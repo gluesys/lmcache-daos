@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lmcache-daos"
+version = "0.0.1"
+description = "DAOS (dfs_sys) remote connector backend for LMCache"
+requires-python = ">=3.8"
+# No hard runtime deps: uses ctypes against the system libdaos/libdfs, and
+# LMCache is expected to already be present in the serving environment.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["lmcache_daos"]

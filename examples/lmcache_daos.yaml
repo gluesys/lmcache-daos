@@ -1,0 +1,21 @@
+# Example LMCache config selecting the DAOS remote connector.
+# Point remote_url at a DAOS pool/container. The container must be POSIX type:
+#   daos cont create <pool> <container> --type POSIX
+#
+# Then run vLLM with:  LMCACHE_CONFIG_FILE=examples/lmcache_daos.yaml
+
+chunk_size: 256
+
+# daos://<pool>/<container>[?sys=<sysname>]
+remote_url: "daos://tank/lmcache"
+
+# Serializer for the transfer channel; DAOS stores whatever bytes it is given.
+remote_serde: "naive"
+
+# Register the out-of-tree connector so LMCache's RemoteBackend can route the
+# daos:// scheme to it. (Exact key names track the target LMCache release --
+# verify against its docs when pinning a version.)
+remote_storage_plugins: ["daos"]
+extra_config:
+  remote_storage_plugin.daos.module_path: lmcache_daos.connector
+  remote_storage_plugin.daos.class_name: DaosConnector
