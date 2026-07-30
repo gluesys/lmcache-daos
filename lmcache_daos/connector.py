@@ -53,6 +53,40 @@ except Exception:  # pragma: no cover - exercised only off the serving host
             pass
 
 
+def _parse_daos_url(url: str):
+    """Parse a DAOS target out of either URL spelling.
+
+    LMCache's ``DynamicConnectorAdapter`` builds its schema as
+    ``plugin://<plugin_type>`` and only matches URLs with that prefix -- a
+    plain ``daos://`` url is never routed to us. Since ``can_parse`` uses
+    ``startswith``, extra path components survive, so the pool/container ride
+    along in the path:
+
+        plugin://daos/<pool>/<container>[?sys=<sysname>]
+
+    ``daos://<pool>/<container>`` is still accepted for direct construction
+    (unit tests, embedding this connector without LMCache's factory).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "plugin":
+        # netloc is the plugin name ("daos" / "daos.instance"); pool+cont are path
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(
+                "daos plugin url must be plugin://<name>/<pool>/<container>, "
+                f"got {url!r}")
+        pool, cont = parts[0], parts[1]
+    else:
+        pool = parsed.netloc
+        parts = [p for p in parsed.path.split("/") if p]
+        cont = parts[0] if parts else ""
+    if not pool or not cont:
+        raise ValueError(
+            "daos url must be daos://<pool>/<container> or "
+            f"plugin://<name>/<pool>/<container>, got {url!r}")
+    return pool, cont, parse_qs(parsed.query).get("sys", [None])[0]
+
+
 def _key_to_path(key) -> str:
     """Map a CacheEngineKey to a flat DFS path.
 
@@ -65,20 +99,24 @@ def _key_to_path(key) -> str:
 
 
 class DaosConnector(RemoteConnector):
-    def __init__(self, url, loop, local_cpu_backend):
+    def __init__(self, url=None, loop=None, local_cpu_backend=None, config=None):
+        # LMCache's DynamicConnectorAdapter instantiates us as
+        #   cls(loop=..., local_cpu_backend=..., config=...)
+        # -- no url argument -- so the target is taken from config.remote_url.
+        # Direct construction (tests) may still pass url positionally.
         if not _HAS_LMCACHE:
             raise RuntimeError("DaosConnector requires LMCache to be installed")
-        super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+        if local_cpu_backend is None:
+            raise ValueError("DaosConnector requires a local_cpu_backend")
+        cfg = config if config is not None else local_cpu_backend.config
+        super().__init__(cfg, local_cpu_backend.metadata)
 
-        parsed = urlparse(url)
-        # LMCache routes external plugins by name; tolerate either the plugin's
-        # own scheme or a plain daos:// url.
-        pool = parsed.netloc
-        cont = parsed.path.lstrip("/")
-        if not pool or not cont:
-            raise ValueError(
-                f"daos url must be daos://<pool>/<container>, got {url!r}")
-        sysname = parse_qs(parsed.query).get("sys", [None])[0]
+        if url is None:
+            url = getattr(cfg, "remote_url", None)
+            if not url:
+                raise ValueError(
+                    "DaosConnector: no url given and config.remote_url is unset")
+        pool, cont, sysname = _parse_daos_url(url)
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend

@@ -59,6 +59,11 @@ def main():
     loop = asyncio.new_event_loop()
     conn = DaosConnector(f"daos://{POOL}/{CONT}", loop, lcb)
     try:
+        # Make the test idempotent: a previous run leaves the key behind, and
+        # the container is shared, so start from a known-clean state.
+        from lmcache_daos.connector import _key_to_path
+
+        conn._dfs.remove(_key_to_path(key))
         assert not loop.run_until_complete(conn.exists(key)), "key should not exist yet"
         loop.run_until_complete(conn.put(key, mo))
         print("put OK")
