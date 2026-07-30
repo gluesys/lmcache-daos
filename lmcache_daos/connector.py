@@ -150,9 +150,27 @@ class DaosConnector(RemoteConnector):
         await self._run(self._dfs.write, _key_to_path(key), blob)
 
     async def list(self) -> List[str]:
-        # Optional for a cache backend; requires dfs_sys_opendir/readdir
-        # marshalling (Phase 4). Enumeration is never needed on the hot path.
-        return []
+        """Enumerate the object names in the container.
+
+        LIMITATION -- the names are NOT reversible to ``CacheEngineKey``.
+        ``_key_to_path`` hashes the key with sha256, so what comes back here is
+        the 64-char digest. That is enough for capacity work (count, total
+        bytes, sweep-and-delete by path) but not for consumers that expect to
+        rebuild keys from names: LMCache's own ``fs_connector`` encodes the key
+        into the filename ('/' -> '-SEP-') and
+        ``internal_api_server/vllm/load_fs_chunks_api`` reverses it with
+        ``CacheEngineKey.from_string``. Making our names reversible means
+        changing the on-disk naming scheme, which invalidates every cached
+        object and interacts with the directory-fanout design -- so it is left
+        as an explicit decision rather than a silent change.
+        """
+        return await self._run(self._dfs.listdir, "/")
+
+    def remove_sync(self, key) -> bool:
+        """Delete one object. ``RemoteBackend.remove()`` calls this, so this is
+        what makes remote eviction work at all -- without it the container grows
+        without bound."""
+        return self._dfs.remove(_key_to_path(key))
 
     async def close(self):
         self._pool.shutdown(wait=True)
