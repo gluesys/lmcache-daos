@@ -140,8 +140,21 @@ NVMe 계층에서는 DAOS 로드 0.50s < prefill 재계산 1.99s로 손익분기
 zvol 계층에서는 로드가 prefill보다 느려 캐시가 오히려 손해다. **지연이 중요한 시험은
 NVMe 백킹 풀을 쓸 것.**
 
-측정 KV 크기(Qwen3-1.7B, 28층 / KV head 8 / head_dim 128): 256-token chunk = 0.2188 GB.
-put throughput 8.8~9.8 GB/s (첫 put만 연결 초기화 비용으로 느림).
+측정 KV 크기(Qwen3-1.7B, 28층 / KV head 8 / head_dim 128, BF16):
+
+```
+토큰당 = 2(K+V) × 28 × 8 × 128 × 2B = 114,688 B = 112 KiB
+  256 토큰 (chunk_size)  =  28.0 MiB   → DFS 파일 1개
+ 2048 토큰               = 0.2188 GiB  → LMCache가 8청크씩 묶어 store하는 단위
+ 4864 토큰 (본 시험)     = 0.5195 GiB  → DFS 파일 19개
+```
+
+dfuse 실측 557,843,220 B이 위 계산(557,842,432 B)과 파일당 36 B 프레이밍
+(prefix 8 B + `RemoteMetadata` 28 B) × 19개를 더한 값과 일치한다. 계획서가 가정한
+"32층 / 8 KV head / head_dim 128 / BF16 / 256-token → 약 32 MiB/chunk"와도
+층수 비율(28/32)만큼 정확히 맞는다.
+
+put throughput 4.8~9.8 GB/s (첫 put만 연결 초기화 비용으로 느림).
 
 주의: A2는 H100 대비 prefill 연산량이 훨씬 작으므로 위 배수를 H100 경제성 판단에
 그대로 쓸 수 없다. 이 CI의 역할은 **기능·정합성 검증**이고 성능 게이트는 별도 H100
