@@ -121,11 +121,23 @@ class DaosConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
+        self._workers = 16
         self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=16, thread_name_prefix="daos-io")
+            max_workers=self._workers, thread_name_prefix="daos-io")
 
     def _run(self, fn, *args):
         return self.loop.run_in_executor(self._pool, fn, *args)
+
+    def _pack(self, memory_obj: "MemoryObj") -> bytes:
+        """Serialize one MemoryObj into the on-disk object bytes."""
+        kv_bytes = bytes(memory_obj.byte_array)
+        meta_bytes = RemoteMetadata(
+            len(kv_bytes),
+            memory_obj.get_shapes(),
+            memory_obj.get_dtypes(),
+            memory_obj.get_memory_format(),
+        ).serialize()
+        return serde.pack(meta_bytes, kv_bytes)
 
     # -- RemoteConnector interface -----------------------------------------
     async def exists(self, key) -> bool:
@@ -139,15 +151,66 @@ class DaosConnector(RemoteConnector):
 
     async def put(self, key, memory_obj: "MemoryObj"):
         # Extract on the calling thread (cheap), do the write in the pool.
-        kv_bytes = bytes(memory_obj.byte_array)
-        meta_bytes = RemoteMetadata(
-            len(kv_bytes),
-            memory_obj.get_shapes(),
-            memory_obj.get_dtypes(),
-            memory_obj.get_memory_format(),
-        ).serialize()
-        blob = serde.pack(meta_bytes, kv_bytes)
-        await self._run(self._dfs.write, _key_to_path(key), blob)
+        await self._run(self._dfs.write, _key_to_path(key), self._pack(memory_obj))
+
+    # -- batched interface --------------------------------------------------
+    # Only get/put are overridden, and only because measurement said so.
+    #
+    # Every chunk is its own DFS object, so these are concurrent fan-outs over
+    # the thread pool, not true batch RPCs the way Redis's batch_exists_sync is.
+    # Collapsing N operations into one request needs the dkey/akey layout where
+    # the chunks of a prefix share a dkey.
+    #
+    # Measured on nvme_pool, 19 objects per batch (a 4864-token prefix):
+    #
+    #   chunk    PUT seq -> batched        GET seq -> batched
+    #    1 MiB   106.8 -> 44.4 ms  2.41x    69.3 -> 19.8 ms  3.49x
+    #    4 MiB   248.1 -> 152.8 ms 1.62x   133.9 -> 54.9 ms  2.44x
+    #   16 MiB   862.4 -> 643.6 ms 1.34x   436.1 -> 148.1 ms 2.95x
+    #
+    # batched_contains is deliberately NOT overridden. It looks like the obvious
+    # win -- the inherited fallback is a *sequential* `for key in keys:
+    # contains(key)` loop, 128 round trips for a 32K prefix -- but dfs_sys_open +
+    # close on an existing object costs only ~69 us, so the whole sequential
+    # probe is 8.8 ms and thread-dispatch overhead cancels the parallelism: a
+    # windowed fan-out measured 9.4 ms, i.e. 0.9x. Against a ~500 ms retrieve it
+    # is noise either way. Left inherited (support_batched_contains() -> False)
+    # rather than carrying code that buys nothing. Worth revisiting only with
+    # data from a low-hit-rate fleet, where the argument would be about wasted
+    # server operations rather than latency.
+    #
+    # batched_async_contains and batched_get_non_blocking are also left
+    # inherited: both already fan out via asyncio.gather over our per-key
+    # methods, and get_non_blocking carries the ref_count_down() discipline for
+    # objects after the first failure -- reimplementing that risks a MemoryObj
+    # leak for no measured gain.
+
+
+    def support_batched_get(self) -> bool:
+        return True
+
+    def support_batched_put(self) -> bool:
+        return True
+
+    async def batched_get(self, keys) -> List[Optional["MemoryObj"]]:
+        """Fetch every key. Unlike the *_non_blocking variant this has no prefix
+        semantics -- the result is positional, with None for a miss."""
+        results = await asyncio.gather(
+            *(self._run(self._get_sync, _key_to_path(k)) for k in keys),
+            return_exceptions=True,
+        )
+        # A single unreadable object must not fail the whole batch; a cache
+        # reports a miss and lets the engine recompute.
+        return [None if isinstance(r, BaseException) else r for r in results]
+
+    async def batched_put(self, keys, memory_objs):
+        blobs = [self._pack(mo) for mo in memory_objs]
+        await asyncio.gather(*(
+            self._run(self._dfs.write, _key_to_path(k), b)
+            for k, b in zip(keys, blobs)
+        ))
+
+
 
     async def list(self) -> List[str]:
         """Enumerate the object names in the container.

@@ -105,9 +105,9 @@ extra_config:
       이전에는 `list()`가 `[]`이고 삭제 경로가 아예 없어 컨테이너가 단조 증가만 했다.
 - [ ] **용량 정책** eviction/TTL/모델 revision 폐기 정책 설계. 32K prefix 하나가
       ~3.5 GiB, 64K는 ~7 GiB이므로 `nvme_pool`(7.5 GB)은 32K 2개면 찬다.
+- [x] **batched 인터페이스** `batched_get`/`batched_put` 구현 **PASS** (T8).
+      `batched_contains`는 측정 결과 이득이 없어 의도적으로 상속 유지 (아래 참고).
 - [ ] **Phase 4** 벤치·튜닝(oclass EC/RP, chunk, in-flight), 디렉터리 fanout, RDMA.
-      LMCache v0.5.2가 이미 제공하는 `batched_get/put/contains` +
-      `support_*()` opt-in 미구현 — 현재 키별 호출로 폴백 중이다.
 - [ ] **Phase 5** eviction/용량관리, SRPM/CI 연계, 문서·HA.
 
 ## 검증 결과 (2026-07-30, ExaCI5-4 CI)
@@ -129,6 +129,7 @@ CUDA 13.3, torch 2.11.0+cu130) / DAOS 2.9.100 서버 4 rank (.41 rank0·1, .42 r
 | T5 | 동일 키 동시 writer 40라운드 × 6 writer, blend 검출 | PASS |
 | T6 | 독립 replica 2개의 공유 L2 재사용 + 동시 read | PASS |
 | T7 | `list()` 열거 + `remove_sync()` 삭제 (플러그인 래퍼 경유 포함) | PASS |
+| T8 | `batched_get`/`batched_put` + 상속된 prefix 의미 | PASS |
 | Phase 3 | vLLM miss→store(DAOS)→**프로세스 재시작**→hit(DAOS) | PASS |
 
 Phase 3은 두 패스 사이에 vLLM을 완전히 재시작한다. GPU KV 캐시와 LMCache 로컬 CPU
@@ -197,6 +198,42 @@ DAOS 컨테이너를 공유시킨 결과.
 **범위 한정**: T6는 같은 호스트·같은 GPU이므로 cross-*replica*이지 cross-*node*가
 아니다. 네트워크 홉도, 노드별 NIC/CPU 경합도 빠져 있다.
 
+### batched 인터페이스 — 측정으로 범위를 좁힌 기록
+
+LMCache v0.5.2는 `batched_get` / `batched_put` / `batched_contains`를
+`support_*()` opt-in과 함께 제공한다. **`get`/`put`만 구현했다.** 근거는 실측이다.
+
+19객체 배치(4864-token prefix 규모), `nvme_pool`:
+
+| 청크 | PUT 순차 → batched | GET 순차 → batched |
+|---|---|---|
+| 1 MiB | 106.8 → 44.4 ms (**2.41x**) | 69.3 → 19.8 ms (**3.49x**) |
+| 4 MiB | 248.1 → 152.8 ms (**1.62x**) | 133.9 → 54.9 ms (**2.44x**) |
+| 16 MiB | 862.4 → 643.6 ms (**1.34x**) | 436.1 → 148.1 ms (**2.95x**) |
+
+**`batched_contains`는 구현하지 않는다.** 가장 큰 이득처럼 보이는 자리다 — 상속
+폴백이 `for key in keys: contains(key)` **순차 루프**이고 32K prefix면 128번
+왕복이다. 그런데 존재하는 객체에 대한 `dfs_sys_open`+`close`가 개당 **약 69 µs**라
+전체 순차 프로빙이 8.8 ms에 그치고, 윈도우 fan-out은 스레드 디스패치 오버헤드 때문에
+9.4 ms(**0.9x**)로 오히려 느렸다. ~500 ms짜리 retrieve 옆에서는 어느 쪽이든 노이즈다.
+`support_batched_contains()`는 False로 유지하며, T8이 이를 단정해 데이터 없이 되돌리는
+것을 막는다. 재검토할 가치가 있는 경우는 hit rate가 낮은 대규모 운영에서 **지연이 아니라
+낭비되는 서버 연산**을 문제 삼을 때다.
+
+`batched_async_contains`와 `batched_get_non_blocking`도 상속 유지한다. 둘 다 이미
+`asyncio.gather`로 우리 per-key 메서드를 fan-out하며, 특히 후자는 첫 실패 이후 객체에
+`ref_count_down()`을 수행하는 수명 규약을 담고 있어 재구현 시 `MemoryObj` 누수 위험만
+생긴다.
+
+**진짜 batch RPC가 아니라는 점**을 분명히 해둔다. Redis는 `batch_exists_sync`로 1회
+왕복이 가능하지만 DFS는 청크마다 별개 객체이므로 위 구현은 스레드풀 fan-out이다. N개
+연산을 1회 요청으로 접으려면 계획서 §6 3단계의 dkey/akey 레이아웃이 필요하다.
+
+**E2E 해석 주의**: batched 도입 후 Phase 3 E2E는 cold 2.009s → warm 0.665s(3.02x)로
+나왔지만, 이전 실행이 2.63~2.81x였으므로 run-to-run 변동 범위 안이다. 서빙 읽기 경로는
+상속된 `batched_get_non_blocking`이 **이미** gather로 병렬화하고 있었으므로, 이 변경의
+E2E 효과는 "회귀 없음"으로 읽어야 하고 위 배수는 커넥터 API 수준 수치다.
+
 주의: A2는 H100 대비 prefill 연산량이 훨씬 작으므로 위 배수를 H100 경제성 판단에
 그대로 쓸 수 없다. 이 CI의 역할은 **기능·정합성 검증**이고 성능 게이트는 별도 H100
 테스트베드에서 받아야 한다.
@@ -229,6 +266,9 @@ DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_concurrent_writer
 
 # T7: list() 열거 + remove_sync() 삭제
 DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_list_and_remove.py
+
+# T8: batched_get / batched_put + prefix 의미
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_batched.py
 ```
 
 GPU + vLLM이 있는 박스에서 (E2E):
