@@ -1,13 +1,13 @@
 # lmcache-daos
 
 LMCache의 KV cache 오프로딩 백엔드를 **DAOS**로 구현하는 프로젝트.
-LMCache의 `RemoteConnector` 인터페이스에 `daos://` 스킴 커넥터를 붙여, KV 청크를
+LMCache의 `RemoteConnector` 인터페이스에 커넥터를 붙여, KV 청크를
 DAOS DFS(`dfs_sys` API) 네임스페이스의 self-describing 파일로 저장한다.
 
 ## 아키텍처
 
 ```
-vLLM ─ LMCache ─ RemoteBackend ─(daos:// 스킴)─ DaosConnector (connector.py)
+vLLM ─ LMCache ─ RemoteBackend ─(plugin:// 스킴)─ DaosConnector (connector.py)
                                                    └─ DfsSys ctypes 바인딩 (dfs_binding.py)
                                                         └─ libdfs dfs_sys_* → DAOS Array 객체(파일)
 ```
@@ -24,31 +24,128 @@ vLLM ─ LMCache ─ RemoteBackend ─(daos:// 스킴)─ DaosConnector (connect
 - Samba **vfs_daos** 모듈이 동일하게 `dfs_sys` API 사용 → 호출 패턴 재사용.
 - LMCache `RemoteConnector` 인터페이스: `async exists / exists_sync / async get /
   async put / async list / async close`, 키 타입 `CacheEngineKey`
-  (`lmcache/v1/storage_backend/connector/base_connector.py`, dev).
+  (`lmcache/v1/storage_backend/connector/base_connector.py`).
 
 ## 대상 버전 핀
 
-**LMCache v0.5.2** 기준으로 구현. 커넥터 생성자/메타데이터 코덱/allocator API를
-이 태그 소스에서 직접 확인함. 런타임 박스에서 `pip show lmcache`로 v0.5.2인지
-확인 후 진행할 것. 버전이 다르면 `connector.py`의 API 배선을 재확인해야 함.
+**LMCache v0.5.2 + vLLM ≥ 0.26.0** 기준으로 구현·검증. LMCache v0.5.2 릴리스 노트가
+"Requires LMCache v0.5.2 for vLLM ≥ 0.26.0"으로 명시한다. 런타임 박스에서
+`pip show lmcache vllm`으로 확인 후 진행할 것. 버전이 다르면 `connector.py`의 API
+배선과 아래 플러그인 URL 규칙을 재확인해야 한다.
+
+## 플러그인 등록과 URL 규칙 (중요)
+
+LMCache는 out-of-tree `RemoteConnector` 서브클래스를 `DynamicConnectorAdapter`로
+자동 래핑한다. **실측한 계약은 다음과 같고, `daos://` 스킴은 동작하지 않는다.**
+
+```python
+# lmcache/v1/storage_backend/connector/__init__.py
+schema = "plugin://%s" % extract_plugin_type(plugin_name)   # "plugin://daos"
+def can_parse(self, url): return url.startswith(self.schema)  # startswith!
+def create_connector(self, context):
+    return self._connector_class(
+        loop=..., local_cpu_backend=..., config=...)          # url 인자 없음
+```
+
+1. **스킴은 `plugin://`** — `daos://<pool>/<container>`는 어떤 어댑터에도 매칭되지
+   않아 `CreateConnector`가 `No adapter found for URL: daos://...`로 실패한다.
+   `can_parse`가 `startswith`이므로 pool/container를 path에 실어 보낼 수 있다:
+
+   ```
+   plugin://<plugin_name>/<pool>/<container>[?sys=<sysname>]
+   ```
+
+2. **생성자는 `url`을 받지 않고 `config`를 받는다** — 따라서 커넥터는 대상 pool/
+   container를 `config.remote_url`에서 얻는다. `DaosConnector.__init__`은
+   `(url=None, loop=None, local_cpu_backend=None, config=None)` 형태로, 어댑터 경유
+   호출과 직접 생성(테스트) 양쪽을 모두 지원한다.
+
+3. **플러그인명 형식은 `{type}` 또는 `{type}.{instance}`** — `extract_plugin_type`이
+   `.` 앞부분만 스킴에 쓰므로 `daos.nvme` 같은 인스턴스 분리가 가능하다.
+
+설정 예시는 `examples/lmcache_daos.yaml` 참고.
+
+```yaml
+chunk_size: 256
+remote_url: "plugin://daos/hdd_pool/lmcache_test"
+remote_serde: "naive"
+remote_storage_plugins: ["daos"]
+extra_config:
+  remote_storage_plugin.daos.module_path: lmcache_daos.connector
+  remote_storage_plugin.daos.class_name: DaosConnector
+```
 
 ## 진행 상태
 
-- [x] **Phase 0** 환경 조사 — 이 개발 박스엔 DAOS 런타임/LMCache 미설치.
-      실제 I/O는 E2E 런타임 박스에서 (pool/POSIX 컨테이너 필요).
+- [x] **Phase 0** 환경 조사 — 개발 박스엔 DAOS 런타임/LMCache 미설치. 실제 I/O는
+      런타임 박스에서 (pool/POSIX 컨테이너 필요).
 - [x] **Phase 1** libdfs ctypes 바인딩 + serde 프레이밍 + 단위테스트.
-      **T1(DFS roundtrip) 실 DAOS 환경 PASS** (클라 192.168.35.40, python3.12,
-      pool `lmcache`/cont `lmcache_test`, 1 MiB write/read/remove).
+      **T1(DFS roundtrip) 실 DAOS 환경 PASS.**
 - [x] **Phase 2 (코드)** 실제 LMCache v0.5.2 API로 커넥터 확정:
-      생성자 `(url, loop, local_cpu_backend)`, `RemoteMetadata` 메타 코덱,
-      `local_cpu_backend.allocate(...)` 재구성, 플러그인 등록 방식.
-- [x] **Phase 2 (검증)** 클라 .40에 lmcache==0.5.2(CPU torch) 설치, 커넥터
-      import + `_HAS_LMCACHE=True` 확인. **T2 커넥터 왕복 PASS** (LocalCPUBackend
-      →put→exists→get, payload/shape/dtype 일치, tests/test_connector_roundtrip.py).
-- [ ] **Phase 2 잔여** `list()`(readdir) 구현, 플러그인 스킴 라우팅 실동작 확인.
-- [ ] **Phase 3** vLLM+LMCache miss→store→hit, 멀티워커/멀티노드 공유 검증.
+      `RemoteMetadata` 메타 코덱, `local_cpu_backend.allocate(...)` 재구성,
+      플러그인 등록 방식.
+- [x] **Phase 2 (검증)** **T2 커넥터 왕복 PASS** (LocalCPUBackend→put→exists→get,
+      payload/shape/dtype 일치).
+- [x] **Phase 2 잔여** 플러그인 스킴 라우팅 **실동작 확인 완료** — `daos://`가
+      실제로 라우팅되지 않는 결함을 발견해 `plugin://` 규칙으로 수정.
+      **T3(플러그인 라우팅) PASS.**
+- [x] **Phase 3** vLLM+LMCache **miss→store→hit PASS** (아래 검증 결과 참고).
+- [ ] **Phase 3 잔여** 멀티워커/멀티노드 동시 공유(cross-node reuse), 동일 키 동시
+      writer 경합, 부분 저장 청크의 오탐 hit 방지 검증.
 - [ ] **Phase 4** 벤치·튜닝(oclass EC/RP, chunk, in-flight), 디렉터리 fanout, RDMA.
+      `list()`(readdir) 구현.
 - [ ] **Phase 5** eviction/용량관리, SRPM/CI 연계, 문서·HA.
+
+## 검증 결과 (2026-07-30, ExaCI5-4 CI)
+
+환경: 클라 192.168.35.40 (Rocky 8.10, NVIDIA A2 15356MiB, 드라이버 610.43.02,
+CUDA 13.3, torch 2.11.0+cu130) / DAOS 2.9.100 서버 4 rank (.41 rank0·1, .42 rank2·3,
+`ofi+verbs;ofi_rxm` on ib0 172.30.44.0/24) / vLLM 0.26.0 + LMCache 0.5.2 /
+모델 Qwen3-1.7B.
+
+### 기능 검증
+
+| 테스트 | 내용 | 결과 |
+|---|---|---|
+| T0 | serde 프레이밍 (DAOS 불필요) | PASS |
+| T1 | DFS roundtrip, 1 MiB write/read/remove | PASS |
+| T2 | 커넥터 왕복 (직접 생성) | PASS |
+| T3 | 플러그인 라우팅 (`CreateConnector` 경유) + `daos://` 거부 | PASS |
+| Phase 3 | vLLM miss→store(DAOS)→**프로세스 재시작**→hit(DAOS) | PASS |
+
+Phase 3은 두 패스 사이에 vLLM을 완전히 재시작한다. GPU KV 캐시와 LMCache 로컬 CPU
+계층이 모두 비워지므로, 2차 패스의 hit 출처는 DAOS뿐이다.
+
+```
+pass1: Stored 2048+2048+768 = 4864 tokens (0.5195 GB)
+pass2: LMCache hit tokens: 4864, need to load: 4864     ← 전량 hit
+       Retrieved 4864 out of 4864 required tokens. size: 0.5195 gb,
+                cost 501.7759 ms, throughput: 1.0354 GB/s
+       DAOS 파일 수·바이트 불변 → 재계산·재저장 없음
+```
+
+### 성능: 저장 계층이 손익분기를 가른다
+
+풀만 바꾸고 나머지 조건을 고정한 실측. hit 토큰 수와 키 해시는 양쪽 동일.
+
+| pool | 백킹 디바이스 | TTFT cold | TTFT warm | 결과 |
+|---|---|---|---|---|
+| `hdd_pool` | ZFS zvol (`/dev/zvol/daoshdd/daosdata`) | 2.035s | 2.147s | **0.95x — 손실** |
+| `nvme_pool` | kdev NVMe | 1.986s | **0.706s** | **2.81x (TTFT 64.5%↓)** |
+| `nvme_pool` (재현) | kdev NVMe | 1.781s | **0.678s** | **2.63x (TTFT 61.9%↓)** |
+
+NVMe 결과는 독립 실행에서 2.63~2.81x로 재현된다.
+
+NVMe 계층에서는 DAOS 로드 0.50s < prefill 재계산 1.99s로 손익분기 부등식이 성립한다.
+zvol 계층에서는 로드가 prefill보다 느려 캐시가 오히려 손해다. **지연이 중요한 시험은
+NVMe 백킹 풀을 쓸 것.**
+
+측정 KV 크기(Qwen3-1.7B, 28층 / KV head 8 / head_dim 128): 256-token chunk = 0.2188 GB.
+put throughput 8.8~9.8 GB/s (첫 put만 연결 초기화 비용으로 느림).
+
+주의: A2는 H100 대비 prefill 연산량이 훨씬 작으므로 위 배수를 H100 경제성 판단에
+그대로 쓸 수 없다. 이 CI의 역할은 **기능·정합성 검증**이고 성능 게이트는 별도 H100
+테스트베드에서 받아야 한다.
 
 ## 테스트
 
@@ -57,22 +154,41 @@ vLLM ─ LMCache ─ RemoteBackend ─(daos:// 스킴)─ DaosConnector (connect
 python3 tests/test_serde.py
 ```
 
-런타임 박스(DAOS 필요) — DFS roundtrip:
+런타임 박스(DAOS 필요):
 ```bash
 daos cont create <pool> <cont> --type POSIX
+
+# T1: DFS roundtrip (LMCache 불필요)
 DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_dfs_roundtrip.py
+
+# T2: 커넥터 왕복 (LMCache 필요)
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_connector_roundtrip.py
+
+# T3: 플러그인 라우팅 (LMCache 필요)
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_plugin_routing.py
 ```
 
-## 알려진 미해결 지점
+T2/T3는 멱등하다 — 시작 시 대상 키를 제거하므로 반복 실행할 수 있다.
 
-- 코드는 v0.5.2 소스 기준으로 작성됐으나 **실제 설치본에서 미검증** — 런타임
-  박스에서 import/등록/roundtrip 실동작 확인 필요.
-- 외부 플러그인 커넥터의 `remote_url` 스킴 접두어(`daos://` vs 플러그인명 vs
-  `external://`)가 `DynamicConnectorAdapter` 라우팅과 정확히 어떻게 매칭되는지
-  실측 확인 필요. 현재 파서는 `daos://<pool>/<container>`를 가정.
-- `list()`는 현재 `[]` (readdir 마샬링 미구현).
+## 운영 주의사항 (실측 기반)
 
-## 실환경에서 확인된 libdfs 규칙 (DAOS 2.8/2.9 빌드)
+### PYTHONHASHSEED=0 필수
+
+프로세스/노드 간 캐시 공유에는 **`PYTHONHASHSEED`를 고정해야 한다.** LMCache가 vLLM의
+해시 함수를 못 불러오면 Python builtin `str` hash로 폴백하는데, 이 해시는 프로세스마다
+salt가 달라 **같은 prompt가 다른 청크 키를 생성**한다. 결과적으로 재시작 후 hit이 0이
+되고 캐시를 다시 저장한다.
+
+증상과 증거:
+```
+WARNING: Centralized cache sharing detected but PYTHONHASHSEED not set.
+pass1: Initialized NONE_HASH=14150773119372137151
+pass2: Initialized NONE_HASH=17258592176669719754    ← 값이 다르면 절대 hit 안 됨
+```
+`export PYTHONHASHSEED=0`을 엔진 기동 **전에** 설정하고, cross-node 구성에서는 모든
+노드에 동일 값을 강제할 것.
+
+### 실환경에서 확인된 libdfs 규칙 (DAOS 2.8/2.9 빌드)
 
 - `dfs_sys_connect` 전에 `daos_init()` **및 `dfs_init()`** 를 모두 호출해야 함
   (dfs_init 누락 시 EACCES=13). 바인딩에 반영됨.
@@ -80,4 +196,37 @@ DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_dfs_roundtrip.py
   force=False, mode=0, NULL)` 사용. `force=True`도 ENOTSUP 유발 → False 필수.
 - 서버측: `daos_server` 유저가 kdev NVMe 블록디바이스(`root:disk 660`)를 열려면
   `usermod -aG disk daos_server` 필요 (안 그러면 bdev_aio_open Permission denied
-  → 엔진 기동 실패). 자세한 클러스터 운영 메모는 세션 메모리 참고.
+  → 엔진 기동 실패).
+
+### 클러스터/런타임 함정
+
+- **신규 DAOS 풀 생성 실패(`DER_NOSPACE`)**: 크기와 무관하게 실패하면 SSD가 아니라
+  엔진 ram-disk 고갈이다(`daos_server.yml`의 `class: ram, scm_size`). 서버 로그에
+  `no SCM space available for metadata`가 남는다. MD-on-SSD 모드에서 신규 풀의 메모리
+  파일이 ram-disk에 들어가야 하기 때문. → 여유 있는 기존 풀 재사용 또는 `scm_size`
+  증설 후 엔진 재시작.
+- **vLLM 프로세스 누수**: vLLM 워커는 프로세스명을 `VLLM::EngineCore`로 재작성하므로
+  `pkill -f "vllm serve"`가 놓친다. 남은 워커가 GPU 메모리를 계속 점유해 다음 기동이
+  `Free memory on device cuda:0 ... less than desired GPU memory utilization`으로
+  죽는다. → `nvidia-smi --query-compute-apps=pid`로 GPU 점유 기준 회수할 것.
+- **FlashInfer JIT**: 샘플링 커널을 nvcc로 런타임 컴파일하므로 드라이버만 설치된
+  박스에서 `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`
+  로 실패한다. → `VLLM_USE_FLASHINFER_SAMPLER=0` 또는 `cuda-nvcc` 설치.
+- **컨테이너 파일 확인**: `daos fs`에는 `ls` 서브커맨드가 없다. 파일 수/용량 확인은
+  `dfuse --disable-caching` 마운트 후 `find`/`du`로.
+- **Rocky 8(glibc 2.28)에서 vLLM**: vLLM 0.22.0+ 본체는 `manylinux_2_28` 휠이라
+  호환되지만, 의존성 `llguidance`의 x86_64 휠은 `manylinux_2_31`뿐이다. pip이 sdist로
+  폴백하고 maturin이 puccinialin으로 자체 Rust 툴체인을 받아 빌드하므로 통과한다
+  (시스템 rust 불필요, 빌드 시간 소요). vLLM 0.26.0 직접 의존성 73개 중 비호환은
+  이 하나뿐이었다.
+
+## 알려진 미해결 지점
+
+- `list()`는 현재 `[]` (readdir 마샬링 미구현). 캐시 백엔드의 hot path에서는 쓰이지
+  않으나, 용량 관리/eviction(Phase 5)에는 필요하다.
+- `get()`이 반환한 `MemoryObj`의 수명 관리. 테스트 실행 시 LMCache가
+  `MemoryObj at N is being garbage collected with ref_count=1, pin_count=0` 경고를
+  낸다. 실제 서빙 경로에서는 LMCache가 관리하는 것으로 보이나, 장시간 구동 시 CPU
+  메모리 풀 누수 여부는 별도 확인이 필요하다.
+- cross-node 동시 공유, 동일 키 동시 writer, 부분 저장 청크 오탐 hit는 미검증
+  (Phase 3 잔여).
