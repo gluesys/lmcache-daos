@@ -94,6 +94,17 @@ def main():
             gview = gview.cast("B")
         assert bytes(gview[:nbytes]) == pattern, "payload mismatch"
         print("get + compare OK")
+
+        # list()/remove_sync() through the same InstrumentedRemoteConnector
+        # wrapper LMCache uses in production, not just via direct construction.
+        from lmcache_daos.connector import _key_to_path
+
+        names = set(loop.run_until_complete(conn.list()))
+        assert _key_to_path(key).lstrip("/") in names, "list() missed the object"
+        assert conn.remove_sync(key), "remove_sync returned False for a live key"
+        assert not loop.run_until_complete(conn.exists(key)), \
+            "object still present after remove_sync"
+        print(f"list() via wrapper saw {len(names)} objects; remove_sync OK")
     finally:
         loop.run_until_complete(conn.close())
         loop.close()

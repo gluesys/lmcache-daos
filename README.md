@@ -16,6 +16,9 @@ vLLM ─ LMCache ─ RemoteBackend ─(plugin:// 스킴)─ DaosConnector (conne
 - **객체 레이아웃**: `serde.py` — `[prefix 8B][header][payload]`. 파일이 자기 자신을
   기술하므로 read 시 별도 stat/index 불필요.
 - **동시성**: blocking libdfs 호출은 스레드풀 executor로 분리해 asyncio 루프 비블로킹.
+- **열거·삭제**: `list()`는 `dfs_sys_opendir/readdir/closedir`, `remove_sync()`는
+  `dfs_sys_remove_type`. `RemoteBackend.remove()`가 `remove_sync()`를 호출하므로
+  이것이 원격 eviction의 유일한 경로다.
 
 ## 근거 (검증된 사실)
 
@@ -98,8 +101,13 @@ extra_config:
 - [ ] **Phase 3 잔여** **진짜 cross-node** 공유 — T6는 같은 호스트·같은 GPU의
       cross-replica라 네트워크 홉과 노드별 NIC/CPU 경합이 빠져 있다. 노드 2대 이상에
       replica를 배치해 재측정해야 한다.
+- [x] **용량 관리 기반** `list()`(readdir) + `remove_sync()` 구현 **PASS** (T7).
+      이전에는 `list()`가 `[]`이고 삭제 경로가 아예 없어 컨테이너가 단조 증가만 했다.
+- [ ] **용량 정책** eviction/TTL/모델 revision 폐기 정책 설계. 32K prefix 하나가
+      ~3.5 GiB, 64K는 ~7 GiB이므로 `nvme_pool`(7.5 GB)은 32K 2개면 찬다.
 - [ ] **Phase 4** 벤치·튜닝(oclass EC/RP, chunk, in-flight), 디렉터리 fanout, RDMA.
-      `list()`(readdir) 구현.
+      LMCache v0.5.2가 이미 제공하는 `batched_get/put/contains` +
+      `support_*()` opt-in 미구현 — 현재 키별 호출로 폴백 중이다.
 - [ ] **Phase 5** eviction/용량관리, SRPM/CI 연계, 문서·HA.
 
 ## 검증 결과 (2026-07-30, ExaCI5-4 CI)
@@ -120,6 +128,7 @@ CUDA 13.3, torch 2.11.0+cu130) / DAOS 2.9.100 서버 4 rank (.41 rank0·1, .42 r
 | T4 | 부분 저장(잘린) 객체 6개 절단 지점 → 오탐 hit 없이 miss | PASS |
 | T5 | 동일 키 동시 writer 40라운드 × 6 writer, blend 검출 | PASS |
 | T6 | 독립 replica 2개의 공유 L2 재사용 + 동시 read | PASS |
+| T7 | `list()` 열거 + `remove_sync()` 삭제 (플러그인 래퍼 경유 포함) | PASS |
 | Phase 3 | vLLM miss→store(DAOS)→**프로세스 재시작**→hit(DAOS) | PASS |
 
 Phase 3은 두 패스 사이에 vLLM을 완전히 재시작한다. GPU KV 캐시와 LMCache 로컬 CPU
@@ -217,6 +226,9 @@ DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_partial_object.py
 
 # T5: 동일 키 동시 writer (WRITERS/ROUNDS/PAYLOAD_KB로 조절)
 DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_concurrent_writers.py
+
+# T7: list() 열거 + remove_sync() 삭제
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_list_and_remove.py
 ```
 
 GPU + vLLM이 있는 박스에서 (E2E):
@@ -288,8 +300,16 @@ pass2: Initialized NONE_HASH=17258592176669719754    ← 값이 다르면 절대
 
 ## 알려진 미해결 지점
 
-- `list()`는 현재 `[]` (readdir 마샬링 미구현). 캐시 백엔드의 hot path에서는 쓰이지
-  않으나, 용량 관리/eviction(Phase 5)에는 필요하다.
+- **`list()`가 돌려주는 이름은 `CacheEngineKey`로 되돌릴 수 없다.** `_key_to_path`가
+  sha256으로 해싱하므로 64자 다이제스트가 나온다. 용량 작업(개수·총 바이트·경로 단위
+  일괄 삭제)에는 충분하지만, 이름에서 키를 복원하는 소비자에는 못 쓴다 — LMCache의
+  `fs_connector`는 파일명에 키를 인코딩하고(`/` → `-SEP-`)
+  `internal_api_server/vllm/load_fs_chunks_api`가 `CacheEngineKey.from_string`으로
+  되돌린다. 되돌릴 수 있게 만들려면 온디스크 네이밍을 바꿔야 하고 기존 캐시가 전부
+  무효화되며 디렉터리 fanout 설계와도 얽히므로, 조용히 바꾸지 않고 명시적 결정 사항으로
+  남겨둔다.
+- **용량 정책이 없다.** `list()`/`remove_sync()`로 수단은 갖췄지만 무엇을 언제 지울지는
+  미정이다. 시험 중 컨테이너가 파일 2 → 59개(1.35 GB)로 단조 증가했다.
 - `get()`이 반환한 `MemoryObj`의 수명 관리. 테스트 실행 시 LMCache가
   `MemoryObj at N is being garbage collected with ref_count=1, pin_count=0` 경고를
   낸다. 실제 서빙 경로에서는 LMCache가 관리하는 것으로 보이나, 장시간 구동 시 CPU
