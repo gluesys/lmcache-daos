@@ -160,20 +160,41 @@ class DaosConnector(RemoteConnector):
 
     # -- runs inside the thread pool ---------------------------------------
     def _get_sync(self, path) -> Optional["MemoryObj"]:
+        """Load one object, or return None if it is absent OR incomplete.
+
+        A writer killed mid-store leaves a short file behind, and `exists()` is
+        only an open() so a torn object still looks present. Every read is
+        therefore length-checked and any shortfall is reported as a plain miss:
+        raising here would surface as a failed request, since vLLM's default
+        ``kv_load_failure_policy`` is ``fail`` rather than recompute.
+        """
         if not self._dfs.exists(path):
             return None
-        meta_len, payload_len = serde.parse_prefix(
-            self._dfs.read(path, 0, serde.prefix_size()))
+
+        prefix = self._dfs.read(path, 0, serde.prefix_size())
+        if len(prefix) != serde.prefix_size():
+            return None                      # empty or mid-prefix
+        meta_len, payload_len = serde.parse_prefix(prefix)
+
         meta_bytes = self._dfs.read(path, serde.prefix_size(), meta_len)
-        metadata = RemoteMetadata.deserialize(meta_bytes)
+        if len(meta_bytes) != meta_len:
+            return None                      # mid-metadata
+        try:
+            metadata = RemoteMetadata.deserialize(meta_bytes)
+        except Exception:
+            return None                      # unparseable header
+
+        # Read the payload before allocating, so a torn object never costs a
+        # MemoryObj that then has to be handed back to the allocator.
+        kv_bytes = self._dfs.read(
+            path, serde.prefix_size() + meta_len, payload_len)
+        if len(kv_bytes) != payload_len or payload_len < metadata.length:
+            return None                      # truncated payload
 
         memory_obj = self.local_cpu_backend.allocate(
             metadata.shapes, metadata.dtypes, metadata.fmt)
         if memory_obj is None:
             return None
-
-        kv_bytes = self._dfs.read(
-            path, serde.prefix_size() + meta_len, payload_len)
 
         view = memory_obj.byte_array
         if isinstance(view, memoryview):
