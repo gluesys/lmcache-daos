@@ -90,8 +90,14 @@ extra_config:
       실제로 라우팅되지 않는 결함을 발견해 `plugin://` 규칙으로 수정.
       **T3(플러그인 라우팅) PASS.**
 - [x] **Phase 3** vLLM+LMCache **miss→store→hit PASS** (아래 검증 결과 참고).
-- [ ] **Phase 3 잔여** 멀티워커/멀티노드 동시 공유(cross-node reuse), 동일 키 동시
-      writer 경합, 부분 저장 청크의 오탐 hit 방지 검증.
+- [x] **Phase 3 정합성** 부분 저장 청크의 오탐 hit 방지 **PASS** — 잘린 객체에서
+      예외가 서빙 경로로 탈출하던 결함을 발견해 miss 반환으로 수정 (T4).
+      동일 키 동시 writer 경합 **PASS** (T5).
+- [x] **Phase 3 멀티 replica** 독립 vLLM replica 2개가 공유 DAOS L2로 prefill 생략
+      **PASS**, 동시 read 확장성 측정 완료 (T6).
+- [ ] **Phase 3 잔여** **진짜 cross-node** 공유 — T6는 같은 호스트·같은 GPU의
+      cross-replica라 네트워크 홉과 노드별 NIC/CPU 경합이 빠져 있다. 노드 2대 이상에
+      replica를 배치해 재측정해야 한다.
 - [ ] **Phase 4** 벤치·튜닝(oclass EC/RP, chunk, in-flight), 디렉터리 fanout, RDMA.
       `list()`(readdir) 구현.
 - [ ] **Phase 5** eviction/용량관리, SRPM/CI 연계, 문서·HA.
@@ -111,6 +117,9 @@ CUDA 13.3, torch 2.11.0+cu130) / DAOS 2.9.100 서버 4 rank (.41 rank0·1, .42 r
 | T1 | DFS roundtrip, 1 MiB write/read/remove | PASS |
 | T2 | 커넥터 왕복 (직접 생성) | PASS |
 | T3 | 플러그인 라우팅 (`CreateConnector` 경유) + `daos://` 거부 | PASS |
+| T4 | 부분 저장(잘린) 객체 6개 절단 지점 → 오탐 hit 없이 miss | PASS |
+| T5 | 동일 키 동시 writer 40라운드 × 6 writer, blend 검출 | PASS |
+| T6 | 독립 replica 2개의 공유 L2 재사용 + 동시 read | PASS |
 | Phase 3 | vLLM miss→store(DAOS)→**프로세스 재시작**→hit(DAOS) | PASS |
 
 Phase 3은 두 패스 사이에 vLLM을 완전히 재시작한다. GPU KV 캐시와 LMCache 로컬 CPU
@@ -156,6 +165,29 @@ dfuse 실측 557,843,220 B이 위 계산(557,842,432 B)과 파일당 36 B 프레
 
 put throughput 4.8~9.8 GB/s (첫 put만 연결 초기화 비용으로 느림).
 
+### 멀티 replica 공유 L2 (T6, `tests/phase3_multi_replica.sh`)
+
+A2 한 장에 독립 vLLM replica 2개(`--gpu-memory-utilization 0.42` 각각)를 올리고 같은
+DAOS 컨테이너를 공유시킨 결과.
+
+| | TTFT | LMCache | DAOS retrieve |
+|---|---|---|---|
+| A: cold (miss→store) | 1.933s | `hit 0` | — |
+| B: 공유 L2 hit (단독) | **0.703s** | `hit 4864, need to load 4864` | 501.8 ms / 1.0354 GB/s |
+| A: 동시 | 0.795s | `hit 4864, need to load 4864` | 579.5 ms / 0.8965 GB/s |
+| B: 동시 | 0.890s | `hit 4864, need to load 4864` | 642.5 ms / 0.8086 GB/s |
+
+- replica B는 별개 프로세스로 자기 L1이 이 prefix를 본 적이 없고, 파일 수가 19개에서
+  변하지 않았으므로 재저장이 아니라 DAOS 로드다. **cross-replica 2.75x.**
+- 동시 read 시 TTFT는 단독 대비 +13% / +27%, 집계 대역폭은 1.035 → 1.705 GB/s로
+  **1.65배 확장**. 동시 상황에서도 cold 대비 2.17~2.43x.
+- 동시 구간은 두 replica를 **재시작한 뒤** 측정한다. 재시작 없이 재면 양쪽이 이미
+  로컬 계층에 KV를 갖고 있어 `need to load: 0`이 되고, DAOS를 전혀 거치지 않는
+  로컬 hit(TTFT 0.1s대)을 잘못 측정한다.
+
+**범위 한정**: T6는 같은 호스트·같은 GPU이므로 cross-*replica*이지 cross-*node*가
+아니다. 네트워크 홉도, 노드별 NIC/CPU 경합도 빠져 있다.
+
 주의: A2는 H100 대비 prefill 연산량이 훨씬 작으므로 위 배수를 H100 경제성 판단에
 그대로 쓸 수 없다. 이 CI의 역할은 **기능·정합성 검증**이고 성능 게이트는 별도 H100
 테스트베드에서 받아야 한다.
@@ -179,9 +211,30 @@ DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_connector_roundtr
 
 # T3: 플러그인 라우팅 (LMCache 필요)
 DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_plugin_routing.py
+
+# T4: 부분 저장(잘린) 객체가 오탐 hit이 되지 않는지
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_partial_object.py
+
+# T5: 동일 키 동시 writer (WRITERS/ROUNDS/PAYLOAD_KB로 조절)
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_concurrent_writers.py
 ```
 
-T2/T3는 멱등하다 — 시작 시 대상 키를 제거하므로 반복 실행할 수 있다.
+GPU + vLLM이 있는 박스에서 (E2E):
+```bash
+# Phase 3: miss -> store -> 재시작 -> hit
+POOL=<pool> CONT=<cont> bash tests/phase3_vllm_e2e.sh
+
+# T6: replica 2개가 공유 L2 재사용 + 동시 read
+POOL=<pool> CONT=<cont> bash tests/phase3_multi_replica.sh
+```
+
+T2~T5는 멱등하다 — 시작 시 대상 키를 제거하므로 반복 실행할 수 있다.
+
+> `test_concurrent_writers.py` 주의: 커넥터는 생성 시 받은 asyncio 루프에 바인딩되고
+> `그 루프.run_in_executor`로 blocking libdfs 호출을 넘긴다. 스레드마다 별도 루프를
+> 만들어 구동하면 `got Future attached to a different loop`가 난다. LMCache는 항상
+> 단일 루프를 쓰므로, 동시성은 루프 하나를 전용 스레드에서 돌리고
+> `asyncio.run_coroutine_threadsafe`로 코루틴을 던지는 형태로 모델링해야 한다.
 
 ## 운영 주의사항 (실측 기반)
 
@@ -241,5 +294,9 @@ pass2: Initialized NONE_HASH=17258592176669719754    ← 값이 다르면 절대
   `MemoryObj at N is being garbage collected with ref_count=1, pin_count=0` 경고를
   낸다. 실제 서빙 경로에서는 LMCache가 관리하는 것으로 보이나, 장시간 구동 시 CPU
   메모리 풀 누수 여부는 별도 확인이 필요하다.
-- cross-node 동시 공유, 동일 키 동시 writer, 부분 저장 청크 오탐 hit는 미검증
-  (Phase 3 잔여).
+- **진짜 cross-node 공유는 미검증.** T6는 같은 호스트·같은 GPU의 cross-replica라
+  네트워크 홉과 노드별 NIC/CPU 경합이 빠져 있다 (Phase 3 잔여).
+- **메타데이터 스케일 미검증.** 본 시험은 파일 19개 규모여서 계획서 §3.3이 경고한
+  "파일 수 수십만~수백만에서 metadata·디렉터리 분산이 먼저 병목" 구간에 닿지 않았다.
+  `_key_to_path`는 여전히 flat(`/` + sha256)이라 fanout도 미적용이며, 이 스케일 시험
+  결과가 dkey/akey native 레이아웃 투자의 근거가 된다.
