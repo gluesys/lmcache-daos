@@ -165,8 +165,17 @@ class DfsSys:
 
     _daos_inited = False
 
+    # sflags defaults to 0 -- dfs_sys caching AND locking on.
+    #
+    # This used to pass DFS_SYS_NO_LOCK, which daos_fs_sys.h documents as
+    # "Turn off locking. Useful for single-threaded applications." The connector
+    # is emphatically not single-threaded: one DfsSys handle is shared across a
+    # 16-thread pool, and the lock is what protects dfs_sys's internal directory
+    # cache. Tests passing under that flag was absence of observed failure, not
+    # safety. Caching is left on because every path here is "/<sha256>", so the
+    # root directory entry is looked up on literally every operation.
     def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
-                 mflags: int = DFS_RDWR, sflags: int = DFS_SYS_NO_LOCK):
+                 mflags: int = DFS_RDWR, sflags: int = 0):
         _load()
         if not DfsSys._daos_inited:
             rc = _daos.daos_init()
