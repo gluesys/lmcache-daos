@@ -32,7 +32,6 @@ import concurrent.futures
 import ctypes
 import hashlib
 import os
-import threading
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -62,6 +61,39 @@ except Exception:  # pragma: no cover - exercised only off the serving host
 # prefix+meta come back in a single round-trip.
 _HDR_CAP = 512
 
+def _parse_daos_url(url: str):
+    """Parse a DAOS target out of either URL spelling.
+
+    LMCache's ``DynamicConnectorAdapter`` builds its schema as
+    ``plugin://<plugin_type>`` and only matches URLs with that prefix -- a
+    plain ``daos://`` url is never routed to us. Since ``can_parse`` uses
+    ``startswith``, extra path components survive, so the pool/container ride
+    along in the path:
+
+        plugin://daos/<pool>/<container>[?sys=<sysname>]
+
+    ``daos://<pool>/<container>`` is still accepted for direct construction
+    (unit tests, embedding this connector without LMCache's factory).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "plugin":
+        # netloc is the plugin name ("daos" / "daos.instance"); pool+cont are path
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(
+                "daos plugin url must be plugin://<name>/<pool>/<container>, "
+                f"got {url!r}")
+        pool, cont = parts[0], parts[1]
+    else:
+        pool = parsed.netloc
+        parts = [p for p in parsed.path.split("/") if p]
+        cont = parts[0] if parts else ""
+    if not pool or not cont:
+        raise ValueError(
+            "daos url must be daos://<pool>/<container> or "
+            f"plugin://<name>/<pool>/<container>, got {url!r}")
+    return pool, cont, parse_qs(parsed.query).get("sys", [None])[0]
+
 
 def _key_to_path(key) -> str:
     """Map a CacheEngineKey to a flat DFS path.
@@ -75,65 +107,31 @@ def _key_to_path(key) -> str:
 
 
 class DaosConnector(RemoteConnector):
-    # LMCache 0.5.2 DynamicConnectorAdapter.create_connector() instantiates a
-    # RemoteConnector subclass as
-    #     cls(loop=..., local_cpu_backend=..., config=...)
-    # (no ``url`` argument). The remote URL comes from ``config.remote_url`` and
-    # is routed to this class by the ``plugin://<name>`` scheme, so we accept
-    #     plugin://daos/<pool>/<container>[?sys=<sysname>]
-    # and still tolerate a bare daos://<pool>/<container>.
-    def __init__(self, loop=None, local_cpu_backend=None, config=None):
+    def __init__(self, url=None, loop=None, local_cpu_backend=None, config=None):
+        # LMCache's DynamicConnectorAdapter instantiates us as
+        #   cls(loop=..., local_cpu_backend=..., config=...)
+        # -- no url argument -- so the target is taken from config.remote_url.
+        # Direct construction (tests) may still pass url positionally.
         if not _HAS_LMCACHE:
             raise RuntimeError("DaosConnector requires LMCache to be installed")
-        if config is None:
-            raise ValueError("DaosConnector requires config (config.remote_url)")
-        metadata = getattr(local_cpu_backend, "metadata", None)
-        super().__init__(config, metadata)
+        if local_cpu_backend is None:
+            raise ValueError("DaosConnector requires a local_cpu_backend")
+        cfg = config if config is not None else local_cpu_backend.config
+        super().__init__(cfg, local_cpu_backend.metadata)
 
-        url = config.remote_url
-        parsed = urlparse(url)
-        if parsed.scheme == "plugin":
-            # plugin://daos/<pool>/<container> : netloc is the plugin name,
-            # the pool/container live in the path.
-            parts = parsed.path.strip("/").split("/", 1)
-            pool = parts[0] if parts and parts[0] else ""
-            cont = parts[1] if len(parts) > 1 else ""
-        else:
-            # daos://<pool>/<container>
-            pool = parsed.netloc
-            cont = parsed.path.lstrip("/")
-        if not pool or not cont:
-            raise ValueError(
-                "daos url must be plugin://daos/<pool>/<container> "
-                f"(or daos://<pool>/<container>), got {url!r}")
-        sysname = parse_qs(parsed.query).get("sys", [None])[0]
+        if url is None:
+            url = getattr(cfg, "remote_url", None)
+            if not url:
+                raise ValueError(
+                    "DaosConnector: no url given and config.remote_url is unset")
+        pool, cont, sysname = _parse_daos_url(url)
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
-        # dfs_sys is opened with DFS_SYS_NO_LOCK, so a single handle is NOT safe
-        # for concurrent use. Over TCP the ops were slow enough to rarely
-        # overlap, but over verbs/RoCE the concurrent chunk reads race and
-        # corrupt each other's buffers. Give every worker thread its own
-        # dfs_sys connection (each used by exactly one thread => NO_LOCK-safe)
-        # so we keep the parallelism without a shared-handle data race.
-        self._dfs_params = (pool, cont, sysname)
-        self._tls = threading.local()
-        self._handles = []
-        self._handles_lock = threading.Lock()
-        self._dfs = self._handle()  # primary handle for the calling thread
+        self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
+        self._workers = 16
         self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=16, thread_name_prefix="daos-io")
-
-    def _handle(self) -> DfsSys:
-        """Return this thread's own dfs_sys handle, opening one on first use."""
-        h = getattr(self._tls, "dfs", None)
-        if h is None:
-            pool, cont, sysname = self._dfs_params
-            h = DfsSys(pool=pool, cont=cont, sys=sysname)
-            self._tls.dfs = h
-            with self._handles_lock:
-                self._handles.append(h)
-        return h
+            max_workers=self._workers, thread_name_prefix="daos-io")
 
     def _run(self, fn, *args):
         return self.loop.run_in_executor(self._pool, fn, *args)
@@ -143,7 +141,7 @@ class DaosConnector(RemoteConnector):
         return await self._run(self._exists_sync, _key_to_path(key))
 
     def _exists_sync(self, path) -> bool:
-        return self._handle().exists(path)
+        return self._dfs.exists(path)
 
     def exists_sync(self, key) -> bool:
         return self._dfs.exists(_key_to_path(key))
@@ -160,6 +158,8 @@ class DaosConnector(RemoteConnector):
         return True
 
     async def batched_get(self, keys) -> List[Optional["MemoryObj"]]:
+        """Fetch every key. Unlike the *_non_blocking variant this has no prefix
+        semantics -- the result is positional, with None for a miss."""
         import time as _t
         t0 = _t.perf_counter()
         paths = [_key_to_path(k) for k in keys]
@@ -262,12 +262,20 @@ class DaosConnector(RemoteConnector):
                 yield idx, res
 
     async def put(self, key, memory_obj: "MemoryObj"):
-        # Zero-copy: alias the MemoryObj buffer instead of materialising it.
-        # The old path did bytes(byte_array) → serde.pack concat → ctypes
-        # create_string_buffer = THREE full copies of every chunk (120 MB of
-        # GIL-held memcpy per 40 MB chunk), which measured as ~1 GB/s effective
-        # store (+5.2s on a 5.24 GB store). Header and payload are written as
-        # two offset writes so the payload never needs to be concatenated.
+        header, src, n = self._prep_write(memory_obj)
+        await self._run(self._put_sync, _key_to_path(key), header, src, n)
+
+    def _prep_write(self, memory_obj):
+        """Build ``(header, src, n)`` for a zero-copy write.
+
+        The old path did ``bytes(byte_array)`` -> ``serde.pack`` concat ->
+        ``create_string_buffer``: THREE full copies of every chunk, 120 MB of
+        GIL-held memcpy per 40 MB chunk, measured as ~1 GB/s effective store
+        (+5.2 s on a 5.24 GB store). Here ``src`` merely *aliases* the MemoryObj
+        buffer, and header and payload are written as two offset writes so the
+        payload is never concatenated. Store overhead went +5178 -> +65 ms at 8K
+        and +136 ms at 31K.
+        """
         view = memory_obj.byte_array
         if not isinstance(view, memoryview):
             view = memoryview(view)
@@ -280,33 +288,95 @@ class DaosConnector(RemoteConnector):
             memory_obj.get_memory_format(),
         ).serialize()
         header = serde.prefix_pack(len(meta_bytes), n) + meta_bytes
-        src = (ctypes.c_char * n).from_buffer(view)
-        await self._run(self._put_sync, _key_to_path(key), header, src, n)
+        return header, (ctypes.c_char * n).from_buffer(view), n
 
     def _put_sync(self, path, header, src, n):
-        dfs = self._handle()
-        obj = dfs.open_rdwr_create(path)
+        obj = self._dfs.open_rdwr_create(path)
         try:
             hdr = (ctypes.c_char * len(header)).from_buffer_copy(header)
-            dfs.write_obj_from(obj, 0, len(header), hdr)       # tiny (~36 B)
-            dfs.write_obj_from(obj, len(header), n, src)       # bulk, no copy
+            self._dfs.write_obj_from(obj, 0, len(header), hdr)   # tiny (~36 B)
+            self._dfs.write_obj_from(obj, len(header), n, src)   # bulk, no copy
         finally:
-            dfs.close_obj(obj)
+            self._dfs.close_obj(obj)
+
+    # -- batched interface --------------------------------------------------
+    # Only get/put are overridden, and only because measurement said so.
+    #
+    # Every chunk is its own DFS object, so these are concurrent fan-outs over
+    # the thread pool, not true batch RPCs the way Redis's batch_exists_sync is.
+    # Collapsing N operations into one request needs the dkey/akey layout where
+    # the chunks of a prefix share a dkey.
+    #
+    # Measured on nvme_pool, 19 objects per batch (a 4864-token prefix):
+    #
+    #   chunk    PUT seq -> batched        GET seq -> batched
+    #    1 MiB   106.8 -> 44.4 ms  2.41x    69.3 -> 19.8 ms  3.49x
+    #    4 MiB   248.1 -> 152.8 ms 1.62x   133.9 -> 54.9 ms  2.44x
+    #   16 MiB   862.4 -> 643.6 ms 1.34x   436.1 -> 148.1 ms 2.95x
+    #
+    # batched_contains is deliberately NOT overridden. It looks like the obvious
+    # win -- the inherited fallback is a *sequential* `for key in keys:
+    # contains(key)` loop, 128 round trips for a 32K prefix -- but dfs_sys_open +
+    # close on an existing object costs only ~69 us, so the whole sequential
+    # probe is 8.8 ms and thread-dispatch overhead cancels the parallelism: a
+    # windowed fan-out measured 9.4 ms, i.e. 0.9x. Against a ~500 ms retrieve it
+    # is noise either way. Left inherited (support_batched_contains() -> False)
+    # rather than carrying code that buys nothing. Worth revisiting only with
+    # data from a low-hit-rate fleet, where the argument would be about wasted
+    # server operations rather than latency.
+    #
+    # batched_async_contains and batched_get_non_blocking are also left
+    # inherited: both already fan out via asyncio.gather over our per-key
+    # methods, and get_non_blocking carries the ref_count_down() discipline for
+    # objects after the first failure -- reimplementing that risks a MemoryObj
+    # leak for no measured gain.
+
+
+    def support_batched_put(self) -> bool:
+        return True
+
+    async def batched_put(self, keys, memory_objs):
+        # Zero-copy, same as put(). main's version built every blob first via
+        # _pack() -- for a 5.24 GB store that is 10.5 GB of GIL-held memcpy on
+        # the asyncio loop thread plus a 5.24 GB transient. _prep_write only
+        # aliases each buffer, so nothing is materialised here.
+        prepped = [self._prep_write(mo) for mo in memory_objs]
+        await asyncio.gather(*(
+            self._run(self._put_sync, _key_to_path(k), h, s, n)
+            for k, (h, s, n) in zip(keys, prepped)
+        ))
+
+
 
     async def list(self) -> List[str]:
-        # Optional for a cache backend; requires dfs_sys_opendir/readdir
-        # marshalling (Phase 4). Enumeration is never needed on the hot path.
-        return []
+        """Enumerate the object names in the container.
+
+        LIMITATION -- the names are NOT reversible to ``CacheEngineKey``.
+        ``_key_to_path`` hashes the key with sha256, so what comes back here is
+        the 64-char digest. That is enough for capacity work (count, total
+        bytes, sweep-and-delete by path) but not for consumers that expect to
+        rebuild keys from names: LMCache's own ``fs_connector`` encodes the key
+        into the filename ('/' -> '-SEP-') and
+        ``internal_api_server/vllm/load_fs_chunks_api`` reverses it with
+        ``CacheEngineKey.from_string``. Making our names reversible means
+        changing the on-disk naming scheme, which invalidates every cached
+        object and interacts with the directory-fanout design -- so it is left
+        as an explicit decision rather than a silent change.
+        """
+        return await self._run(self._dfs.listdir, "/")
+
+    def remove_sync(self, key) -> bool:
+        """Delete one object. ``RemoteBackend.remove()`` calls this, so this is
+        what makes remote eviction work at all -- without it the container grows
+        without bound."""
+        return self._dfs.remove(_key_to_path(key))
 
     async def close(self):
         self._pool.shutdown(wait=True)
-        with self._handles_lock:
-            handles = list(self._handles)
-        for h in handles:
-            try:
-                h.close()
-            except Exception:
-                pass
+        try:
+            self._dfs.close()
+        except Exception:
+            pass
 
     # -- runs inside the thread pool ---------------------------------------
     @staticmethod
@@ -349,7 +419,7 @@ class DaosConnector(RemoteConnector):
         main's path does not scale at all -- the two full Python-level copies
         hold the GIL, so 16 threads serialise. Keeping its safety costs 2%.
         """
-        dfs = self._handle()  # this worker thread's own dfs_sys handle
+        dfs = self._dfs
         # One open for prefix + metadata + payload (was 3 opens: exists + meta +
         # payload). Missing key => open raises ENOENT, which we map to None.
         try:

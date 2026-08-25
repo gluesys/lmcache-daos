@@ -3,18 +3,27 @@
 #   daos cont create <pool> <container> --type POSIX
 #
 # Then run vLLM with:  LMCACHE_CONFIG_FILE=examples/lmcache_daos.yaml
+#
+# IMPORTANT -- url spelling (measured against LMCache 0.5.2):
+# LMCache wraps an out-of-tree RemoteConnector subclass in its
+# DynamicConnectorAdapter, whose schema is "plugin://<plugin_type>" and whose
+# can_parse() is a startswith() test. So the scheme must be `plugin://` with the
+# plugin name first; the pool and container ride along in the path. A plain
+# `daos://...` url matches no adapter and CreateConnector raises
+# "No adapter found for URL: daos://...".
 
 chunk_size: 256
 
-# daos://<pool>/<container>[?sys=<sysname>]
-remote_url: "daos://tank/lmcache"
+# plugin://<plugin_name>/<pool>/<container>[?sys=<sysname>]
+remote_url: "plugin://daos/hdd_pool/lmcache_test"
 
 # Serializer for the transfer channel; DAOS stores whatever bytes it is given.
 remote_serde: "naive"
 
-# Register the out-of-tree connector so LMCache's RemoteBackend can route the
-# daos:// scheme to it. (Exact key names track the target LMCache release --
-# verify against its docs when pinning a version.)
+# Register the out-of-tree connector so LMCache's ConnectorManager builds a
+# DynamicConnectorAdapter for it. The plugin name here ("daos") is what forms
+# the url schema above; "<type>.<instance>" is also allowed and matches on the
+# type part.
 remote_storage_plugins: ["daos"]
 extra_config:
   remote_storage_plugin.daos.module_path: lmcache_daos.connector

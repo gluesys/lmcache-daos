@@ -33,6 +33,20 @@ DFS_SYS_NO_LOCK = 2
 
 _S_IFREG = stat.S_IFREG  # dfs_sys_open requires S_IFMT bits to match object type
 
+
+class _Dirent(ctypes.Structure):
+    """glibc x86_64 ``struct dirent`` -- dfs_sys_readdir hands back a pointer to
+    one of these. Only ``d_name`` is used; the buffer may be reused between
+    calls, so the name is copied out immediately."""
+
+    _fields_ = [
+        ("d_ino", ctypes.c_ulong),
+        ("d_off", ctypes.c_long),
+        ("d_reclen", ctypes.c_ushort),
+        ("d_type", ctypes.c_ubyte),
+        ("d_name", ctypes.c_char * 256),
+    ]
+
 _daos = None  # libdaos handle
 _dfs = None   # libdfs handle
 
@@ -147,6 +161,22 @@ def _load() -> None:
         ctypes.c_void_p,
     ]
 
+    # int dfs_sys_opendir(dfs_sys_t *, const char *dir, int flags, DIR **dirp);
+    # int dfs_sys_readdir(dfs_sys_t *, DIR *dirp, struct dirent **dirent);
+    # int dfs_sys_closedir(DIR *dirp);
+    # readdir returns 0 and sets *dirent to NULL once the directory is drained.
+    _dfs.dfs_sys_opendir.restype = ctypes.c_int
+    _dfs.dfs_sys_opendir.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _dfs.dfs_sys_readdir.restype = ctypes.c_int
+    _dfs.dfs_sys_readdir.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_Dirent)),
+    ]
+    _dfs.dfs_sys_closedir.restype = ctypes.c_int
+    _dfs.dfs_sys_closedir.argtypes = [ctypes.c_void_p]
+
     # -- async path: the base dfs API, not the dfs_sys wrapper ---------------
     # int dfs_sys2base(dfs_sys_t *dfs_sys, dfs_t **dfs);
     _dfs.dfs_sys2base.restype = ctypes.c_int
@@ -184,6 +214,15 @@ class DfsSys:
 
     _daos_inited = False
 
+    # sflags defaults to 0 -- dfs_sys caching AND locking on.
+    #
+    # This used to pass DFS_SYS_NO_LOCK, which daos_fs_sys.h documents as
+    # "Turn off locking. Useful for single-threaded applications." The connector
+    # is emphatically not single-threaded: one DfsSys handle is shared across a
+    # 16-thread pool, and the lock is what protects dfs_sys's internal directory
+    # cache. Tests passing under that flag was absence of observed failure, not
+    # safety. Caching is left on because every path here is "/<sha256>", so the
+    # root directory entry is looked up on literally every operation.
     def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
                  mflags: int = DFS_RDWR,
                  sflags: int = 0):
@@ -389,6 +428,41 @@ class DfsSys:
             raise
         _dfs.dfs_sys_close(obj)
         return True
+
+    # -- enumeration --------------------------------------------------------
+    def iterdir(self, path: str = "/"):
+        """Yield entry names under ``path``.
+
+        A generator on purpose: a KV container can hold hundreds of thousands of
+        objects and callers that only need a count or a running total should not
+        have to materialise the whole list.
+        """
+        dirp = ctypes.c_void_p()
+        rc = _dfs.dfs_sys_opendir(self._sys, path.encode(), 0, ctypes.byref(dirp))
+        if rc != 0:
+            raise DaosError(f"dfs_sys_opendir({path})", rc)
+        try:
+            while True:
+                ent = ctypes.POINTER(_Dirent)()
+                rc = _dfs.dfs_sys_readdir(self._sys, dirp, ctypes.byref(ent))
+                if rc != 0:
+                    raise DaosError(f"dfs_sys_readdir({path})", rc)
+                if not ent:                      # NULL => end of directory
+                    break
+                name = ent.contents.d_name.decode("utf-8", "replace")
+                if name in (".", ".."):
+                    continue
+                yield name
+        finally:
+            _dfs.dfs_sys_closedir(dirp)
+
+    def listdir(self, path: str = "/", limit: Optional[int] = None) -> list:
+        out = []
+        for name in self.iterdir(path):
+            out.append(name)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
 
     def remove(self, path: str) -> bool:
         # mode=0 skips the type check; force=False (force=True yields ENOTSUP on
