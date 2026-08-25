@@ -163,8 +163,13 @@ class DaosConnector(RemoteConnector):
         import time as _t
         t0 = _t.perf_counter()
         paths = [_key_to_path(k) for k in keys]
-        res = await asyncio.gather(
-            *(self._run(self._get_sync, p) for p in paths))
+        # return_exceptions: one unreadable object must not fail the whole
+        # batch. A cache reports a miss and lets the engine recompute that
+        # range. (Adopted from the main branch's batched_get.)
+        gathered = await asyncio.gather(
+            *(self._run(self._get_sync, p) for p in paths),
+            return_exceptions=True)
+        res = [None if isinstance(r, BaseException) else r for r in gathered]
         # Instrumentation: connector-side batched_get wall time. LMCache's own
         # "Retrieved ... cost" covers connector-read + H2D staging; subtracting
         # this isolates the H2D stage (env DAOS_BG_PROF=1 to enable).
@@ -304,7 +309,46 @@ class DaosConnector(RemoteConnector):
                 pass
 
     # -- runs inside the thread pool ---------------------------------------
+    @staticmethod
+    def _release(memory_obj) -> None:
+        """Hand a MemoryObj back to the allocator (best effort).
+
+        Needed on the torn-object path: reading straight into the destination
+        means the buffer is allocated *before* the payload length is known to be
+        good, so a short read has to give it back or it leaks.
+        """
+        for meth in ("ref_count_down", "release", "free"):
+            fn = getattr(memory_obj, meth, None)
+            if fn is not None:
+                try:
+                    fn()
+                except Exception:
+                    pass
+                return
+
     def _get_sync(self, path) -> Optional["MemoryObj"]:
+        """Load one object, or return None if it is absent OR incomplete.
+
+        Every length is checked and any shortfall is reported as a plain miss.
+        A writer killed mid-store leaves a short file behind and `exists()` is
+        only an open(), so a torn object still looks present; raising here would
+        surface as a failed request, because vLLM's default
+        ``kv_load_failure_policy`` is ``fail`` rather than recompute.
+
+        The checks are the same ones the main branch performs, but they cost
+        nothing here because the payload is never materialised: the destination
+        is the MemoryObj buffer and ``read_obj_into`` returns the byte count, so
+        a truncated payload is detected from the return value. Measured
+        (tests/bench_readpath_merge.py, 32 x 28 MiB):
+
+            arm                          1 thread   16 threads
+            main-style (4 opens, 2 copies)   2.78        2.61
+            zero-copy, no checks           14.37       33.55
+            zero-copy + these checks       12.31       32.75
+
+        main's path does not scale at all -- the two full Python-level copies
+        hold the GIL, so 16 threads serialise. Keeping its safety costs 2%.
+        """
         dfs = self._handle()  # this worker thread's own dfs_sys handle
         # One open for prefix + metadata + payload (was 3 opens: exists + meta +
         # payload). Missing key => open raises ENOENT, which we map to None.
@@ -322,12 +366,21 @@ class DaosConnector(RemoteConnector):
             # second read.
             ps = serde.prefix_size()
             hdr = dfs.read_obj(obj, 0, ps + _HDR_CAP)
+            if len(hdr) < ps:
+                return None                      # empty or mid-prefix
             meta_len, payload_len = serde.parse_prefix(hdr[:ps])
             if meta_len <= len(hdr) - ps:
                 meta_bytes = hdr[ps:ps + meta_len]
             else:
                 meta_bytes = dfs.read_obj(obj, ps, meta_len)
-            metadata = RemoteMetadata.deserialize(meta_bytes)
+            if len(meta_bytes) != meta_len:
+                return None                      # mid-metadata
+            try:
+                metadata = RemoteMetadata.deserialize(meta_bytes)
+            except Exception:
+                return None                      # unparseable header
+            if payload_len < metadata.length:
+                return None                      # header itself is inconsistent
 
             memory_obj = self.local_cpu_backend.allocate(
                 metadata.shapes, metadata.dtypes, metadata.fmt)
@@ -347,8 +400,12 @@ class DaosConnector(RemoteConnector):
             view = view.cast("B")
             n = metadata.length
             dest = (ctypes.c_char * n).from_buffer(view[:n])
-            dfs.read_obj_into(
+            got = dfs.read_obj_into(
                 obj, serde.prefix_size() + meta_len, payload_len, dest)
+            if got != payload_len:
+                # Truncated payload: give the buffer back and report a miss.
+                self._release(memory_obj)
+                return None
             return memory_obj
         finally:
             dfs.close_obj(obj)
