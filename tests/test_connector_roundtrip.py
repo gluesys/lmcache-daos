@@ -29,6 +29,7 @@ def main():
     from lmcache_daos.connector import DaosConnector
 
     config = LMCacheEngineConfig.from_defaults()
+    config.remote_url = f"plugin://daos/{POOL}/{CONT}"
     metadata = LMCacheMetadata(
         model_name="test-model",
         world_size=1,
@@ -57,8 +58,14 @@ def main():
     key = CacheEngineKey("test-model", 1, 0, 0xDEADBEEF, dtype)
 
     loop = asyncio.new_event_loop()
-    conn = DaosConnector(f"daos://{POOL}/{CONT}", loop, lcb)
+    conn = DaosConnector(loop=loop, local_cpu_backend=lcb, config=config)
     try:
+        # ensure a clean slate (a previous run may have left this key behind)
+        from lmcache_daos.connector import _key_to_path
+        try:
+            conn._dfs.remove(_key_to_path(key))
+        except Exception:
+            pass
         assert not loop.run_until_complete(conn.exists(key)), "key should not exist yet"
         loop.run_until_complete(conn.put(key, mo))
         print("put OK")

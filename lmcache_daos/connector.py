@@ -29,12 +29,16 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import hashlib
+import os
+import threading
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import serde
-from .dfs_binding import DfsSys
+from .dfs_binding import DfsSys, DaosError
+from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
 # stays inspectable/unit-testable elsewhere.
@@ -53,6 +57,12 @@ except Exception:  # pragma: no cover - exercised only off the serving host
             pass
 
 
+# How many bytes past the 8-byte prefix to grab in the header read. LMCache's
+# RemoteMetadata for a KV chunk serializes to ~28 B; 512 leaves ample room so
+# prefix+meta come back in a single round-trip.
+_HDR_CAP = 512
+
+
 def _key_to_path(key) -> str:
     """Map a CacheEngineKey to a flat DFS path.
 
@@ -65,33 +75,75 @@ def _key_to_path(key) -> str:
 
 
 class DaosConnector(RemoteConnector):
-    def __init__(self, url, loop, local_cpu_backend):
+    # LMCache 0.5.2 DynamicConnectorAdapter.create_connector() instantiates a
+    # RemoteConnector subclass as
+    #     cls(loop=..., local_cpu_backend=..., config=...)
+    # (no ``url`` argument). The remote URL comes from ``config.remote_url`` and
+    # is routed to this class by the ``plugin://<name>`` scheme, so we accept
+    #     plugin://daos/<pool>/<container>[?sys=<sysname>]
+    # and still tolerate a bare daos://<pool>/<container>.
+    def __init__(self, loop=None, local_cpu_backend=None, config=None):
         if not _HAS_LMCACHE:
             raise RuntimeError("DaosConnector requires LMCache to be installed")
-        super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+        if config is None:
+            raise ValueError("DaosConnector requires config (config.remote_url)")
+        metadata = getattr(local_cpu_backend, "metadata", None)
+        super().__init__(config, metadata)
 
+        url = config.remote_url
         parsed = urlparse(url)
-        # LMCache routes external plugins by name; tolerate either the plugin's
-        # own scheme or a plain daos:// url.
-        pool = parsed.netloc
-        cont = parsed.path.lstrip("/")
+        if parsed.scheme == "plugin":
+            # plugin://daos/<pool>/<container> : netloc is the plugin name,
+            # the pool/container live in the path.
+            parts = parsed.path.strip("/").split("/", 1)
+            pool = parts[0] if parts and parts[0] else ""
+            cont = parts[1] if len(parts) > 1 else ""
+        else:
+            # daos://<pool>/<container>
+            pool = parsed.netloc
+            cont = parsed.path.lstrip("/")
         if not pool or not cont:
             raise ValueError(
-                f"daos url must be daos://<pool>/<container>, got {url!r}")
+                "daos url must be plugin://daos/<pool>/<container> "
+                f"(or daos://<pool>/<container>), got {url!r}")
         sysname = parse_qs(parsed.query).get("sys", [None])[0]
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
-        self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
+        # dfs_sys is opened with DFS_SYS_NO_LOCK, so a single handle is NOT safe
+        # for concurrent use. Over TCP the ops were slow enough to rarely
+        # overlap, but over verbs/RoCE the concurrent chunk reads race and
+        # corrupt each other's buffers. Give every worker thread its own
+        # dfs_sys connection (each used by exactly one thread => NO_LOCK-safe)
+        # so we keep the parallelism without a shared-handle data race.
+        self._dfs_params = (pool, cont, sysname)
+        self._tls = threading.local()
+        self._handles = []
+        self._handles_lock = threading.Lock()
+        self._dfs = self._handle()  # primary handle for the calling thread
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=16, thread_name_prefix="daos-io")
+
+    def _handle(self) -> DfsSys:
+        """Return this thread's own dfs_sys handle, opening one on first use."""
+        h = getattr(self._tls, "dfs", None)
+        if h is None:
+            pool, cont, sysname = self._dfs_params
+            h = DfsSys(pool=pool, cont=cont, sys=sysname)
+            self._tls.dfs = h
+            with self._handles_lock:
+                self._handles.append(h)
+        return h
 
     def _run(self, fn, *args):
         return self.loop.run_in_executor(self._pool, fn, *args)
 
     # -- RemoteConnector interface -----------------------------------------
     async def exists(self, key) -> bool:
-        return await self._run(self._dfs.exists, _key_to_path(key))
+        return await self._run(self._exists_sync, _key_to_path(key))
+
+    def _exists_sync(self, path) -> bool:
+        return self._handle().exists(path)
 
     def exists_sync(self, key) -> bool:
         return self._dfs.exists(_key_to_path(key))
@@ -99,17 +151,142 @@ class DaosConnector(RemoteConnector):
     async def get(self, key) -> Optional["MemoryObj"]:
         return await self._run(self._get_sync, _key_to_path(key))
 
+    # LMCache dispatches per-chunk get() concurrently, but also probes for a
+    # batched hook. Advertising it lets us gather every chunk of a request onto
+    # the thread pool in one shot; because _get_sync reads the payload straight
+    # into the target buffer via a GIL-releasing ctypes call, the chunk reads
+    # actually overlap instead of serializing on the interpreter lock.
+    def support_batched_get(self) -> bool:
+        return True
+
+    async def batched_get(self, keys) -> List[Optional["MemoryObj"]]:
+        import time as _t
+        t0 = _t.perf_counter()
+        paths = [_key_to_path(k) for k in keys]
+        res = await asyncio.gather(
+            *(self._run(self._get_sync, p) for p in paths))
+        # Instrumentation: connector-side batched_get wall time. LMCache's own
+        # "Retrieved ... cost" covers connector-read + H2D staging; subtracting
+        # this isolates the H2D stage (env DAOS_BG_PROF=1 to enable).
+        if os.environ.get("DAOS_BG_PROF") == "1" and len(keys) > 2:
+            nb = 0
+            for o in res:
+                if o is not None:
+                    try:
+                        nb += len(memoryview(o.byte_array).cast("B"))
+                    except Exception:
+                        pass
+            dt = _t.perf_counter() - t0
+            import sys as _s
+            _s.stderr.write(
+                f"[CONN-BG] chunks={len(keys)} bytes={nb} wall={dt*1000:.1f}ms "
+                f"= {nb/dt/1e9:.2f} GB/s\n")
+            _s.stderr.flush()
+        return res
+
+    # LMCache's async-loading path (storage_manager) prefers this over the
+    # blocking variant: it is awaited as a coroutine so the engine can overlap
+    # scheduling/H2D with the DAOS reads instead of running read-all → H2D-all
+    # strictly serially (that serialization is what caps retrieve at
+    # read⊕H2D ≈ 19 GB/s even though read alone does 34 and H2D 46).
+    # Contract (per base_connector): return only the CONSECUTIVE prefix of
+    # successfully retrieved objects; release anything after the first miss.
+    # MEASURED (2026-08-25): enabling this path did NOT unlock read↔H2D
+    # pipelining — the API returns a list, so all chunks must still be read
+    # before LMCache starts H2D. Aggregate was flat (conc4 +6%) and single
+    # request regressed 1.7× (172→288ms), so we opt out and keep the blocking
+    # batched_get. The implementation is retained for the day LMCache offers
+    # incremental/streaming chunk delivery.
+    def support_batched_get_non_blocking(self) -> bool:
+        return False
+
+    async def batched_get_non_blocking(self, lookup_id, keys):
+        paths = [_key_to_path(k) for k in keys]
+        res = await asyncio.gather(
+            *(self._run(self._get_sync, p) for p in paths))
+        prefix = []
+        for obj in res:
+            if obj is None:
+                break
+            prefix.append(obj)
+        for obj in res[len(prefix):]:
+            if obj is None:
+                continue
+            # avoid leaking allocations past the first miss
+            for meth in ("ref_count_down", "release", "free"):
+                fn = getattr(obj, meth, None)
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+        return prefix
+
+    # -- P4: completion-ordered streaming --------------------------------
+    # Not part of LMCache 0.5.2's connector interface -- this is the reference
+    # implementation for the upstream streaming-get RFC. LMCache will not call
+    # it until such an API lands; until then it costs nothing and is exercised
+    # by tests/bench_stream_h2d.py, which measures the overlap it enables.
+    #
+    # Deliberately built on the existing blocking thread pool rather than DAOS
+    # event queues: measured, the event path caps near 7-12 GB/s however the
+    # queues are arranged (per-EQ eqx_lock serialises submit+completion, and
+    # each extra EQ costs a network context), while the blocking pool reaches
+    # 34.3 GB/s on a 100 GB NVMe-resident working set. Completion ordering does
+    # not require DAOS events -- a resolved future is a completion.
+    def support_stream_get(self) -> bool:
+        return True
+
+    async def stream_get(self, keys, max_inflight: int = 16):
+        """Yield ``(index, MemoryObj | None)`` as each chunk finishes reading.
+
+        ``index`` is the position in ``keys``, so the consumer can copy each
+        chunk into its slot the moment it lands instead of waiting for the whole
+        batch. ``None`` means miss-or-error for that chunk; the stream continues
+        (per-chunk error semantics, as the RFC proposes).
+        """
+        paths = [_key_to_path(k) for k in keys]
+        async for idx, res in stream_completions(
+                self.loop, self._pool, self._get_sync, paths, max_inflight):
+            if isinstance(res, BaseException):
+                # A single unreadable chunk must not poison the batch; the
+                # engine treats it as a miss and recomputes that range.
+                yield idx, None
+            else:
+                yield idx, res
+
     async def put(self, key, memory_obj: "MemoryObj"):
-        # Extract on the calling thread (cheap), do the write in the pool.
-        kv_bytes = bytes(memory_obj.byte_array)
+        # Zero-copy: alias the MemoryObj buffer instead of materialising it.
+        # The old path did bytes(byte_array) → serde.pack concat → ctypes
+        # create_string_buffer = THREE full copies of every chunk (120 MB of
+        # GIL-held memcpy per 40 MB chunk), which measured as ~1 GB/s effective
+        # store (+5.2s on a 5.24 GB store). Header and payload are written as
+        # two offset writes so the payload never needs to be concatenated.
+        view = memory_obj.byte_array
+        if not isinstance(view, memoryview):
+            view = memoryview(view)
+        view = view.cast("B")
+        n = len(view)
         meta_bytes = RemoteMetadata(
-            len(kv_bytes),
+            n,
             memory_obj.get_shapes(),
             memory_obj.get_dtypes(),
             memory_obj.get_memory_format(),
         ).serialize()
-        blob = serde.pack(meta_bytes, kv_bytes)
-        await self._run(self._dfs.write, _key_to_path(key), blob)
+        header = serde.prefix_pack(len(meta_bytes), n) + meta_bytes
+        src = (ctypes.c_char * n).from_buffer(view)
+        await self._run(self._put_sync, _key_to_path(key), header, src, n)
+
+    def _put_sync(self, path, header, src, n):
+        dfs = self._handle()
+        obj = dfs.open_rdwr_create(path)
+        try:
+            hdr = (ctypes.c_char * len(header)).from_buffer_copy(header)
+            dfs.write_obj_from(obj, 0, len(header), hdr)       # tiny (~36 B)
+            dfs.write_obj_from(obj, len(header), n, src)       # bulk, no copy
+        finally:
+            dfs.close_obj(obj)
 
     async def list(self) -> List[str]:
         # Optional for a cache backend; requires dfs_sys_opendir/readdir
@@ -118,30 +295,60 @@ class DaosConnector(RemoteConnector):
 
     async def close(self):
         self._pool.shutdown(wait=True)
-        self._dfs.close()
+        with self._handles_lock:
+            handles = list(self._handles)
+        for h in handles:
+            try:
+                h.close()
+            except Exception:
+                pass
 
     # -- runs inside the thread pool ---------------------------------------
     def _get_sync(self, path) -> Optional["MemoryObj"]:
-        if not self._dfs.exists(path):
-            return None
-        meta_len, payload_len = serde.parse_prefix(
-            self._dfs.read(path, 0, serde.prefix_size()))
-        meta_bytes = self._dfs.read(path, serde.prefix_size(), meta_len)
-        metadata = RemoteMetadata.deserialize(meta_bytes)
+        dfs = self._handle()  # this worker thread's own dfs_sys handle
+        # One open for prefix + metadata + payload (was 3 opens: exists + meta +
+        # payload). Missing key => open raises ENOENT, which we map to None.
+        try:
+            obj = dfs.open_rdonly(path)
+        except DaosError as e:
+            if getattr(e, "rc", None) == 2:  # ENOENT
+                return None
+            raise
+        try:
+            # One small read grabs the prefix AND the (tiny) metadata together
+            # -- KV RemoteMetadata is ~28 B, so prefix+meta almost always fit in
+            # _HDR_CAP, cutting the per-chunk round-trips from 3 reads to 2
+            # (header + payload). Only a pathologically large meta needs a
+            # second read.
+            ps = serde.prefix_size()
+            hdr = dfs.read_obj(obj, 0, ps + _HDR_CAP)
+            meta_len, payload_len = serde.parse_prefix(hdr[:ps])
+            if meta_len <= len(hdr) - ps:
+                meta_bytes = hdr[ps:ps + meta_len]
+            else:
+                meta_bytes = dfs.read_obj(obj, ps, meta_len)
+            metadata = RemoteMetadata.deserialize(meta_bytes)
 
-        memory_obj = self.local_cpu_backend.allocate(
-            metadata.shapes, metadata.dtypes, metadata.fmt)
-        if memory_obj is None:
-            return None
+            memory_obj = self.local_cpu_backend.allocate(
+                metadata.shapes, metadata.dtypes, metadata.fmt)
+            if memory_obj is None:
+                return None
 
-        kv_bytes = self._dfs.read(
-            path, serde.prefix_size() + meta_len, payload_len)
-
-        view = memory_obj.byte_array
-        if isinstance(view, memoryview):
-            if view.format == "<B":
-                view = view.cast("B")
-        else:
-            view = memoryview(view)
-        view[: metadata.length] = kv_bytes
-        return memory_obj
+            # Read the (large) payload straight into the target MemoryObj
+            # buffer: no intermediate bytes object, no second GIL-held memcpy.
+            # dfs_sys_read is a ctypes C call that releases the GIL, so with the
+            # thread-pool + per-thread handles the concurrent chunk reads truly
+            # overlap -- this is the retrieve-pipeline parallelization. (Over
+            # UCX the aliased buffer reads back correctly; the corruption seen
+            # earlier was the libfabric verbs;ofi_rxm bug, not this alias.)
+            view = memory_obj.byte_array
+            if not isinstance(view, memoryview):
+                view = memoryview(view)
+            view = view.cast("B")
+            n = metadata.length
+            dest = (ctypes.c_char * n).from_buffer(view[:n])
+            dfs.read_obj_into(
+                obj, serde.prefix_size() + meta_len, payload_len, dest)
+            return memory_obj
+        finally:
+            dfs.close_obj(obj)

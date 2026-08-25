@@ -37,6 +37,29 @@ _daos = None  # libdaos handle
 _dfs = None   # libdfs handle
 
 
+# ---- gurt/types.h scatter-gather types -----------------------------------
+# Needed only for the async path: dfs_read() takes a d_sg_list_t whose storage
+# must outlive the operation, so the caller has to own it (see submit_read).
+class DIov(ctypes.Structure):
+    """``d_iov_t`` — {void *iov_buf; size_t iov_buf_len; size_t iov_len;}"""
+
+    _fields_ = [
+        ("iov_buf", ctypes.c_void_p),
+        ("iov_buf_len", ctypes.c_size_t),
+        ("iov_len", ctypes.c_size_t),
+    ]
+
+
+class DSgList(ctypes.Structure):
+    """``d_sg_list_t`` — {uint32 sg_nr; uint32 sg_nr_out; d_iov_t *sg_iovs;}"""
+
+    _fields_ = [
+        ("sg_nr", ctypes.c_uint32),
+        ("sg_nr_out", ctypes.c_uint32),
+        ("sg_iovs", ctypes.POINTER(DIov)),
+    ]
+
+
 class DaosError(OSError):
     """Raised when a DAOS/DFS call returns a non-zero status."""
 
@@ -124,6 +147,32 @@ def _load() -> None:
         ctypes.c_void_p,
     ]
 
+    # -- async path: the base dfs API, not the dfs_sys wrapper ---------------
+    # int dfs_sys2base(dfs_sys_t *dfs_sys, dfs_t **dfs);
+    _dfs.dfs_sys2base.restype = ctypes.c_int
+    _dfs.dfs_sys2base.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+
+    # int dfs_read(dfs_t *dfs, dfs_obj_t *obj, d_sg_list_t *sgl,
+    #              daos_off_t off, daos_size_t *read_size, daos_event_t *ev);
+    _dfs.dfs_read.restype = ctypes.c_int
+    _dfs.dfs_read.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(DSgList),
+        ctypes.c_ulonglong, ctypes.POINTER(ctypes.c_ulonglong),
+        ctypes.c_void_p,
+    ]
+
+
+def libdaos() -> ctypes.CDLL:
+    """Return the loaded ``libdaos`` handle (loading it if needed).
+
+    Exposed for :mod:`lmcache_daos.daos_event`, which declares the event/event
+    queue prototypes on the same handle instead of dlopen'ing a second copy.
+    """
+    _load()
+    return _daos
+
 
 class DfsSys:
     """Thin object wrapper over a single mounted dfs_sys namespace.
@@ -136,7 +185,8 @@ class DfsSys:
     _daos_inited = False
 
     def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
-                 mflags: int = DFS_RDWR, sflags: int = DFS_SYS_NO_LOCK):
+                 mflags: int = DFS_RDWR,
+                 sflags: int = DFS_SYS_NO_CACHE | DFS_SYS_NO_LOCK):
         _load()
         if not DfsSys._daos_inited:
             rc = _daos.daos_init()
@@ -148,6 +198,7 @@ class DfsSys:
             DfsSys._daos_inited = True
 
         self._sys = ctypes.c_void_p()
+        self._base = None  # lazily resolved dfs_t* (async path); see base()
         rc = _dfs.dfs_sys_connect(
             pool.encode(), sys.encode() if sys else None, cont.encode(),
             mflags, sflags, None, ctypes.byref(self._sys),
@@ -182,6 +233,24 @@ class DfsSys:
         finally:
             _dfs.dfs_sys_close(obj)
 
+    def open_rdwr_create(self, path: str) -> ctypes.c_void_p:
+        return self._open(path, DFS_RDWR | os.O_CREAT, create=True)
+
+    def write_obj_from(self, obj: ctypes.c_void_p, offset: int, length: int,
+                       src) -> int:
+        """Write ``length`` bytes from a caller-provided buffer at ``offset``.
+
+        ``src`` is a ctypes array/pointer (e.g. ``(c_char*n).from_buffer(mv)``
+        aliasing a MemoryObj) so no copy is made. Mirrors read_obj_into: the
+        ctypes call releases the GIL for the duration of the write.
+        """
+        size = ctypes.c_ulonglong(length)
+        rc = _dfs.dfs_sys_write(self._sys, obj, src, offset,
+                                ctypes.byref(size), None)
+        if rc != 0:
+            raise DaosError("dfs_sys_write", rc)
+        return size.value
+
     def read(self, path: str, offset: int, length: int) -> bytes:
         """Read ``length`` bytes at ``offset``. Returns the bytes actually read."""
         obj = self._open(path, DFS_RDONLY, create=False)
@@ -195,6 +264,98 @@ class DfsSys:
             return buf.raw[:size.value]
         finally:
             _dfs.dfs_sys_close(obj)
+
+    # -- low-level single-open API (avoids re-open per read; enables reading a
+    #    blob's prefix/meta/payload with ONE open, and reading the large payload
+    #    straight into the caller's destination buffer with no intermediate copy) -
+    def open_rdonly(self, path: str) -> ctypes.c_void_p:
+        return self._open(path, DFS_RDONLY, create=False)
+
+    def close_obj(self, obj: ctypes.c_void_p) -> None:
+        _dfs.dfs_sys_close(obj)
+
+    def read_obj(self, obj: ctypes.c_void_p, offset: int, length: int) -> bytes:
+        """Read ``length`` bytes from an already-open object into fresh bytes."""
+        buf = ctypes.create_string_buffer(length)
+        size = ctypes.c_ulonglong(length)
+        rc = _dfs.dfs_sys_read(self._sys, obj, buf, offset,
+                               ctypes.byref(size), None)
+        if rc != 0:
+            raise DaosError("dfs_sys_read", rc)
+        return buf.raw[:size.value]
+
+    def read_obj_into(self, obj: ctypes.c_void_p, offset: int, length: int,
+                      dest) -> int:
+        """Read ``length`` bytes into a caller-provided writable buffer.
+
+        ``dest`` is a ctypes array/pointer whose capacity is >= ``length``
+        (typically ``(c_char * n).from_buffer(memoryview)`` aliasing the target
+        MemoryObj buffer -- no copy). ``dfs_sys_read`` is a ctypes C call, so it
+        releases the GIL for its duration; concurrent ``read_obj_into`` calls on
+        distinct objects/buffers therefore run truly in parallel instead of
+        serializing on the interpreter lock. Returns bytes actually read.
+        """
+        size = ctypes.c_ulonglong(length)
+        rc = _dfs.dfs_sys_read(self._sys, obj, dest, offset,
+                               ctypes.byref(size), None)
+        if rc != 0:
+            raise DaosError("dfs_sys_read", rc)
+        return size.value
+
+    # -- async read ---------------------------------------------------------
+    def base(self) -> ctypes.c_void_p:
+        """The underlying ``dfs_t *`` for this ``dfs_sys_t`` (cached).
+
+        ``daos_fs_sys.h`` explicitly sanctions this: *"the DFS API can be used
+        directly by getting the DFS Object with dfs_sys2base()"*.
+        """
+        if self._base is None:
+            h = ctypes.c_void_p()
+            rc = _dfs.dfs_sys2base(self._sys, ctypes.byref(h))
+            if rc != 0:
+                raise DaosError("dfs_sys2base", rc)
+            self._base = h
+        return self._base
+
+    def submit_read(self, obj: ctypes.c_void_p, offset: int, sgl: DSgList,
+                    size, ev_addr: int) -> None:
+        """Submit an asynchronous read; completion arrives via the event queue.
+
+        Uses ``dfs_read()`` directly rather than ``dfs_sys_read()``. That is not
+        a style preference — **``dfs_sys_read()`` cannot be used asynchronously
+        at all.** Its implementation (DAOS 2.8 ``src/client/dfs/dfs_sys.c``)
+        builds the scatter-gather list on its own stack::
+
+            d_iov_t     iov;
+            d_sg_list_t sgl;
+            d_iov_set(&iov, buf, *size);
+            sgl.sg_nr = 1; sgl.sg_iovs = &iov; sgl.sg_nr_out = 1;
+            return dfs_read(dfs_sys->dfs, obj, &sgl, off, size, ev);
+
+        With ``ev != NULL`` that call returns immediately and the frame dies,
+        but DAOS's completion callback still dereferences the caller's sgl
+        (``dc_array.c:check_short_read_cb`` does ``D_ASSERT(args->sgl->sg_nr ==
+        1)``). Passing an event to ``dfs_sys_read`` therefore aborts the process
+        on a dangling stack read — observed as::
+
+            check_short_read_cb() Assertion 'args->sgl->sg_nr == 1' failed
+
+        Calling ``dfs_read`` with a caller-owned ``sgl`` is the fix.
+
+        **Lifetime contract — the caller must keep ALL of these alive until the
+        event is harvested:** ``sgl``, the ``d_iov_t`` it points at, ``size``
+        (the ``daos_size_t *`` out-param), the destination buffer, the
+        ``dfs_obj_t`` handle, and the event itself.
+        :class:`~lmcache_daos.daos_event.AsyncRead` exists to own exactly that
+        set; dropping any member early is a use-after-free DAOS writes into.
+
+        A non-zero return means *submission* failed. An operation that was
+        submitted and then failed reports through the event's ``ev_error``.
+        """
+        rc = _dfs.dfs_read(self.base(), obj, ctypes.byref(sgl), offset,
+                           ctypes.byref(size), ctypes.c_void_p(ev_addr))
+        if rc != 0:
+            raise DaosError("dfs_read(async submit)", rc)
 
     def exists(self, path: str) -> bool:
         try:

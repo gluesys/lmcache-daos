@@ -1,0 +1,18 @@
+localhost/kvsup-ucx-lmc:local 308f3f5ac392 22.4 GB
+localhost/kvsup-ucx:local a9b9e2634d88 22.2 GB
+<none>:<none> 8cb15b1cff5b 22.2 GB
+<none>:<none> 93b28a9e9bd1 22.2 GB
+localhost/vgwrdma-run:local bdcf36ee841d 7.43 GB
+localhost/cuobjtest-run:local 8d262a049d5b 7.44 GB
+<none>:<none> c88a0bdaecba 7.41 GB
+localhost/kvsup:052 5b59201ea773 22.1 GB
+docker.io/nvidia/cuda:13.3.0-devel-rockylinux9 9f3b0862c045 7.31 GB
+docker.io/nvidia/cuda:12.9.1-devel-ubuntu22.04 c76e8f8e54eb 10.2 GB
+docker.io/nvidia/cuda:12.6.0-base-ubi9 363091f7e024 397 MB
+---
+NVIDIA H100 NVL, 610.57.04, 95830 MiB
+---
+podman version 5.8.2
+PRETTY_NAME="Rocky Linux 10.2 (Red Quartz)"
+ens4f1           UP             10.100.230.6/24 
+ens255np0        UP             192.168.10.60/24 
