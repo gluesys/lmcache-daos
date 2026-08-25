@@ -51,10 +51,22 @@ TOTAL_BYTES = FILE_BYTES * WORKERS
 def precreate(errs):
     """Create the files serially, from one handle, before any parallel work.
 
-    Creating them concurrently from 16 handles fails with EINVAL from
-    dfs_sys_open: the handles are opened DFS_SYS_NO_LOCK, so simultaneous
-    inserts into the same parent directory race. Only creation needs
-    serialising -- the bulk writes afterwards are per-file and safe.
+    Creating them concurrently from 16 handles can fail with EINVAL from
+    dfs_sys_open. This was originally attributed to DFS_SYS_NO_LOCK, which was
+    **wrong**: measured across mount flags (10 bursts x 16 threads each),
+
+        sflags=0 (cache+lock on)   1/160 failures
+        DFS_SYS_NO_CACHE          0/160
+        NO_CACHE|NO_LOCK          0/160
+
+    so locking does not prevent it. That makes sense -- dfs_sys's lock protects
+    one handle's internal directory cache, and each thread here has its own
+    handle, so the lock never sees the cross-handle race. The single failure
+    landed on the very first burst, consistent with a cold root-directory-cache
+    race, but one event is not enough to claim cache-on is worse.
+
+    Either way the mitigation is serialising *creation*, not flag choice. The
+    bulk writes afterwards are per-file and safe.
     """
     try:
         d = DfsSys(pool=POOL, cont=CONT)

@@ -198,8 +198,11 @@ MML=131072 FACTOR=3.2   launchers/run_arm_yarn.sh daos   # 127K
   비례해 누적되어 "확장 안 됨" 곡선이 만들어진다. barrier 로 분리한다.
 - **배리어 전에 공용 work queue 를 drain 하면** 첫 스레드가 전량 독점한다
   ("제출 순서대로, 7 GB/s" 라는 그럴듯한 가짜 결과).
-- **`DFS_SYS_NO_LOCK` 핸들 여러 개가 같은 부모 디렉터리에 동시 create** 하면
-  `dfs_sys_open` 이 EINVAL 을 낸다. 생성만 단일 핸들로 직렬화한다(대량 write 는 파일별이라 안전).
+- **핸들 여러 개가 같은 부모 디렉터리에 동시 create** 하면 `dfs_sys_open` 이 EINVAL 을 낼 수 있다.
+  **mount flag 와 무관하다** — 10회×16스레드 측정에서 `sflags=0`(락 on) 1/160,
+  `NO_CACHE` 0/160, `NO_CACHE|NO_LOCK` 0/160. dfs_sys 의 락은 *한 핸들의* 디렉터리 캐시를
+  보호하므로 핸들 간 경쟁에는 관여하지 않는다. 완화책은 flag 가 아니라 **생성만 직렬화**하는 것.
+  (커넥터 `put()` 도 서로 다른 키를 동시에 create 하므로 EINVAL 재시도가 필요할 수 있다 — 미적용)
 - **파이프 수신측 `ssh` 에 `-n` 을 붙이면** stdin 이 막혀 "not a tar archive" 로 조용히 실패한다.
 
 ## 8. 재현된 주요 수치

@@ -186,7 +186,30 @@ class DfsSys:
 
     def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
                  mflags: int = DFS_RDWR,
-                 sflags: int = DFS_SYS_NO_CACHE | DFS_SYS_NO_LOCK):
+                 sflags: int = 0):
+        # sflags=0 -> dfs_sys caching AND locking on, which is what
+        # daos_fs_sys.h calls the default ("DFS_SYS_NO_LOCK ... useful for
+        # single-threaded applications"). This used to default to
+        # DFS_SYS_NO_CACHE | DFS_SYS_NO_LOCK.
+        #
+        # Measured before changing it (tests/bench_sflags_scaling.py, 28 MiB
+        # objects — the real chunk size — 16 threads, best of 4):
+        #
+        #   sflags               handles      preopen   open+read
+        #   NO_CACHE|NO_LOCK     perthread      32.54      34.78
+        #   0 (cache+lock on)    perthread      33.64      33.13
+        #   0 (cache+lock on)    shared         33.73      32.90
+        #   NO_CACHE (lock on)   perthread      33.63      33.39
+        #
+        # All equal within noise, so the lock is free for bulk reads just as it
+        # was for the 64 KiB metadata ops. Caching stays on because every path
+        # is "/<sha256>", so the root directory entry is looked up on every
+        # operation.
+        #
+        # Consequence for callers: the per-thread handle pool in connector.py
+        # was introduced *only* to make NO_LOCK safe. With locking on it is no
+        # longer required — it is retained for now (harmless, and gives each
+        # thread its own directory cache) but is a candidate for removal.
         _load()
         if not DfsSys._daos_inited:
             rc = _daos.daos_init()
