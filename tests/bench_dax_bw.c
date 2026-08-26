@@ -13,7 +13,16 @@
  *
  *   ./bench_dax_bw anon         32 16      # DRAM control, 32 GiB, 16 threads
  *   ./bench_dax_bw /dev/dax0.0  32 16      # CXL, read-only (safe)
+ *   MODE=load ./bench_dax_bw /dev/dax0.0 32 16
  *   numactl --cpunodebind=0 ./bench_dax_bw /dev/dax0.0 32 16
+ *
+ * MODE=copy (default) copies into a per-thread DRAM buffer, so the reported
+ * figure counts bytes read while an equal write stream runs alongside it.
+ * MODE=load only sums the source with unrolled loads and never stores, which
+ * is what MLC-style tools report. On the CZ120 the two agree to within 0.5%
+ * (11.76 vs 11.81 GB/s), which is how we ruled out the destination write as
+ * the limiter -- but quote which mode you used, because on a healthy DRAM node
+ * they differ a lot (106 copy vs 192 load).
  *
  * READ-ONLY BY DEFAULT. The device is opened O_RDONLY and mapped PROT_READ, so
  * it cannot damage data that already lives on the dax device. This matters:
@@ -52,7 +61,9 @@ static double now(void)
 	return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 
-static void *worker(void *a)
+static int load_mode;			/* MODE=load: sum the source, never store */
+
+static void *worker_copy(void *a)
 {
 	long id = (long)a;
 	char *dst = aligned_alloc(4096, chunk);
@@ -73,6 +84,23 @@ static void *worker(void *a)
 	return NULL;
 }
 
+static void *worker_load(void *a)
+{
+	long id = (long)a;
+	const unsigned long *p = (const unsigned long *)(src_base + (size_t)id * per);
+	size_t n = per / sizeof(*p);
+	unsigned long s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+
+	pthread_barrier_wait(&bar);
+	for (int it = 0; it < iters; it++)
+		for (size_t i = 0; i + 8 <= n; i += 8) {
+			s0 += p[i];     s1 += p[i + 1]; s2 += p[i + 2]; s3 += p[i + 3];
+			s4 += p[i + 4]; s5 += p[i + 5]; s6 += p[i + 6]; s7 += p[i + 7];
+		}
+	sink += s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;	/* keep the loads alive */
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
 	const char *dev = argc > 1 ? argv[1] : "/dev/dax0.0";
@@ -81,6 +109,8 @@ int main(int argc, char **argv)
 	iters = argc > 4 ? atoi(argv[4]) : 2;
 	const char *pf = getenv("PREFILL");
 	int prefill = pf && (*pf == '1' || *pf == 'y' || *pf == 'Y');
+	const char *md = getenv("MODE");
+	load_mode = md && !strcmp(md, "load");
 
 	if (nthr < 1 || nthr > 512) {
 		fprintf(stderr, "threads out of range\n");
@@ -118,7 +148,8 @@ int main(int argc, char **argv)
 		src_base = p;
 	}
 
-	per = (total / nthr) & ~(chunk - 1);
+	per = load_mode ? ((total / nthr) & ~(size_t)4095)
+			: ((total / nthr) & ~(chunk - 1));
 	if (per == 0) {
 		fprintf(stderr, "per-thread span smaller than one %zu MiB chunk; "
 			"use a larger size or fewer threads\n", chunk >> 20);
@@ -128,7 +159,8 @@ int main(int argc, char **argv)
 	pthread_barrier_init(&bar, NULL, nthr + 1);
 	pthread_t th[512];
 	for (long i = 0; i < nthr; i++)
-		if (pthread_create(&th[i], NULL, worker, (void *)i)) {
+		if (pthread_create(&th[i], NULL,
+				   load_mode ? worker_load : worker_copy, (void *)i)) {
 			perror("pthread_create");
 			return 1;
 		}
@@ -140,8 +172,8 @@ int main(int argc, char **argv)
 	double dt = now() - t0;
 
 	double bytes = (double)per * nthr * iters;
-	printf("%-12s threads=%-3d per=%5.1fGiB moved=%6.1fGiB  %6.2f GB/s%s\n",
-	       dev, nthr, per / 1073741824.0, bytes / 1073741824.0,
+	printf("%-4s %-12s threads=%-3d read=%6.1fGiB  %6.2f GB/s%s\n",
+	       load_mode ? "LOAD" : "COPY", dev, nthr, bytes / 1073741824.0,
 	       bytes / dt / 1e9, prefill ? "  (prefilled)" : "");
 	return 0;
 }

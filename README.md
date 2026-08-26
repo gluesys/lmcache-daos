@@ -402,10 +402,14 @@ python3 tests/bench_stream_h2d.py        # BATCH vs STREAM 오버랩 (1.55×)
 
 CXL / Device-DAX 원시 대역폭 (C, GIL 없음 — 파이썬판은 인터프리터를 재게 된다):
 ```bash
-gcc -O2 -pthread -o /tmp/bench_dax_bw tests/bench_dax_bw.c
-/tmp/bench_dax_bw anon        32 16     # ★ DRAM 대조군을 먼저 — 하네스 검증
-/tmp/bench_dax_bw /dev/dax0.0 32 16     # CXL, 읽기 전용(기본)
+gcc -O3 -march=native -pthread -o /tmp/bench_dax_bw tests/bench_dax_bw.c
+/tmp/bench_dax_bw           anon 32 16   # ★ DRAM 대조군을 먼저 — 하네스 검증
+/tmp/bench_dax_bw           /dev/dax0.0 32 16   # COPY (기본): read + 동량 DRAM write
+MODE=load /tmp/bench_dax_bw  /dev/dax0.0 32 16   # LOAD: 순수 load, MLC 계열과 같은 방식
 ```
+**모드를 반드시 병기하라.** 정상 DRAM 노드에서 두 모드는 크게 다르다(client-6: COPY 106 /
+LOAD 192 GB/s). CZ120 에서는 0.5% 내로 일치했고(11.78 vs 11.77), 그래서 "목적지 DRAM 쓰기가
+병목" 가설을 배제할 수 있었다.
 `anon` 값이 그럴듯한지 먼저 보라. 초판은 배리어 재사용으로 **수백만 GB/s** 를 냈고, 대조군이
 그걸 잡아냈다. `PREFILL=1` 은 디바이스에 **덮어쓴다** — DAOS 가 `class: cxl` /
 `cxl_dax_path` 로 소유한 dax 디바이스에는 절대 쓰지 말 것(VOS 메타데이터가 파괴된다).
