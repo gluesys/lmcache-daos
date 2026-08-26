@@ -14,6 +14,7 @@
  *   ./bench_dax_bw anon         32 16      # DRAM control, 32 GiB, 16 threads
  *   ./bench_dax_bw /dev/dax0.0  32 16      # CXL, read-only (safe)
  *   MODE=load ./bench_dax_bw /dev/dax0.0 32 16
+ *   MODE=rand ./bench_dax_bw /dev/dax0.0 32 16   # random 64 B lines
  *   numactl --cpunodebind=0 ./bench_dax_bw /dev/dax0.0 32 16
  *
  * MODE=copy (default) copies into a per-thread DRAM buffer, so the reported
@@ -23,6 +24,14 @@
  * (11.76 vs 11.81 GB/s), which is how we ruled out the destination write as
  * the limiter -- but quote which mode you used, because on a healthy DRAM node
  * they differ a lot (106 copy vs 192 load).
+ *
+ * MODE=rand reads one 64 B line per access at pseudo-random offsets, counting
+ * 64 B per access. Addresses come from independent LCG streams, so they are
+ * unpredictable to the prefetcher but still computable ahead of the loads --
+ * that keeps many requests in flight, so this measures random-access
+ * *bandwidth*, not latency. Use it to compare against a CDAT read-bandwidth
+ * figure: CDAT DSLBIS may describe non-sequential access, in which case a
+ * healthy host beats it on sequential streams while matching it here.
  *
  * READ-ONLY BY DEFAULT. The device is opened O_RDONLY and mapped PROT_READ, so
  * it cannot damage data that already lives on the dax device. This matters:
@@ -53,6 +62,7 @@ static size_t per, chunk = 32UL << 20;
 static int nthr, iters;
 static pthread_barrier_t bar;
 static volatile unsigned long sink;
+static double rand_bytes[512];
 
 static double now(void)
 {
@@ -62,6 +72,41 @@ static double now(void)
 }
 
 static int load_mode;			/* MODE=load: sum the source, never store */
+static int rand_mode;			/* MODE=rand: random 64 B lines, no stores */
+
+static void *worker_rand(void *a)
+{
+	long id = (long)a;
+	const unsigned long *p = (const unsigned long *)(src_base + (size_t)id * per);
+	/* Power-of-two line count so indexing is a mask, not a division -- a
+	 * runtime modulo costs tens of cycles and would cap the result near the
+	 * bandwidth we are trying to measure. */
+	size_t lines = per / 64, pot = 1;
+	while (pot * 2 <= lines)
+		pot *= 2;
+	const size_t mask = pot - 1;
+	/* Eight independent streams keep requests in flight; one stream would
+	 * measure latency instead. */
+	unsigned long x[8], s[8];
+	for (int i = 0; i < 8; i++) {
+		x[i] = 0x9e3779b97f4a7c15UL * (unsigned long)(id * 8 + i + 1);
+		s[i] = 0;
+	}
+	size_t rounds = (size_t)iters * pot / 8;
+
+	pthread_barrier_wait(&bar);
+	for (size_t k = 0; k < rounds; k++)
+		for (int i = 0; i < 8; i++) {
+			x[i] = x[i] * 6364136223846793005UL + 1442695040888963407UL;
+			s[i] += p[((x[i] >> 16) & mask) << 3];
+		}
+	unsigned long acc = 0;
+	for (int i = 0; i < 8; i++)
+		acc += s[i];
+	sink += acc;
+	rand_bytes[id] = (double)rounds * 8 * 64;
+	return NULL;
+}
 
 static void *worker_copy(void *a)
 {
@@ -111,6 +156,7 @@ int main(int argc, char **argv)
 	int prefill = pf && (*pf == '1' || *pf == 'y' || *pf == 'Y');
 	const char *md = getenv("MODE");
 	load_mode = md && !strcmp(md, "load");
+	rand_mode = md && !strcmp(md, "rand");
 
 	if (nthr < 1 || nthr > 512) {
 		fprintf(stderr, "threads out of range\n");
@@ -148,7 +194,7 @@ int main(int argc, char **argv)
 		src_base = p;
 	}
 
-	per = load_mode ? ((total / nthr) & ~(size_t)4095)
+	per = (load_mode || rand_mode) ? ((total / nthr) & ~(size_t)4095)
 			: ((total / nthr) & ~(chunk - 1));
 	if (per == 0) {
 		fprintf(stderr, "per-thread span smaller than one %zu MiB chunk; "
@@ -160,6 +206,7 @@ int main(int argc, char **argv)
 	pthread_t th[512];
 	for (long i = 0; i < nthr; i++)
 		if (pthread_create(&th[i], NULL,
+				   rand_mode ? worker_rand :
 				   load_mode ? worker_load : worker_copy, (void *)i)) {
 			perror("pthread_create");
 			return 1;
@@ -172,8 +219,13 @@ int main(int argc, char **argv)
 	double dt = now() - t0;
 
 	double bytes = (double)per * nthr * iters;
+	if (rand_mode) {
+		bytes = 0;
+		for (int i = 0; i < nthr; i++)
+			bytes += rand_bytes[i];
+	}
 	printf("%-4s %-12s threads=%-3d read=%6.1fGiB  %6.2f GB/s%s\n",
-	       load_mode ? "LOAD" : "COPY", dev, nthr, bytes / 1073741824.0,
+	       rand_mode ? "RAND" : load_mode ? "LOAD" : "COPY", dev, nthr, bytes / 1073741824.0,
 	       bytes / dt / 1e9, prefill ? "  (prefilled)" : "");
 	return 0;
 }

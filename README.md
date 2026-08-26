@@ -407,6 +407,16 @@ gcc -O3 -march=native -pthread -o /tmp/bench_dax_bw tests/bench_dax_bw.c
 /tmp/bench_dax_bw           /dev/dax0.0 32 16   # COPY (기본): read + 동량 DRAM write
 MODE=load /tmp/bench_dax_bw  /dev/dax0.0 32 16   # LOAD: 순수 load, MLC 계열과 같은 방식
 ```
+CXL 1.1 RCD 의 **협상 링크 폭·속도** (다른 방법이 없다 — RCiEP 는 LnkCap/LnkSta 를 구현하지 않아
+`lspci -vv` 에도, sysfs 에도 안 나온다. 레지스터는 호스트브리지 RCRB 에 있고 그 주소는 ACPI CEDT 만
+알고 있다):
+```bash
+gcc -O2 -o /tmp/cxl_link_state tests/cxl_link_state.c
+sudo /tmp/cxl_link_state          # CEDT 에서 RCRB 자동 탐색
+```
+동일 부품이 두 호스트에서 11.8 vs 26.0 GB/s 였고 소프트웨어 가설이 전부 배제된 뒤, 이 한 번의
+읽기가 원인을 확정했다 — **x16 포트에 x8 로 협상**.
+
 **모드를 반드시 병기하라.** 정상 DRAM 노드에서 두 모드는 크게 다르다(client-6: COPY 106 /
 LOAD 192 GB/s). CZ120 에서는 0.5% 내로 일치했고(11.78 vs 11.77), 그래서 "목적지 DRAM 쓰기가
 병목" 가설을 배제할 수 있었다.
