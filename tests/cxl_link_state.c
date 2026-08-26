@@ -29,6 +29,15 @@
  * negotiated width against the *device's* width from its datasheet, not
  * against the port maximum -- the port maximum tells you about the slot.
  *
+ * Read the speed line first, then the Supported Link Speeds Vector. LnkCap's
+ * "maximum" can be lower than what the port's own vector advertises, and that
+ * difference is the whole question: if the vector offers a generation that
+ * LnkCap does not, firmware masked it and a BIOS option may restore it; if the
+ * vector stops where LnkCap does, the port genuinely cannot go faster and no
+ * setting will change it. On the slow host here the vector stops at Gen4, so
+ * there is nothing to un-mask -- which is why we stopped looking for a
+ * software fix and went to the board.
+ *
  *   gcc -O2 -o cxl_link_state cxl_link_state.c
  *   sudo ./cxl_link_state              # discover via CEDT
  *   sudo ./cxl_link_state 0xb3000000   # or name the RCRB base directly
@@ -146,16 +155,19 @@ int main(int argc, char **argv)
 	uint16_t vid = *(volatile uint16_t *)(m + 0x00);
 	printf("RCRB @0x%" PRIx64 ": downstream port config space (vendor=0x%04x)\n", base, vid);
 
-	uint32_t lnkcap = 0;
-	uint16_t lnksta = 0;
+	uint32_t lnkcap = 0, lnkcap2 = 0;
+	uint16_t lnksta = 0, lnkctl2 = 0, lnksta2 = 0;
 	int found = 0;
 	uint8_t cap = *(volatile uint8_t *)(m + 0x34);
 	for (int guard = 0; cap && cap != 0xff && guard < 48; guard++) {
 		uint8_t id = *(volatile uint8_t *)(m + cap);
 		uint8_t next = *(volatile uint8_t *)(m + cap + 1);
 		if (id == 0x10) {			/* PCI Express Capability */
-			lnkcap = *(volatile uint32_t *)(m + cap + 0x0c);
-			lnksta = *(volatile uint16_t *)(m + cap + 0x12);
+			lnkcap  = *(volatile uint32_t *)(m + cap + 0x0c);
+			lnksta  = *(volatile uint16_t *)(m + cap + 0x12);
+			lnkcap2 = *(volatile uint32_t *)(m + cap + 0x2c);
+			lnkctl2 = *(volatile uint16_t *)(m + cap + 0x30);
+			lnksta2 = *(volatile uint16_t *)(m + cap + 0x32);
 			found = 1;
 			break;
 		}
@@ -168,18 +180,56 @@ int main(int argc, char **argv)
 
 	unsigned max_spd = lnkcap & 0xf, max_wid = (lnkcap >> 4) & 0x3f;
 	unsigned cur_spd = lnksta & 0xf, cur_wid = (lnksta >> 4) & 0x3f;
-	printf("  LnkCap 0x%08x  maximum   %-16s x%-2u  %5.1f GB/s\n",
+	unsigned tgt_spd = lnkctl2 & 0xf;
+	printf("  LnkCap  0x%08x  maximum    %-16s x%-2u  %5.1f GB/s\n",
 	       lnkcap, spd_name(max_spd), max_wid, lane_gbps(max_spd) * max_wid);
-	printf("  LnkSta 0x%04x      negotiated %-16s x%-2u  %5.1f GB/s\n",
+	printf("  LnkSta  0x%04x      negotiated %-16s x%-2u  %5.1f GB/s\n",
 	       lnksta, spd_name(cur_spd), cur_wid, lane_gbps(cur_spd) * cur_wid);
 
+	/* Supported Link Speeds Vector, LnkCap2 bits [7:1]. This is the port's own
+	 * list, and it can extend past LnkCap's "maximum" -- see header comment. */
+	unsigned vec_max = 0;
+	printf("  LnkCap2 0x%08x  supported  ", lnkcap2);
+	for (unsigned b = 1; b <= 6; b++)
+		if (lnkcap2 & (1u << b)) {
+			printf("%s ", spd_name(b));
+			vec_max = b;
+		}
+	if (!vec_max)
+		printf("(vector empty)");
+	printf("\n");
+	printf("  LnkCtl2 0x%04x      target     %s\n", lnkctl2, spd_name(tgt_spd));
+
+	/* LnkSta2: equalization outcome and whether retimers sit in the path.
+	 * A retimer adds latency and can cap the achievable generation, so its
+	 * presence is worth knowing before blaming firmware. */
+	printf("  LnkSta2 0x%04x      equalization %s", lnksta2,
+	       (lnksta2 & 0x02) ? "complete" : "INCOMPLETE");
+	if ((lnksta2 & 0x1c) == 0x1c)
+		printf(" (phases 1-3 ok)");
+	if (lnksta2 & 0x20)
+		printf(", EQUALIZATION REQUEST PENDING");
+	printf(", retimers: %s\n",
+	       (lnksta2 & 0x80) ? "two detected" :
+	       (lnksta2 & 0x40) ? "one detected" : "none detected");
+
 	putchar('\n');
+	int actionable = 0;
 	if (cur_spd < max_spd) {
-		printf("  SPEED BELOW PORT MAXIMUM: running %s where the port supports %s.\n",
+		printf("  SPEED BELOW PORT MAXIMUM: running %s where LnkCap allows %s.\n",
 		       spd_name(cur_spd), spd_name(max_spd));
-		printf("  This halves bandwidth per generation and is the first thing to check.\n");
+		printf("  Bandwidth halves per generation, so check this before anything else.\n");
+		actionable = 1;
+	} else if (vec_max > max_spd) {
+		printf("  SPEED MASKED BY FIRMWARE: the port's own vector offers %s but LnkCap\n"
+		       "  advertises only %s. The Supported Link Speeds Vector is HwInit, so\n"
+		       "  firmware set this at boot -- look for a BIOS option to restore it.\n",
+		       spd_name(vec_max), spd_name(max_spd));
+		actionable = 1;
 	} else {
-		printf("  speed is at the port maximum (%s)\n", spd_name(max_spd));
+		printf("  speed is at the port ceiling (%s, and the vector stops there too),\n"
+		       "  so no BIOS setting will raise it -- this is board or silicon.\n",
+		       spd_name(max_spd));
 	}
 	if (cur_wid < max_wid)
 		printf("  width x%u of a x%u port -- compare against the DEVICE's width from its\n"
@@ -188,5 +238,5 @@ int main(int argc, char **argv)
 		       cur_wid, max_wid, cur_wid, max_wid, cur_wid);
 	else
 		printf("  width is at the port maximum (x%u)\n", max_wid);
-	return (cur_spd < max_spd) ? 3 : 0;
+	return actionable ? 3 : 0;
 }
