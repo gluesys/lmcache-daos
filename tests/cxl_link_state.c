@@ -14,8 +14,20 @@
  * firmware) measured 11.8 vs 26.0 GB/s, and every software explanation we
  * tested came back negative: thread count, socket affinity, copy-vs-load,
  * page size (2 MiB PMD confirmed), dax mode, and AER (192 GiB moved with a
- * cleared error register and nothing logged). The link registers settled it in
- * one read -- negotiated x8 against a x16 port maximum.
+ * cleared error register and nothing logged). One read of these registers gave
+ * the answer:
+ *
+ *   slow host   LnkCap max 16 GT/s x16   LnkSta negotiated 16 GT/s x8  15.8 GB/s
+ *   fast host   LnkCap max 32 GT/s x16   LnkSta negotiated 32 GT/s x8  31.5 GB/s
+ *
+ * Same width. The gap is entirely link *speed* -- one port runs the device at
+ * Gen4, the other at Gen5, and the per-lane rate doubles. Measured throughput
+ * came to 75% and 83% of those ceilings, both ordinary for CXL.mem.
+ *
+ * Read the speed line first. A narrower negotiated width is often not a fault:
+ * a x8 device in a x16 port negotiates x8 and that is correct. Compare the
+ * negotiated width against the *device's* width from its datasheet, not
+ * against the port maximum -- the port maximum tells you about the slot.
  *
  *   gcc -O2 -o cxl_link_state cxl_link_state.c
  *   sudo ./cxl_link_state              # discover via CEDT
@@ -161,15 +173,20 @@ int main(int argc, char **argv)
 	printf("  LnkSta 0x%04x      negotiated %-16s x%-2u  %5.1f GB/s\n",
 	       lnksta, spd_name(cur_spd), cur_wid, lane_gbps(cur_spd) * cur_wid);
 
-	if (cur_wid < max_wid || cur_spd < max_spd) {
-		printf("\n  NEGOTIATED BELOW MAXIMUM");
-		if (cur_wid < max_wid)
-			printf(" -- width x%u of x%u", cur_wid, max_wid);
-		if (cur_spd < max_spd)
-			printf(" -- speed %s of %s", spd_name(cur_spd), spd_name(max_spd));
-		printf("\n  Check the BIOS port bifurcation and how the bay is wired.\n");
-		return 3;
+	putchar('\n');
+	if (cur_spd < max_spd) {
+		printf("  SPEED BELOW PORT MAXIMUM: running %s where the port supports %s.\n",
+		       spd_name(cur_spd), spd_name(max_spd));
+		printf("  This halves bandwidth per generation and is the first thing to check.\n");
+	} else {
+		printf("  speed is at the port maximum (%s)\n", spd_name(max_spd));
 	}
-	printf("\n  negotiated at the port maximum\n");
-	return 0;
+	if (cur_wid < max_wid)
+		printf("  width x%u of a x%u port -- compare against the DEVICE's width from its\n"
+		       "  datasheet before calling this a fault. A x%u device in a x%u port\n"
+		       "  negotiates x%u and that is correct; the port maximum describes the slot.\n",
+		       cur_wid, max_wid, cur_wid, max_wid, cur_wid);
+	else
+		printf("  width is at the port maximum (x%u)\n", max_wid);
+	return (cur_spd < max_spd) ? 3 : 0;
 }
