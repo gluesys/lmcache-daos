@@ -4,7 +4,81 @@ LMCache의 KV cache 오프로딩 백엔드를 **DAOS**로 구현하는 프로젝
 LMCache의 `RemoteConnector` 인터페이스에 커넥터를 붙여, KV 청크를
 DAOS DFS(`dfs_sys` API) 네임스페이스의 self-describing 파일로 저장한다.
 
+## 주요 특징과 강점
+
+수치에는 출처를 달았다. `ExaCI5-4` = A2 1장 + DAOS 4 rank CI(Qwen3-1.7B, 아래
+[검증 결과](#검증-결과-2026-07-30-exaci5-4-ci)), `client-6` = H100 NVL + DAOS 2 rank
+테스트베드(Qwen3-14B, [`deploy/README.md`](deploy/README.md) §8). 두 환경은 prefill
+연산량이 크게 달라 배수를 섞어 읽으면 안 된다.
+
+### 특징
+
+- **LMCache 상류를 고치지 않는다.** `plugin://` 스킴과 `remote_storage_plugins` 설정만
+  으로 로드되는 out-of-tree `RemoteConnector` 구현이다. vLLM·LMCache 포크나 패치가
+  필요 없다 ([플러그인 등록과 URL 규칙](#플러그인-등록과-url-규칙-중요)).
+- **DAOS 네이티브 경로.** dfuse나 커널 VFS를 거치지 않고 `libdfs`의 `dfs_sys_*` 를
+  ctypes로 직접 호출한다. Samba `vfs_daos` 와 같은 API 계열이라 호출 패턴이 검증돼 있다.
+- **객체가 자기 자신을 기술한다.** `[prefix 8B][meta][payload]` 한 파일 = KV 청크 하나.
+  read 시 별도 stat·index 조회가 없고, 외부 인덱스나 별도 메타 DB를 요구하지 않는다.
+- **용량 관리 수단이 있다.** `list()`(readdir) + `remove_sync()`(`remove_type`). 이것이
+  `RemoteBackend.remove()`가 타는 원격 eviction의 유일한 경로다 (정책 자체는 미정 —
+  [알려진 미해결 지점](#알려진-미해결-지점)).
+- **batched get/put.** 커넥터 API 수준에서 GET 2.4–3.5x, PUT 1.3–2.4x
+  (`ExaCI5-4`). `batched_contains`는 실측 이득이 없어 **의도적으로 미구현**이다.
+- **스토리지 쪽 튜닝 손잡이가 노출된다.** DFS chunk / oclass / `rd_fac` 로 read 대역폭을
+  직접 조절한다. chunk 1 MiB → 4 MiB 하나로 sustained read 9.2 → 34.5 GB/s (`client-6`).
+- **비블로킹.** blocking libdfs 호출은 스레드풀 executor로 분리해 LMCache의 asyncio
+  루프를 막지 않는다.
+
+### 강점 (측정으로 확인된 것)
+
+- **prefill 재계산을 없앤다.** hit TTFT 는 컨텍스트 8K 에서 151 ms, 127K 에서 2129 ms
+  이고, 같은 컨텍스트의 recompute 대비 3.8x → 11.8x 다. 100 GB long-doc-qa /
+  12 inflight 에서 avg TTFT 371 ms, 집계
+  21.36 GB/s (recompute 대비 11.7x) — `client-6`. Hub v4 기준 최종 TTFT 배수는 17.7x
+  (hit 158 ms vs recompute 2812 ms).
+- **노드 경계를 넘어 캐시를 공유한다 — 이 백엔드의 핵심 이유.** 한 번도 KV를 쓴 적 없는
+  노드가 다른 노드가 넣은 100 GB KV 를 **149/149 전량 히트**(미스 0), avg TTFT 444 ms로
+  기록 노드(371 ms)의 84%. 같은 조건의 **로컬 NVMe 는 83% 미스** — 노드 로컬 계층으로는
+  구조적으로 불가능한 재사용이다 (`client-6`).
+- **재시작·프로세스 교체를 견딘다.** vLLM 을 완전히 재시작해 GPU KV 와 LMCache 로컬
+  CPU 계층을 모두 비운 뒤에도 전량 hit — 2차 패스의 hit 출처는 DAOS 뿐이다
+  (`ExaCI5-4`, Phase 3). 독립 replica 간 공유도 cross-replica 2.75x (T6).
+- **대역폭이 확장된다.** 단일 노드 raw read 34.27 GB/s(100 GB NVMe 상주), 2노드 동시
+  집계 32.8 GB/s, 단일요청 retrieve 21.4 GB/s (`client-6`). 2노드 집계가 2배로 가지
+  않는 이유까지 규명돼 있다 — 병목이 클라이언트에서 서버로 넘어간 구간이다.
+- **정합성이 게이트로 잡혀 있다.** 잘린 객체를 hit 으로 오탐하지 않고(T4), 같은 키에
+  동시 writer 40라운드 x 6 writer 에서 blend 없음(T5), 28 MB x 30 순차 read 무결성
+  30/30 (libfabric `verbs;ofi_rxm` 에서는 3–10/30 — 그래서 UCX 로 확정했다).
+- **메타데이터가 제약이 되지 않는다.** 디렉터리 fanout 없이 flat(`/` + sha256)로 충분
+  하다는 결론을 측정으로 얻었다. 실제 청크 크기(28 MiB)에서 메타는 제약의 약 500배 밖
+  이고, 손익분기 객체 크기 61 KB 는 `chunk_size=1`(112 KiB)보다도 작다.
+
+### 적용 조건 (강점이 성립하는 범위)
+
+- **백킹은 NVMe 여야 한다.** ZFS zvol 풀에서는 DAOS 로드가 prefill 재계산보다 느려
+  0.95x(**손실**), NVMe 풀에서 2.63–2.81x (`ExaCI5-4`). 지연이 중요한 시험은 NVMe
+  백킹 풀로.
+- **retrieve 상한은 `read ⊕ H2D` 직렬 합성**이다. 커넥터 read 33.6 + c_ops H2D 45.8
+  → 합성 19.4 GB/s. completion-ordered 스트리밍으로 33.7 GB/s(1.55x)를 확보했지만
+  실제 서빙 반영은 **LMCache 상류에 streaming API 가 열려야** 한다.
+- 성능은 이미지·설정에 민감하다. `lmcache.c_ops` 비활성(이미지 CUDA 불일치)만으로
+  retrieve 가 6x 느려지고, 긴 프롬프트를 텍스트로 보내면 API 서버 GIL 직렬화가 TTFT 를
+  4.2x 왜곡한다. 측정 전 체크리스트는 [`deploy/README.md`](deploy/README.md) §7 에 있다.
+- 프로세스·노드 간 공유에는 **`PYTHONHASHSEED` 고정이 필수**다
+  ([운영 주의사항](#운영-주의사항-실측-기반)).
+- 남은 미해결 지점(용량 정책 부재, `list()` 이름의 키 복원 불가, 드문 `put()` EINVAL
+  등)은 [알려진 미해결 지점](#알려진-미해결-지점)에 그대로 적어 두었다.
+
 ## 아키텍처
+
+![lmcache-daos 소프트웨어 / 하드웨어 스택](doc/figures/fig1b_lmcache_daos_stack.png)
+
+각 계층의 역할과 계층 간에 넘는 인터페이스만 담은 그림이다. 실험환경 고유 값
+(호스트·IP·이미지·측정치)이 들어간 판과 테스트베드 토폴로지는
+[`doc/figures/`](doc/figures/) 에 함께 있다 (`fig1`, `fig2`).
+
+호출 경로만 요약하면:
 
 ```
 vLLM ─ LMCache ─ RemoteBackend ─(plugin:// 스킴)─ DaosConnector (connector.py)
