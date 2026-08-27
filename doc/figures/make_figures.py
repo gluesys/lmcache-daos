@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """lmcache-daos 아키텍처 / 실험환경 도식 (연구자 공유용, 저채도)."""
 import os
+import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -394,13 +395,136 @@ def fig_bed():
     return fig
 
 
+
+# ----------------------------------------------------------------- Figure 1b
+def fig_stack():
+    """실험환경 고유값을 뺀 SW/HW 스택 단순화 판."""
+    fig, ax = newax((9.4, 9.0))
+
+    ax.text(3.0, 97.4, "그림 1b.  lmcache-daos 소프트웨어 / 하드웨어 스택",
+            fontsize=12.4, color=INK, fontweight="bold", va="top")
+    ax.text(3.0, 93.9, "호스트·IP·이미지·측정치 등 실험환경 고유 값을 제외한 구조만.   "
+                       "파란 테두리 = 본 프로젝트 구현.",
+            fontsize=8.2, color=GREY, va="top")
+    ax.text(97.0, 93.9, "↓ store (put)    ↑ retrieve (get)", fontsize=7.6,
+            color=ACC, va="top", ha="right")
+
+    X, W = 16.0, 66.0
+    RX = X + W + 1.6          # 인터페이스 라벨 열
+    CX = X + W / 2.0
+
+    def band(y, h, title, sub=None, ts=9.2, ls=7.2, **kw):
+        lines = [(sub, "k")] if sub else None
+        box(ax, X, y, W, h, title=title, lines=lines, ts=ts, ls=ls, **kw)
+
+    def iface(y, txt):
+        arrow(ax, (CX, y + 0.85), (CX, y - 0.85), col="#8d8d8d", lw=0.9, ms=6,
+              style="<|-|>")
+        ax.text(RX, y, txt, fontsize=6.9, color=GREY, va="center")
+
+    def hwband(y, h, label, cells):
+        cw = (W - 2.0 * (len(cells) - 1)) / float(len(cells))
+        for k, (t, sub) in enumerate(cells):
+            box(ax, X + k * (cw + 2.0), y, cw, h, title=t, ts=8.4, ls=6.9,
+                lines=[(sub, "k")], fill=FILL2, tal="center", ha_body="center")
+
+    # ---- 서빙 노드 소프트웨어
+    band(85.0, 6.0, "vLLM  —  추론 서빙 엔진",
+         "API server · prefill / decode · GPU KV cache", fill=FILL2)
+    iface(84.1, "KV 오프로드 훅")
+
+    band(78.2, 6.0, "LMCache  —  KV-cache 계층",
+         "KV 청크 관리 · CPU 캐시 계층 · c_ops CUDA 커널 (H2D scatter / gather)",
+         fill=FILL2)
+    iface(77.3, "RemoteConnector\n인터페이스")
+
+    band(72.2, 5.2, "RemoteBackend  →  DynamicConnectorAdapter",
+         "out-of-tree 커넥터를 plugin:// 스킴으로 로딩", fill=FILL2, ts=8.6)
+    iface(71.3, "plugin:// URL 라우팅")
+
+    # 커넥터 (본 프로젝트)
+    box(ax, X, 59.0, W, 12.0, fill=ACCF, edge=ACC, lw=1.8)
+    ax.text(X + 1.6, 69.8, "lmcache_daos   (DaosConnector)", fontsize=9.4,
+            color=ACC, fontweight="bold", va="top")
+    ax.text(X + W - 1.6, 69.8, "본 프로젝트 구현", fontsize=7.0, color=ACC,
+            va="top", ha="right")
+    sub = [("connector.py", "get / put · batched\nlist / remove_sync"),
+           ("serde.py", "[prefix][meta][payload]\n자기 기술적 객체"),
+           ("dfs_binding.py", "ctypes → libdfs\ndfs_sys_*"),
+           ("streaming.py", "read ⊕ H2D 오버랩\n(상류 API 대기)")]
+    cw = (W - 3.0 - 3 * 1.4) / 4.0
+    for k, (t, sb) in enumerate(sub):
+        box(ax, X + 1.5 + k * (cw + 1.4), 59.9, cw, 6.6, title=t,
+            mono_title=True, ts=7.4, ls=6.4, tal="center", ha_body="center",
+            lines=[(ln, "k") for ln in sb.split("\n")],
+            fill="white", edge=("#bdbab5" if k == 3 else "#b7cad9"),
+            dash=((0, (3, 2)) if k == 3 else None))
+    iface(58.1, "dfs_sys_*  (ctypes)")
+
+    band(52.0, 5.2, "DAOS 클라이언트 라이브러리  ·  daos_agent",
+         "libdaos / libdfs — DFS 네임스페이스에 POSIX 유사 파일 API 제공", ts=8.6)
+    iface(51.1, "CART RPC + bulk RDMA")
+
+    band(45.0, 5.2, "mercury  +  UCX",
+         "RDMA 전송 계층 — 제어는 RPC, 데이터는 bulk transfer", ts=8.6)
+    iface(44.1, "verbs / rdma-core")
+
+    # ---- 서빙 노드 하드웨어
+    hwband(36.8, 6.6, "노드 HW",
+           [("GPU", "HBM · KV cache"),
+            ("CPU / DRAM", "청크 staging"),
+            ("RDMA NIC", "RoCE 포트")])
+
+    # ---- 패브릭
+    box(ax, X, 29.0, W, 5.4, title="이더넷 패브릭  —  RoCE v2 (RDMA)",
+        lines=[("KV 청크 본문은 bulk RDMA 로, 제어는 RPC 로 오간다", "k")],
+        ts=8.6, ls=7.2, fill="#f0efec", tal="center", ha_body="center")
+    arrow(ax, (CX, 36.7), (CX, 34.5), col=ACC, lw=1.2, ms=6, style="<|-|>")
+    arrow(ax, (CX, 28.9), (CX, 27.3), col=ACC, lw=1.2, ms=6, style="<|-|>")
+
+    # ---- DAOS 서버 소프트웨어
+    band(21.0, 6.2, "daos_engine  (rank)",
+         "target 별 독립 서비스 스레드 · 객체 배치와 스트라이핑 담당", ts=8.8)
+    iface(20.5, "DAOS 객체 (array)")
+
+    band(12.6, 7.4, "pool  →  container (POSIX / DFS)  →  array object",
+         "KV 청크 1개 = DFS 파일 1개 = array 객체.  파일은 DFS chunk 단위로\n"
+         "여러 target 에 스트라이프된다 (chunk 크기가 read 대역폭을 지배).",
+         ts=8.8)
+    iface(11.7, "SCM 메타 · NVMe 데이터")
+
+    # ---- DAOS 서버 하드웨어
+    hwband(4.2, 6.6, "DAOS HW",
+           [("SCM 계층 (DRAM / PMem)", "메타데이터 · 소용량 I/O"),
+            ("NVMe SSD", "KV 청크 본문")])
+
+    # ---- 좌측 존 괄호
+    xz = X - 3.4
+    for label, y0, y1 in [("서빙 노드\nSW", 45.0, 91.0),
+                          ("서빙 노드\nHW", 36.8, 43.4),
+                          ("패브릭", 29.0, 34.4),
+                          ("DAOS 서버\nSW", 12.6, 27.2),
+                          ("DAOS 서버\nHW", 4.2, 10.8)]:
+        ax.plot([xz, xz], [y0, y1], color="#bdbab5", lw=0.9, zorder=1)
+        for yy in (y0, y1):
+            ax.plot([xz, xz + 0.9], [yy, yy], color="#bdbab5", lw=0.9, zorder=1)
+        ax.text(xz - 1.0, (y0 + y1) / 2.0, label, fontsize=7.4, color=INK,
+                va="center", ha="right", ma="right", fontweight="bold",
+                linespacing=1.45)
+
+    return fig
+
 OUT = os.path.dirname(os.path.abspath(__file__))
-f1 = fig_arch()
-f1.savefig(os.path.join(OUT, "fig1_lmcache_daos_architecture.png"), dpi=200,
-           facecolor="white")
-f1.savefig(os.path.join(OUT, "fig1_lmcache_daos_architecture.svg"), facecolor="white")
-f2 = fig_bed()
-f2.savefig(os.path.join(OUT, "fig2_lmcache_daos_testbed.png"), dpi=200,
-           facecolor="white")
-f2.savefig(os.path.join(OUT, "fig2_lmcache_daos_testbed.svg"), facecolor="white")
-print("done")
+FIGS = {
+    "arch": (fig_arch, "fig1_lmcache_daos_architecture"),
+    "stack": (fig_stack, "fig1b_lmcache_daos_stack"),
+    "bed": (fig_bed, "fig2_lmcache_daos_testbed"),
+}
+
+want = sys.argv[1:] or list(FIGS)
+for key in want:
+    fn, name = FIGS[key]
+    fig = fn()
+    fig.savefig(os.path.join(OUT, name + ".png"), dpi=200, facecolor="white")
+    fig.savefig(os.path.join(OUT, name + ".svg"), facecolor="white")
+    print("wrote", name)
