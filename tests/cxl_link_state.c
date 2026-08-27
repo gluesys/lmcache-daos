@@ -200,15 +200,24 @@ int main(int argc, char **argv)
 	printf("\n");
 	printf("  LnkCtl2 0x%04x      target     %s\n", lnkctl2, spd_name(tgt_spd));
 
-	/* LnkSta2: equalization outcome and whether retimers sit in the path.
-	 * A retimer adds latency and can cap the achievable generation, so its
-	 * presence is worth knowing before blaming firmware. */
-	printf("  LnkSta2 0x%04x      equalization %s", lnksta2,
-	       (lnksta2 & 0x02) ? "complete" : "INCOMPLETE");
-	if ((lnksta2 & 0x1c) == 0x1c)
-		printf(" (phases 1-3 ok)");
-	if (lnksta2 & 0x20)
-		printf(", EQUALIZATION REQUEST PENDING");
+	/* LnkSta2 tells us about retimers at any rate, but its equalization bits
+	 * describe the 8 GT/s pass only -- at Gen4/Gen5 the per-rate status lives
+	 * in the "Physical Layer 16.0/32.0 GT/s" extended capabilities instead. A
+	 * Gen5 link therefore reads 0x0000 here, and calling that "INCOMPLETE"
+	 * invites exactly the wrong conclusion: we saw a healthy Gen5 x8 link
+	 * report it. Only interpret the bits when the link actually runs at
+	 * 8 GT/s; otherwise say so and let LnkSta speak for the link. */
+	printf("  LnkSta2 0x%04x      ", lnksta2);
+	if (cur_spd == 3) {
+		printf("equalization %s", (lnksta2 & 0x02) ? "complete" : "INCOMPLETE");
+		if ((lnksta2 & 0x1c) == 0x1c)
+			printf(" (phases 1-3 ok)");
+		if (lnksta2 & 0x20)
+			printf(", EQUALIZATION REQUEST PENDING");
+	} else {
+		printf("equalization n/a at %s (these bits are 8 GT/s only)",
+		       spd_name(cur_spd));
+	}
 	printf(", retimers: %s\n",
 	       (lnksta2 & 0x80) ? "two detected" :
 	       (lnksta2 & 0x40) ? "one detected" : "none detected");
