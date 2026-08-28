@@ -227,10 +227,40 @@ NIC 이 호스트로 DMA 한 8 GiB 이고, `pinnedcopy` 는 복사 엔진이 그
 않고 가져온다"** 로만 가능하다. 그 이득이 값어치가 있는지는 실제 vLLM 워크로드에서 호스트
 DRAM 대역폭이 실제로 경합하는지에 달려 있고, 그것은 아직 측정하지 않았다.
 
-GPU-direct 가 뒤지는 이유의 유력한 후보는 **토폴로지**다. 이 호스트에서 GPU 는 NUMA1,
-NIC 은 NUMA0 이고 `nvidia-smi topo -m` 은 `SYS` 로 보고한다. GPU BAR 로의 RDMA 는 소켓을
-건너지만 호스트 DRAM 으로의 DMA 는 그렇지 않다. NIC 을 GPU 와 같은 root complex 로 옮기는
-것이 다음 실험이다.
+### 토폴로지는 원인이 아니다 (검증 완료)
+
+GPU 와 NIC 이 같은 NUMA 노드에 있는 호스트(client-6, `nvidia-smi topo` = `NODE`)와 서로
+다른 노드인 호스트(client-5, `SYS`)에서 **같은 풀·컨테이너·파일**을 읽어 비교했다. 두
+장비는 동일 모델·동일 커널(6.12.0-211.16.1)이고 GPU/NIC 의 PCI 주소도 같다 — 차이는 BIOS
+의 SNC 설정뿐이다(client-5/7 은 SNC 로 소켓0이 node0/node1 로 쪼개져 GPU 가 node1, NIC 이
+node0 이 된다. client-6 은 SNC 가 꺼져 둘 다 node0).
+
+5회 반복, 중앙값과 범위:
+
+| 배치 | arm | 워커 | 중앙값 GB/s | 범위 |
+|---|---|---|---|---|
+| `NODE` (client-6) | `gpu` | 1 | 8.27 | 6.20–8.76 |
+| `SYS` (client-5) | `gpu` | 1 | 7.89 | 7.31–9.24 |
+| `NODE` | `gpu` | 16 | 21.61 | 18.74–25.37 |
+| `SYS` | `gpu` | 16 | 19.16 | 15.07–24.20 |
+| `NODE` | `pinnedcopy` | 1 | 11.25 | 11.18–11.28 |
+| `SYS` | `pinnedcopy` | 1 | 11.26 | 11.13–11.33 |
+| `NODE` | `pinnedcopy` | 16 | 35.81 | 34.23–36.01 |
+| `SYS` | `pinnedcopy` | 16 | 33.93 | 27.73–34.12 |
+
+**토폴로지로 설명되지 않는다.** GPU-direct 는 NODE 에서 중앙값이 +5%(1워커)·+13%(16워커)
+높지만 범위가 크게 겹쳐 노이즈와 구분할 수 없다. 무엇보다 이상적 배치에서도 스테이징
+대비 비율이 그대로다 — 0.74×(1워커, 8.27 vs 11.25), 0.60×(16워커, 21.61 vs 35.81). 즉
+GPU 경로의 열세는 GPU/NIC 를 같은 노드에 두어도 사라지지 않는다.
+
+`nvidia-smi topo -m` 의 `SYS` 표기는 애초에 오해를 부른다. client-5/7 에서 node0↔node1 은
+**같은 소켓 안의 SNC 분할**이고 거리 12(소켓 횡단은 21)이므로 UPI 를 건너지 않는다.
+"소켓을 건너기 때문" 이라는 설명은 처음부터 성립하지 않았다.
+
+**부수 발견: GPU 경로만 불안정하다.** 16워커에서 `pinnedcopy` 는 34.2–36.0(±2.5%)인데
+`gpu` 는 18.7–25.4(±15%)로 흔들린다. 1워커에서도 `pinnedcopy` 가 11.18–11.28 인 반면
+`gpu` 는 6.20–8.76 이다. 원인은 규명하지 않았고, 남은 후보는 GPU BAR 로의 PCIe 쓰기
+대역폭과 UCX 가 device memory 를 다루는 방식(전송별 등록/rendezvous)이다.
 
 ### 측정 이력과 정정
 
@@ -250,8 +280,9 @@ NIC 은 NUMA0 이고 `nvidia-smi topo -m` 은 `SYS` 로 보고한다. GPU BAR �
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency
   (1→32)는 측정했으나, **write 경로**(`dfs_write_gpu`)와 vLLM 수준의 TTFT 는 미측정이다.
-- **GPU-direct 가 왜 뒤지는지 확정하지 않았다.** `SYS` 토폴로지가 유력한 후보이지만, NIC 을
-  GPU 와 같은 root complex 로 옮긴 대조 측정이 없다. 프로세스 NUMA 고정 효과도 미측정이다.
+- **GPU-direct 가 왜 뒤지는지 확정하지 않았다.** 토폴로지는 위에서 배제했다. 남은 후보는
+  GPU BAR 로의 PCIe 쓰기 대역폭과 UCX 의 device memory 처리(전송별 등록/rendezvous)이며,
+  둘 다 측정하지 않았다. 프로세스 NUMA 고정 효과도 미측정이다.
 - **DRAM 이득의 값어치를 아직 모른다.** 실제 vLLM 워크로드에서 호스트 DRAM 대역폭이
   경합하는지를 재지 않았으므로, 이 경로를 채택할 근거의 크기를 말할 수 없다.
 - **2엔진/호스트 토폴로지는 이 클러스터에서 불가능하다.** `provider: ucx+rc_v` 는 Mercury 가
