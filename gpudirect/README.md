@@ -164,13 +164,41 @@ ucx_perftest  호스트 메모리, rc_v, 4 MiB   14.1 GB/s   (기준선)
 DAOS 2.9.100 초안, `provider: ucx+rc_v`, RoCE 400G NDR `mlx5_0`). el8 로 빌드한 DAOS
 클라이언트 바이너리가 Rocky 10 에서 그대로 동작하므로 컨테이너 없이 붙였다.
 
-`GPU0 ↔ NIC0` 은 `SYS`(소켓 횡단)다. 이 배치에서도 정합성은 통과하지만 대역폭 영향은
-아직 측정하지 않았다.
+`GPU0 ↔ NIC0` 은 `SYS`(소켓 횡단)다 — GPU 는 NUMA1, NIC 은 NUMA0. 아래 수치는 그
+배치에서 나온 것이고 프로세스를 NUMA 에 고정하지 않았다.
+
+### 읽기 경로 비교 (`../tests/bench_dfs_gpu.sh`, 8 GiB / 32 MiB 청크, 단일 스레드)
+
+| arm | GB/s | 청크 지연 ms | cyc/byte | DRAM rd MiB | DRAM wr MiB | DRAM 배수 |
+|---|---|---|---|---|---|---|
+| `gpu` | **9.84** | **3.41** | **0.572** | 424 | 337 | **0.09** |
+| `pinnedcopy` | 4.31 | 7.78 | 1.062 | 7765 | 8743 | 2.02 |
+| `hostcopy` | 2.95 | 11.36 | 1.345 | 16262 | 18742 | 4.27 |
+| `pinned` | 4.68 | 7.16 | 0.994 | 558 | 8704 | 1.13 |
+| `host` | 4.50 | 7.46 | 1.020 | 638 | 8700 | 1.14 |
+
+정직한 비교 대상은 `pinnedcopy`(pinned 스테이징 + H2D)다. 그 대비 GPU-direct 는
+**대역폭 2.28×, 청크 지연 2.28× 개선, CPU 사이클 1.86× 절감, 호스트 DRAM 트래픽 약 22×
+감소**다. `hostcopy`(pinned 아님)는 CUDA 가 자체 pinned 바운스를 한 번 더 거쳐 DRAM 배수가
+4.27 까지 오르므로 "스테이징" 대표값으로 인용하면 안 된다.
+
+분해가 서로 맞물린다. `pinned`(H2D 없음)의 DRAM write 8.7 GiB 는 NIC 이 호스트 메모리로
+DMA 한 8 GiB(쓰기 증폭 1.06×)이고, `pinnedcopy` 는 거기에 복사 엔진이 스테이징 버퍼를
+읽는 7.8 GiB 를 더한다. `gpu` 의 0.09× 는 페이로드가 호스트 DRAM 을 아예 지나지 않고
+제어 평면 트래픽만 남는다는 뜻이다 (유휴 기준선이 방향별 약 90 MiB/s 이므로 0.83초
+구간의 약 75 MiB 는 배경 트래픽이다).
+
+주의할 점 세 가지. DRAM 카운터는 uncore PMU 라 **system-wide** 로만 측정되므로 배경
+트래픽이 섞인다. `cyc/byte` 는 `daos_init` 을 포함한 프로세스 전체 사이클을 전달 바이트로
+나눈 값이다. 그리고 이 수치는 단일 스레드 값이라 상한이 아니다 — 같은 클러스터에서
+다중 워커로는 이미 37.4 GB/s 를 측정한 적이 있다 (`../tests/bench_raw_workingset.py`).
 
 ## 알려진 한계
 
-- **성능 수치가 없다.** 위 결과는 정합성만 본 것이다. 계획서 §8 의 지표(CPU cycles/byte,
-  `uncore_imc` 호스트 DRAM 트래픽, TTFT, concurrency 열화)는 미측정이다.
+- **측정 범위가 단일 스레드 read 에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽은
+  측정했으나, concurrency 열화 곡선(1→32), write 경로, NUMA 고정 효과, 그리고 vLLM
+  수준의 TTFT 는 미측정이다. `GPU0↔NIC0=SYS` 배치에서 NIC/GPU 를 같은 root complex 로
+  옮기면 얼마나 달라지는지도 아직 모른다.
 - **rkey import 는 스텁이다.** `HG_Bulk_import_rkey()` 가 `HG_OPNOTSUPPORTED` 를 돌려주고
   호출자가 HMEM 등록으로 폴백한다. UCX 경로에서는 애초에 호출되지 않으므로 손실이 없지만,
   OFI/verbs + cuFile 조합을 쓰려면 진짜 구현이 필요하다.
