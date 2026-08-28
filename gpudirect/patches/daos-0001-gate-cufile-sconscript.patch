@@ -1,0 +1,17 @@
+diff --git a/src/client/SConscript b/src/client/SConscript
+index bf4235263..3f54ff471 100644
+--- a/src/client/SConscript
++++ b/src/client/SConscript
+@@ -19,7 +19,11 @@ def scons():
+         SConscript("dfuse/SConscript")
+         SConscript("serialize/SConscript")
+         SConscript("ds3/SConscript")
+-        SConscript("cufile/SConscript")
++        # The cuFile plugin prototype is opt-in: its SConscript requires the CUDA
++        # Toolkit headers/libcufile and is not feature-detected upstream, so it
++        # breaks a normal build. Enable with DAOS_BUILD_CUFILE=yes.
++        if os.environ.get("DAOS_BUILD_CUFILE", "no") == "yes":
++            SConscript("cufile/SConscript")
+ 
+         SConscript("pydaos/SConscript")
+         env.Install(os.path.join("$PREFIX", "lib/daos/python"), "setup.py")

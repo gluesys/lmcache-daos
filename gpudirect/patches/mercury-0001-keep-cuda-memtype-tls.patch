@@ -1,0 +1,37 @@
+--- a/src/na/na_ucx.c
++++ b/src/na/na_ucx.c
+@@ -1426,8 +1426,32 @@
+         na_ucs_status_to_na(status), "ucp_config_read() failed (%s)",
+         ucs_status_string(status));
+ 
+-    /* Set user-requested transport */
+-    status = ucp_config_modify(config, "TLS", tls);
++    /* Set user-requested transport.
++     *
++     * cuda_copy and cuda_ipc are memory-type components, not network
++     * transports, but UCX gates them through the same TLS list. Restricting
++     * TLS to just the requested protocol therefore drops the component that
++     * supplies the dma-buf file descriptor for GPU buffers, and a later
++     * ucp_mem_map() of CUDA memory fails with -EINVAL (it falls back to
++     * ibv_reg_mr() on a device address). Keep them in the list, and fall back
++     * to the bare protocol if this UCX build does not know those names.
++     * NA_UCX_EXTRA_TLS overrides the appended list (empty disables it). */
++    {
++        const char *extra_tls = getenv("NA_UCX_EXTRA_TLS");
++        char        tls_buf[256];
++
++        if (extra_tls == NULL)
++            extra_tls = "cuda_copy,cuda_ipc";
++
++        if (extra_tls[0] != '\0') {
++            snprintf(tls_buf, sizeof(tls_buf), "%s,%s", tls, extra_tls);
++            status = ucp_config_modify(config, "TLS", tls_buf);
++            if (status != UCS_OK)
++                status = ucp_config_modify(config, "TLS", tls);
++        } else {
++            status = ucp_config_modify(config, "TLS", tls);
++        }
++    }
+     NA_CHECK_SUBSYS_ERROR(cls, status != UCS_OK, error, ret,
+         na_ucs_status_to_na(status), "ucp_config_modify() failed (%s)",
+         ucs_status_string(status));

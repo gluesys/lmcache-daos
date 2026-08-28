@@ -1,0 +1,29 @@
+diff --git a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
+index 265d53e0a..a3a80a2e0 100644
+--- a/src/uct/ib/base/ib_md.c
++++ b/src/uct/ib/base/ib_md.c
+@@ -1248,6 +1248,24 @@ static void uct_ib_md_check_dmabuf(uct_ib_md_t *md)
+ 
+     ucs_debug("%s: dmabuf is supported", uct_ib_device_name(&md->dev));
+     md->cap_flags |= UCT_MD_FLAG_REG_DMABUF;
++
++    /* On platforms that have no legacy peer-memory driver (nvidia_peermem or
++     * nv_peer_mem), uct_ib_check_gpudirect_driver() leaves CUDA out of
++     * reg_mem_types because it only probes those sysfs paths. ucp_mem_map()
++     * with UCS_MEMORY_TYPE_CUDA then fails with -EIO even though the device
++     * can register GPU memory through a dma-buf FD -- which is the path
++     * ibv_reg_dmabuf_mr() takes, and which we verified works on this HCA.
++     * Advertise CUDA when dmabuf is available. Set DAOS_IB_DMABUF_CUDA=0 to
++     * restore the upstream behaviour. */
++    {
++        const char *dmabuf_cuda = getenv("DAOS_IB_DMABUF_CUDA");
++
++        if ((dmabuf_cuda == NULL) || strcmp(dmabuf_cuda, "0")) {
++            md->reg_mem_types |= UCS_BIT(UCS_MEMORY_TYPE_CUDA);
++            ucs_debug("%s: advertising cuda registration via dmabuf",
++                      uct_ib_device_name(&md->dev));
++        }
++    }
+ #endif
+ }
+ 

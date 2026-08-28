@@ -143,12 +143,17 @@ shim/             daos_evshim.c — sizeof(daos_event_t) 를 C 쪽에 두는 선
 tests/            게이트 테스트 + 마이크로벤치 (DAOS 필요)
 bench/            클라이언트측 측정 하네스 (vLLM+LMCache E2E)
 deploy/           ★ 환경 재구성 — 런처·Containerfile·설정·호스트 스냅샷
+gpudirect/        dfs_*_gpu() 스택 — DAOS/UCX/Mercury 패치와 3단 검증 도구
 ```
 
 **환경을 다시 세우려면 [`deploy/README.md`](deploy/README.md) 를 먼저 읽을 것.**
 측정에 쓴 호스트(client-6)가 반납되었으므로, 토폴로지·풀/컨테이너 속성·`daoslib-ucx`
 큐레이션·컨테이너 2단 빌드, 그리고 *모르면 결과가 조용히 무효가 되는* 측정 체크리스트가
 그 문서에만 있다.
+
+이 커넥터는 CPU `MemoryObj` 를 반환하는 `RemoteConnector` 계약 위에 있어 GPU-direct 가
+아니다. GPU 버퍼에 직접 read/write 하는 DAOS 쪽 데이터 평면은 별도로 세웠고, 그 패치와
+검증 절차는 [`gpudirect/README.md`](gpudirect/README.md) 에 있다 (정합성 통과, 성능 미측정).
 
 ## 근거 (검증된 사실)
 
