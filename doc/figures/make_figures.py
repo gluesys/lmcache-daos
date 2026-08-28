@@ -514,11 +514,146 @@ def fig_stack():
 
     return fig
 
+
+# ----------------------------------------------------------------- Figure 3
+def fig_why():
+    """KV-cache 워크로드의 성질 → DAOS 객체 모델 → 실측 근거."""
+    fig, ax = newax((13.4, 8.6))
+
+    ax.text(2.0, 97.8, "그림 3.  KV-cache 를 DAOS 에 두는 구조적 이유와 실측",
+            fontsize=12.6, color=INK, fontweight="bold", va="top")
+    ax.text(2.0, 94.2, "워크로드의 성질 하나하나가 DAOS 객체 모델의 어떤 성질과 맞물리는지, "
+                       "그리고 그것이 실측에서 어떤 수치로 나타나는지.",
+            fontsize=8.4, color=GREY, va="top")
+
+    C1, W1 = 2.0, 29.0          # 워크로드
+    C2, W2 = 34.5, 30.5         # DAOS 메커니즘
+    C3, W3 = 68.5, 29.5         # 실측
+
+    for x, w, t, sub in [(C1, W1, "KV-cache 워크로드의 성질", "vLLM + LMCache 가 만드는 I/O"),
+                         (C2, W2, "DAOS 객체 모델이 주는 것", "이 성질과 맞물리는 구조"),
+                         (C3, W3, "실측", "본 저장소 · deploy/README.md §8")]:
+        ax.text(x + 1.0, 90.6, t, fontsize=9.4, color=INK, fontweight="bold", va="top")
+        ax.text(x + 1.0, 87.6, sub, fontsize=7.0, color=GREY, va="top")
+    ax.plot([C1, C3 + W3], [86.2, 86.2], color="#cfccc6", lw=0.9)
+
+    LANES = [
+        ("청크는 크고, 한 번 쓰고 전량 읽는다",
+         ["KV chunk 1개 = 28 MiB (chunk_size 256, BF16)",
+          "write-once · immutable · 부분 갱신 없음"],
+         "array 객체 + DFS chunk 스트라이프",
+         ["파일 하나가 DFS chunk 단위로 쪼개져",
+          "여러 target 에 분산된다.",
+          "규칙: chunk ≈ 파일크기 ÷ 랭크당 타깃수"],
+         [("chunk 1 MiB", "9.17 GB/s"),
+          ("chunk 4 MiB", "34.50 GB/s"),
+          ("chunk 16 MiB", "9.59 GB/s")],
+         "청크 수가 곧 병렬 target 수 — 16 MiB 는 청크 2개뿐이라 target 2개만 쓴다"),
+
+        ("조회는 정확 키 point lookup 이다",
+         ["LMCache 가 토큰 해시로 키를 계산 —",
+          "검색·범위질의·스캔이 없다. 객체 수는 수십만"],
+         "디렉터리 엔트리 = 디렉터리 객체의 dkey",
+         ["해시로 찾으므로 선형 스캔이 아니고,",
+          "중앙 MDS 도 없다. 별도 인덱스를",
+          "유지할 필요가 없다."],
+         [("exists  1k 객체", "0.039 ms"),
+          ("exists  80k 객체", "0.041 ms"),
+          ("read    80k 객체", "0.080 ms")],
+         "1k → 80k 에서 추세 없음 — POSIX/NFS 직관이 적용되지 않는다"),
+
+        ("메타는 아주 작고 데이터는 아주 크다",
+         ["청크 메타(shape/dtype/fmt) ~28 B 대 본문 28 MiB",
+          "메타만 따로 조회할 이유가 없다"],
+         "SCM(메타) + NVMe(데이터) 2티어",
+         ["메타는 SCM, 본문은 NVMe.  커넥터는",
+          "메타를 객체 안에 넣어 (prefix+meta+payload)",
+          "open 1 + read 2 로 끝낸다."],
+         [("객체당 메타", "4.1 KB"),
+          ("28 MiB 청크에서 메타 여유", "~500x"),
+          ("손익분기 객체 크기", "61 KB")],
+         "chunk_size=1 의 112 KiB 도 61 KB 보다 크다 → 메타가 먼저 차지 않는다"),
+
+        ("재사용이 노드 경계를 넘는다",
+         ["다른 노드·다른 프로세스가 넣은 prefix 를 그대로",
+          "쓴다. 노드 로컬 계층으로는 불가능한 재사용"],
+         "공유 네임스페이스 + 클라이언트 직접 접근",
+         ["게이트웨이나 프록시 없이 각 노드의",
+          "daos_agent 가 같은 컨테이너에 직접 붙는다.",
+          "쓴 노드와 읽는 노드가 대칭이다."],
+         [("크로스노드 재사용", "149/149 hit"),
+          ("같은 조건 로컬 NVMe", "83% miss"),
+          ("2노드 동시 집계", "32.8 GB/s")],
+         "avg TTFT 444 ms — 기록 노드(371 ms)의 84%"),
+
+        ("서빙 경로는 지연에 민감하다",
+         ["TTFT 예산 안에서 GB 단위를 옮겨야 한다.",
+          "커널 경유 계층이 하나 늘면 그대로 TTFT 로 온다"],
+         "사용자 공간 direct path + RDMA",
+         ["dfuse·커널 VFS 를 거치지 않고 libdfs 를",
+          "직접 호출한다. UCX RDMA 로 NIC 에서",
+          "NVMe/SCM 까지 복사 단계가 짧다."],
+         [("커넥터 read", "33.6 GB/s"),
+          ("retrieve (단일요청)", "21.4 GB/s"),
+          ("단일노드 raw read", "34.27 GB/s")],
+         "발견된 병목 3개는 모두 DAOS 외부였다 (그림 1 참조)"),
+    ]
+
+    y = 84.2
+    LH = 10.4
+    for req_t, req_l, mech_t, mech_l, ev, note in LANES:
+        y0 = y - LH
+        box(ax, C1, y0, W1, LH, title=req_t, ts=8.2, ls=6.9,
+            lines=[(t, "k") for t in req_l], fill=FILL2)
+        box(ax, C2, y0, W2, LH, title=mech_t, ts=8.2, ls=6.9,
+            lines=[(t, "k") for t in mech_l], fill=FILL)
+        ty = box(ax, C3, y0, W3, LH, title=None, fill="white", edge=ACC, lw=1.2)
+        table(ax, C3 + 1.5, y0 + LH - 2.2, W3 - 3.0, ev, ls=7.2, col=INK)
+        ax.text(C3 + 1.5, y0 + 1.9, note, fontsize=6.5, color=GREY, va="top")
+
+        mid = y0 + LH * 0.58
+        arrow(ax, (C1 + W1 + 0.6, mid), (C2 - 0.6, mid), col="#8d8d8d", lw=1.0, ms=7)
+        arrow(ax, (C2 + W2 + 0.6, mid), (C3 - 0.6, mid), col=ACC, lw=1.0, ms=7)
+        y = y0 - 1.3
+
+    # ---- 하단: E2E 효과 / 비교 범위
+    ax.plot([C1, C3 + W3], [24.2, 24.2], color="#cfccc6", lw=0.9)
+
+    ty = box(ax, C1, 4.6, 44.0, 18.0, title="E2E 효과  (client-6 · H100 NVL + DAOS 2 rank · Qwen3-14B)",
+             ts=9.0, fill="white", edge=ACC, lw=1.3)
+    table(ax, C1 + 1.6, ty, 40.8, [
+        ("hit TTFT — 컨텍스트 8K", "151 ms   (recompute 대비 3.8x)"),
+        ("hit TTFT — 컨텍스트 127K", "2129 ms  (recompute 대비 11.8x)"),
+        ("long-doc-qa 100 GB / 12 inflight", "avg 371 ms · 21.36 GB/s (11.7x)"),
+        ("Hub v4 최종 TTFT 배수", "17.7x  (158 ms vs 2812 ms)"),
+        ("데이터 무결성 (28 MB x 30)", "30/30  (libfabric 3-10/30)"),
+    ], ls=7.2, col=INK)
+
+    ty = box(ax, 49.0, 4.6, 49.0, 18.0, title="비교 범위와 한계  —  이 그림이 주장하지 않는 것",
+             ts=9.0, ls=7.0, fill="#fbf9f5", edge=WARN, lw=1.1,
+             lines=[
+                 ("다른 원격 백엔드(Redis · 공유 POSIX FS · 오브젝트 스토리지)", "k"),
+                 ("와의 비교는 미측정이다. 위 대비는 모두 노드 로컬 계층", "k"),
+                 ("(GPU KV · CPU · 로컬 NVMe) 기준이다.", "k"),
+                 ("", "k"),
+                 ("· 백킹이 NVMe 여야 한다 — ZFS zvol 풀에서는 0.95x, 손실", "k"),
+                 ("· retrieve 상한은 read ⊕ H2D 직렬 합성 (19.4–21.4 GB/s).", "k"),
+                 ("  스트리밍으로 33.7 GB/s 확보했으나 상류 API 대기", "k"),
+                 ("· 위 배수는 노드 로컬 계층 대비이며, 워킹셋이 서버", "k"),
+                 ("  메모리에 상주 가능한 구간의 값이 섞여 있다", "k"),
+             ])
+
+    ax.text(2.0, 2.0, "출처: 본 저장소 README (ExaCI5-4 CI, 메타데이터 스케일 시험) · "
+                      "deploy/README.md §8 (client-6) · 「DAOS KV-cache over RoCE v4」",
+            fontsize=6.8, color="#a8a8a8", va="bottom")
+    return fig
+
 OUT = os.path.dirname(os.path.abspath(__file__))
 FIGS = {
     "arch": (fig_arch, "fig1_lmcache_daos_architecture"),
     "stack": (fig_stack, "fig1b_lmcache_daos_stack"),
     "bed": (fig_bed, "fig2_lmcache_daos_testbed"),
+    "why": (fig_why, "fig3_why_daos_for_kvcache"),
 }
 
 want = sys.argv[1:] or list(FIGS)
