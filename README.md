@@ -68,6 +68,11 @@ libfabric `verbs;ofi_rxm` 이 대용량 RDMA read 를 조용히 손상시킨다�
 > 대비는 아래처럼 실측했지만, 다른 원격 백엔드(Redis / 공유 POSIX FS / 오브젝트
 > 스토리지) 와의 비교는 **미측정**이다.
 
+![KV-cache 를 DAOS 에 두는 구조적 이유와 실측](doc/figures/fig3_why_daos_for_kvcache.png)
+
+워크로드의 성질 → 그것과 맞물리는 DAOS 객체 모델의 구조 → 실측 수치를 한 줄씩 짝지은
+그림이다. 아래 항목들의 근거가 어디서 온 것인지 이 그림 하나로 따라갈 수 있다.
+
 - **prefill 재계산 제거.** hit TTFT 는 컨텍스트 8K 에서 151 ms, 127K 에서 2129 ms 이고
   같은 컨텍스트의 recompute 대비 3.8x → 11.8x. 100 GB long-doc-qa / 12 inflight 에서
   avg TTFT 371 ms, 집계 21.36 GB/s (recompute 대비 11.7x) — `client-6`. Hub v4 기준
