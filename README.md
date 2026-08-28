@@ -30,29 +30,63 @@ DAOS DFS(`dfs_sys` API) 네임스페이스의 self-describing 파일로 저장�
 - **비블로킹.** blocking libdfs 호출은 스레드풀 executor로 분리해 LMCache의 asyncio
   루프를 막지 않는다.
 
-### 강점 (측정으로 확인된 것)
+### 이 커넥터가 만든 것 (측정으로 확인)
 
-- **prefill 재계산을 없앤다.** hit TTFT 는 컨텍스트 8K 에서 151 ms, 127K 에서 2129 ms
-  이고, 같은 컨텍스트의 recompute 대비 3.8x → 11.8x 다. 100 GB long-doc-qa /
-  12 inflight 에서 avg TTFT 371 ms, 집계
-  21.36 GB/s (recompute 대비 11.7x) — `client-6`. Hub v4 기준 최종 TTFT 배수는 17.7x
-  (hit 158 ms vs recompute 2812 ms).
-- **노드 경계를 넘어 캐시를 공유한다 — 이 백엔드의 핵심 이유.** 한 번도 KV를 쓴 적 없는
-  노드가 다른 노드가 넣은 100 GB KV 를 **149/149 전량 히트**(미스 0), avg TTFT 444 ms로
-  기록 노드(371 ms)의 84%. 같은 조건의 **로컬 NVMe 는 83% 미스** — 노드 로컬 계층으로는
-  구조적으로 불가능한 재사용이다 (`client-6`).
-- **재시작·프로세스 교체를 견딘다.** vLLM 을 완전히 재시작해 GPU KV 와 LMCache 로컬
-  CPU 계층을 모두 비운 뒤에도 전량 hit — 2차 패스의 hit 출처는 DAOS 뿐이다
-  (`ExaCI5-4`, Phase 3). 독립 replica 간 공유도 cross-replica 2.75x (T6).
-- **대역폭이 확장된다.** 단일 노드 raw read 34.27 GB/s(100 GB NVMe 상주), 2노드 동시
-  집계 32.8 GB/s, 단일요청 retrieve 21.4 GB/s (`client-6`). 2노드 집계가 2배로 가지
-  않는 이유까지 규명돼 있다 — 병목이 클라이언트에서 서버로 넘어간 구간이다.
-- **정합성이 게이트로 잡혀 있다.** 잘린 객체를 hit 으로 오탐하지 않고(T4), 같은 키에
-  동시 writer 40라운드 x 6 writer 에서 blend 없음(T5), 28 MB x 30 순차 read 무결성
-  30/30 (libfabric `verbs;ofi_rxm` 에서는 3–10/30 — 그래서 UCX 로 확정했다).
-- **메타데이터가 제약이 되지 않는다.** 디렉터리 fanout 없이 flat(`/` + sha256)로 충분
-  하다는 결론을 측정으로 얻었다. 실제 청크 크기(28 MiB)에서 메타는 제약의 약 500배 밖
-  이고, 손익분기 객체 크기 61 KB 는 `chunk_size=1`(112 KiB)보다도 작다.
+여기 있는 것들은 **커넥터 코드에 귀속되는 것**만이다. 아래 [DAOS 계층에서 오는
+것](#daos-를-kv-계층으로-골라서-얻는-것)과 구분해서 읽을 것.
+
+- **잘린 객체를 hit 으로 오탐하지 않는다.** 8 B prefix 길이 프레이밍으로 부분 저장을
+  read 시점에 판정한다. 초기 구현은 예외가 서빙 경로로 탈출했고, 6개 절단 지점
+  시험(T4)으로 잡아 miss 반환으로 고쳤다. 같은 키에 동시 writer 40라운드 x 6 writer
+  에서 blend 없음(T5).
+- **read 한 번으로 끝난다.** 객체가 자기 자신을 기술하므로 stat·index 왕복이 없다.
+  커넥터 read 실측 33.6 GB/s (2.07 GB / 62 ms, `client-6`).
+- **용량 관리 경로를 만들었다.** 그 전에는 `list()` 가 `[]` 를 돌려주고 삭제 경로가 아예
+  없어 컨테이너가 단조 증가만 했다 (T7).
+- **retrieve 상한의 정체를 규명하고 그 위로 올라갔다.** 21.4 GB/s 가 `read ⊕ H2D`
+  **직렬 합성**임을 모델 오차 0.1% 로 규명하고, completion-ordered 스트리밍으로
+  33.7 GB/s(**1.55x**)를 확보했다 (`lmcache_daos/streaming.py` — 서빙 반영은 LMCache
+  상류 API 대기).
+- **플러그인 라우팅 계약을 실동작으로 확정했다.** `daos://` 는 어떤 어댑터에도 매칭되지
+  않아 실패한다는 것을 찾아 `plugin://<pool>/<container>` 규칙으로 고쳤다 (T3).
+- **DFS chunk 규칙을 찾았다.** `chunk ≈ 파일크기 ÷ 랭크당 타깃수`. 1 MiB → 4 MiB 로
+  sustained read 9.2 → 34.5 GB/s 이고, 16 MiB 붕괴(9.6)까지 같은 규칙으로 설명된다.
+  oclass·복제·스트라이프 폭은 read 에 거의 무영향이었다.
+- **안 만든 것에도 근거가 있다.** batched get/put 은 구현했고(커넥터 API 수준 GET
+  2.4–3.5x, PUT 1.3–2.4x), `batched_contains` 는 순차 프로빙 8.8 ms vs fan-out 9.4 ms
+  로 이득이 없어 미구현이다. 디렉터리 fanout 도 측정 결과 불필요로 결론했다.
+
+부수 산출물 — 커넥터의 강점이 아니라 이 작업이 찾아낸 **DAOS 측 수정 사항**이다:
+libfabric `verbs;ofi_rxm` 이 대용량 RDMA read 를 조용히 손상시킨다는 것(28 MB x 30 중
+3–10개만 정상, raw verbs 는 무결 → 30/30), 그리고 UCX 활성화의 실제 관문이 재빌드가
+아니라 패키징에서 빠진 `libna_plugin_ucx.so` 라는 것.
+
+### DAOS 를 KV 계층으로 골라서 얻는 것
+
+> **lmcache-daos 고유 강점이 아니다.** 원격·공유 계층이면 원리상 얻는 이점이고,
+> 커넥터의 역할은 DAOS 에서 그것이 *실제로 성립하게* 만든 것뿐이다. 노드 로컬 계층
+> 대비는 아래처럼 실측했지만, 다른 원격 백엔드(Redis / 공유 POSIX FS / 오브젝트
+> 스토리지) 와의 비교는 **미측정**이다.
+
+- **prefill 재계산 제거.** hit TTFT 는 컨텍스트 8K 에서 151 ms, 127K 에서 2129 ms 이고
+  같은 컨텍스트의 recompute 대비 3.8x → 11.8x. 100 GB long-doc-qa / 12 inflight 에서
+  avg TTFT 371 ms, 집계 21.36 GB/s (recompute 대비 11.7x) — `client-6`. Hub v4 기준
+  최종 TTFT 배수는 17.7x (hit 158 ms vs recompute 2812 ms).
+- **노드 경계를 넘는 재사용.** 한 번도 KV 를 쓴 적 없는 노드가 다른 노드가 넣은
+  100 GB KV 를 **149/149 전량 히트**(미스 0), avg TTFT 444 ms 로 기록 노드(371 ms)의
+  84%. 같은 조건의 **로컬 NVMe 는 83% 미스** — 노드 로컬 계층으로는 구조적으로 불가능한
+  재사용이다 (`client-6`). 여기서 DAOS 대신 다른 공유 백엔드를 써도 공유 자체는 된다;
+  갈리는 것은 대역폭·용량·운영 비용이고 그 비교는 하지 않았다.
+- **재시작·프로세스 교체 내성.** vLLM 을 완전히 재시작해 GPU KV 와 LMCache 로컬 CPU
+  계층을 모두 비운 뒤에도 전량 hit — 2차 패스의 hit 출처는 DAOS 뿐이다 (`ExaCI5-4`,
+  Phase 3). 독립 replica 간 공유도 cross-replica 2.75x (T6).
+- **대역폭.** 단일 노드 raw read 34.27 GB/s(100 GB NVMe 상주), 2노드 동시 집계
+  32.8 GB/s, 단일요청 retrieve 21.4 GB/s (`client-6`). 2노드 집계가 2배로 가지 않는
+  이유까지 규명돼 있다 — 병목이 클라이언트에서 서버로 넘어간 구간이다.
+- **메타데이터 여유.** 실제 청크 크기(28 MiB)에서 메타는 제약의 약 500배 밖이고,
+  손익분기 객체 크기 61 KB 는 `chunk_size=1`(112 KiB) 보다도 작다. 이는 DAOS 풀의 티어
+  비율에서 오는 성질이며, 커넥터가 여기서 얻은 것은 *flat(`/` + sha256) 키매핑을 유지해도
+  된다는 근거* 뿐이다.
 
 ### 적용 조건 (강점이 성립하는 범위)
 
