@@ -100,8 +100,13 @@ def writer(tid, errs):
         errs.append(f"write t{tid}: {type(e).__name__}: {e}")
 
 
-def reader(tid, nbytes, barrier, errs):
-    """Read the first nbytes of one file, sequentially, into a reused buffer."""
+def reader(tid, nbytes, barrier, errs, moved):
+    """Read the first nbytes of one file, sequentially, into a reused buffer.
+
+    Records what it actually transferred in moved[tid]. A worker that dies on
+    open transfers nothing, and the rate must not be credited with its share --
+    see measure().
+    """
     d = None
     try:
         d = DfsSys(pool=POOL, cont=CONT)
@@ -115,6 +120,7 @@ def reader(tid, nbytes, barrier, errs):
             while off < nbytes:
                 d.read_obj_into(obj, off, CHUNK, buf)
                 off += CHUNK
+            moved[tid] = off
         finally:
             d.close_obj(obj)
     except Exception as e:
@@ -131,13 +137,19 @@ def reader(tid, nbytes, barrier, errs):
 def measure(set_gb):
     per_worker = int(set_gb * 1e9 / WORKERS // CHUNK) * CHUNK
     if per_worker == 0:
-        return None, per_worker, ["working set too small for one chunk"]
-    best, allerr = 0.0, []
+        return None, per_worker, ["working set too small for one chunk"], 0
+    # Discard any rep that lost a worker. Two reasons, and the second one bites
+    # harder: the rate would be credited with bytes that worker never moved,
+    # and the surviving workers face less contention -- so a partial rep is not
+    # a sample of WORKERS-way throughput at all. Taking max() over reps then
+    # selects precisely the most damaged one, which is how this harness came to
+    # report 46 GB/s against a 15.8 GB/s-per-drive fabric.
+    best, clean, allerr = 0.0, 0, []
     for _ in range(REPS):
-        errs = []
+        errs, moved = [], [0] * WORKERS
         barrier = threading.Barrier(WORKERS + 1)
         th = [threading.Thread(target=reader,
-                               args=(k, per_worker, barrier, errs))
+                               args=(k, per_worker, barrier, errs, moved))
               for k in range(WORKERS)]
         for x in th:
             x.start()
@@ -146,9 +158,16 @@ def measure(set_gb):
         for x in th:
             x.join(timeout=900)
         dt = time.perf_counter() - t0
-        best = max(best, per_worker * WORKERS / dt / 1e9)
-        allerr += errs
-    return best, per_worker, allerr
+        if errs:
+            allerr += errs
+            continue
+        want = per_worker * WORKERS
+        if sum(moved) != want:            # short read without an exception
+            allerr.append(f"short: moved {sum(moved)} of {want}")
+            continue
+        clean += 1
+        best = max(best, sum(moved) / dt / 1e9)
+    return (best if clean else None), per_worker, allerr, clean
 
 
 if not SKIP_WRITE:
@@ -180,9 +199,12 @@ for s in SETS:
         print(f"{s:>10.0f} GB {'':>10} {'skip':>8}   corpus is only "
               f"{TOTAL_BYTES/1e9:.0f} GB", flush=True)
         continue
-    g, per, errs = measure(s)
-    note = f"{len(errs)} err: {errs[0][:48]}" if errs else ""
-    print(f"{s:>10.0f} GB {per/1e9:>8.2f} GB {g:>8.2f}   {note}", flush=True)
+    g, per, errs, clean = measure(s)
+    note = f"{clean}/{REPS} clean"
+    if errs:
+        note += f", {len(errs)} discarded: {errs[0][:40]}"
+    shown = "FAILED" if g is None else f"{g:8.2f}"
+    print(f"{s:>10.0f} GB {per/1e9:>8.2f} GB {shown:>8}   {note}", flush=True)
 
 print(f"\n비교 기준: 0.94 GB working set 에서 35.3 GB/s (bench_async_vs_sync, "
       f"서버 메모리 상주 가능) / Part C 2노드 end-to-end 집계 32.8 GB/s "
