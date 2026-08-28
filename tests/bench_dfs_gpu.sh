@@ -9,13 +9,18 @@
 #     include whatever else the box is doing -- run this on an idle host and
 #     read the idle baseline printed first before trusting small differences.
 #
-#   ./bench_dfs_gpu.sh [pool] [cont] [chunk_MiB] [total_MiB]
+#   ./bench_dfs_gpu.sh [pool] [cont] [chunk_MiB] [total_MiB] [workers]
+#
+# For the concurrency sweep, loop this over workers -- one perf pair per point,
+# so each point keeps its own attribution:
+#   for w in 1 4 16 32; do ./bench_dfs_gpu.sh gdspool kvgds 32 8192 $w; done
 set -euo pipefail
 
 POOL=${1:-gdspool}
 CONT=${2:-kvgds}
 CH=${3:-32}
 TOT=${4:-8192}
+NW=${5:-1}
 BIN=${BIN:-./bench_dfs_gpu}
 IMC="uncore_imc/cas_count_read/,uncore_imc/cas_count_write/"
 TMP=$(mktemp -d)
@@ -30,14 +35,17 @@ perf stat -a -e "$IMC" -x, -o "$TMP/idle" -- sleep 2 2>/dev/null
 awk -F, '$3 ~ /cas_count/ {printf "  %-30s %10s %s\n", $3, $1, $2}' "$TMP/idle"
 echo
 
+echo "workers: $NW"
 printf '%-11s %7s %9s %9s %12s %12s %9s\n' \
 	arm GB/s chunk_ms cyc/byte DRAM_rd_MiB DRAM_wr_MiB DRAM_x
 for arm in gpu pinnedcopy hostcopy pinned host; do
 	perf stat -e cycles -x, -o "$TMP/c.$arm" -- \
-		"$BIN" "$POOL" "$CONT" "$arm" "$CH" "$TOT" >"$TMP/o.$arm" 2>/dev/null
+		"$BIN" "$POOL" "$CONT" "$arm" "$CH" "$TOT" "$NW" \
+		>"$TMP/o.$arm" 2>/dev/null
 	sleep 1
 	perf stat -a -e "$IMC" -x, -o "$TMP/d.$arm" -- \
-		"$BIN" "$POOL" "$CONT" "$arm" "$CH" "$TOT" >"$TMP/o2.$arm" 2>/dev/null
+		"$BIN" "$POOL" "$CONT" "$arm" "$CH" "$TOT" "$NW" \
+		>"$TMP/o2.$arm" 2>/dev/null
 
 	gbs=$(grep -oE 'GB/s=[0-9.]+' "$TMP/o2.$arm" | cut -d= -f2)
 	cms=$(grep -oE 'chunk_ms=[0-9.]+' "$TMP/o2.$arm" | cut -d= -f2)
