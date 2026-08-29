@@ -4,7 +4,7 @@ Y=/root/lmc/arm.yaml
 case $ARM in
   cpu)   printf 'chunk_size: 256\nlocal_cpu: true\nmax_local_cpu_size: 200\nenable_async_loading: True\n' > $Y ;;
   nvme)  printf 'chunk_size: 256\nlocal_cpu: false\nlocal_disk: "file:///kvlocal/"\nmax_local_disk_size: 500\nenable_async_loading: True\n' > $Y ;;
-  daos)  printf 'chunk_size: 256\nlocal_cpu: false\nremote_url: "plugin://daos/kvpool2/kv2s16"\nremote_serde: "naive"\nremote_storage_plugins: ["daos"]\nextra_config:\n  remote_storage_plugin.daos.module_path: lmcache_daos.connector\n  remote_storage_plugin.daos.class_name: DaosConnector\nenable_async_loading: True\n' > $Y ;;
+  daos)  printf 'chunk_size: 256\nlocal_cpu: false\nremote_url: "plugin://daos/gdspool/kvlmc"\nremote_serde: "naive"\nremote_storage_plugins: ["daos"]\nextra_config:\n  remote_storage_plugin.daos.module_path: lmcache_daos.connector\n  remote_storage_plugin.daos.class_name: DaosConnector\nenable_async_loading: True\n' > $Y ;;
 esac
 KV=""; [ "$ARM" != "recompute" ] && KV="--kv-transfer-config {\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_both\"}"
 podman run -d --name vllm-daos --net host --security-opt label=disable --device nvidia.com/gpu=all --ipc host \

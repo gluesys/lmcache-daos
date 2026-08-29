@@ -47,6 +47,15 @@ cell2  DAOS rank1    ens2 192.168.10.84,          ens1 192.168.10.83
 
 ## 2. DAOS 측 구성
 
+> ⚠️ **아래 `kvpool2/kv2s16` 은 더 이상 존재하지 않는다** (2026-08-30 확인:
+> `DER_NONEXIST`). GPU-direct 작업을 위해 클러스터를 재구성할 때 파기됐다 — 이 하드웨어에서는
+> `daos_server` 재시작이 매번 SPDK 를 wedge 시키고, 복구에 format 이 필요하며 format 은 풀을
+> 파기한다(`gpudirect/README.md`). 이 절은 **측정 당시의 구성 기록**으로 남긴다.
+>
+> 현재 사용하는 것은 `gdspool` 의 `kvlmc` 이고, 생성 명령은
+> `config/lmcache-daos.yaml` 주석에 있다. 실행 가능한 설정 파일과 런처는 그쪽을 가리키도록
+> 갱신했다.
+
 ```bash
 # 풀 (cell1 에서 dmg, -i 필요)
 dmg -i pool query kvpool2

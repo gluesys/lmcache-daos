@@ -534,11 +534,83 @@ LMCache 기본 `chunk_size` 256 토큰 → **chunk 40 MiB**. 256 KiB 는 1.6 토
 **Phase B 판정: 부정. `DaosGdsBackend` 를 만들지 않는다.** 지연이 마지막 근거였고, 그
 근거가 측정으로 반대 방향임이 확인됐다.
 
-남은 실행 항목은 두 개다:
-- **인터리브 적용** (Phase A). 비용 0, 스테이징 실효 DRAM 상한 220.6 → 401.7.
-- **소형 전송의 호스트 경로 오버헤드 조사.** 256 KiB 에서 chunk 당 ~190 µs 는
-  `DaosConnector` 쪽 개선 여지다. KV 가 작은 모델(적은 layer·GQA 강한 모델)에서는 실제
-  chunk 가 이 영역에 들어올 수 있다.
+#### 256 KiB 이득은 GPU-direct 의 이득이 아니었다 (추가 조사)
+
+위에서 "복사로 설명되지 않는 chunk 당 ~190 µs" 를 `DaosConnector` 개선 여지로 남겼다.
+조사했고, **그 해석이 틀렸다.** 64 KiB~4 MiB 를 촘촘히 재면:
+
+| chunk | pinned | gpu | pinned p95 |
+|---|---|---|---|
+| 64 KiB | 136.2 | 155.3 | 152.3 (좁음) |
+| 128 KiB | 199.7 | 218.1 | 213.9 (좁음) |
+| **256 KiB** | **483.7** | **290.6** | 676.1 (이봉) |
+| 512 KiB | 522.2 | 565.6 | 714.8 |
+| 1 MiB | 580.4 | 619.1 | 759.2 |
+| 4 MiB | 1201.5 | 1229.6 | 1315.8 |
+
+**64·128 KiB 에서는 GPU 경로가 오히려 느리다.** 호스트 경로는 128→256 KiB 에서 200→484 µs
+로 튀고 그 지점부터 이봉 분포가 되며, GPU 경로는 256 KiB 까지 좁게 유지되다가 512 KiB 에서
+튄다. 즉 **256 KiB 는 서로 다른 두 임계 사이의 틈**일 뿐이고, GPU-direct 의 구조적 이득이
+아니다. Phase B 의 부정 판정을 약화시키는 것이 아니라 강화한다.
+
+원인 절반을 특정했다. `daos_mem_type_t` 에 `DAOS_MEM_TYPE_HOST = 0` 이 있으므로,
+`dfs_read_gpu()` 를 **pinned 호스트 버퍼**로 호출하는 arm(`hostattr`)을 만들어 갈랐다:
+
+| arm | 진입점 | 목적지 | 256 KiB chunk 지연 |
+|---|---|---|---|
+| `pinned` | `dfs_read` | 호스트 | 478.0 µs |
+| `hostattr` | `dfs_read_gpu` | 호스트 | **486.5 µs** |
+| `gpu` | `dfs_read_gpu` | GPU | **291.5 µs** |
+
+**진입점이 아니라 목적지 메모리 타입이 원인이다.** `dfs_read` 와 `dfs_read_gpu` 는 DFS·array
+API 계층에서 `args->mem_attr` 하나만 다른 동일 코드이므로(소스 확인), 차이는 전송 계층의
+메모리 타입별 동작이다. 클라이언트측 UCX 노브로는 재현되지 않았다 —
+`UCX_RNDV_FRAG_SIZE=host:4M`, `UCX_RNDV_THRESH=inf`, `UCX_RNDV_SCHEME=get_zcopy` 모두
+478~485 µs 로 변화 없음. DAOS fetch 의 bulk 는 **서버가 개시**하므로(`CRT_BULK_PUT`)
+클라이언트 설정이 결정권을 갖지 않는 것과 일치한다. 서버측 확인은 `daos_server` 재시작이
+SPDK 를 wedge 시키는 위 문제로 막혀 있다.
+
+**결론: 실제 chunk 크기(28~40 MiB)에서는 호스트 경로가 더 빠르므로 운영에 영향이 없다.**
+`DaosConnector` 개선 항목에서 내린다.
+
+### 인터리브 적용 (Phase A): 적용·검증 완료
+
+`deploy/launchers/run_vllm_daos.sh` 에 `numactl --interleave=all` 을 넣었다. 컨테이너
+이미지에 `numactl` 이 있다. `--cpuset-mems` 로 대체하면 안 된다 — 사용 가능한 노드만
+제한하고 기본 local 정책은 그대로여서 인터리브가 되지 않는다.
+
+검증 (client-6, 실제 vLLM 경로):
+- 정책 활성: vLLM 프로세스의 매핑 2478 줄 중 **2381 줄이 `interleave`**
+- 리트리브 중 소켓별 DRAM: S0 2267 MiB / S1 2180 MiB = **51.0% / 49.0%** (균형).
+  벤치의 인터리브 케이스(52/48)와 일치하고 기본 케이스(81/19)와 다르다.
+
+⚠️ 운영 경로의 **before 측정은 없다.** 이 컨테이너의 LMCache 설정이
+`plugin://daos/kvpool2/kv2s16` 를 가리키고 있었고 `kvpool2` 는 이미 파기되어
+(`DER_NONEXIST`) DAOS 백엔드가 죽은 상태였기 때문이다. 그래서 "운영 경로가 81/19 에서
+51/49 로 바뀌었다" 고는 말할 수 없다. 말할 수 있는 것은 정책이 켜졌고 결과 트래픽이
+균형이라는 것이다. 새 컨테이너 `gdspool/kvlmc` 는 벤치와 동일한 속성으로 만들었다
+(`daos fs get-attr` 로 file oclass `RP_2G4`, chunk `4194304`, dir oclass 까지 일치 확인).
+
+### 그런데 운영 경로의 병목은 전송이 아니다
+
+위 검증에서 나온 LMCache 자체 계측이 이 문서 전체의 결론을 확정한다.
+Qwen3-1.7B, 6000 토큰 프롬프트(5888 토큰 저장, 0.6289 GB):
+
+```
+Stored    ... cost 93.4513 ms, throughput 6.7298 GB/s;
+              offload_time: 93.2829 ms, put_time: 0.1324 ms
+Retrieved ... cost 181.7296 ms, throughput 3.4607 GB/s
+```
+
+**store 에서 DAOS 쓰기(`put_time`)는 0.13 ms 인데 offload 가 93.28 ms 다 — 약 700배.**
+리트리브도 3.46 GB/s 로, 같은 하드웨어의 raw DFS 스테이징 처리량(35 GB/s)의 1/10 이다.
+
+즉 운영 경로에서 **스토리지·전송은 병목의 근처에도 없고**, 시간은 LMCache 의 offload
+파이프라인(GPU→CPU 이동, 직렬화, GIL)에서 쓰인다. 전송 계층을 GPU-direct 로 바꿔서 줄일
+수 있는 몫이 애초에 전체의 몇 %도 되지 않는다. Phase B 의 판정과 같은 방향이며, 이쪽이
+훨씬 강한 근거다.
+
+**따라서 다음 작업은 스토리지 쪽이 아니라 LMCache offload 경로다.**
 
 ### 측정 이력과 정정
 

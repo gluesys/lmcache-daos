@@ -70,7 +70,19 @@ extern CUresult cuMemHostAlloc(void **, size_t, unsigned int);
 #define DC(call) do { int _r = (call); if (_r != 0) {                           \
 	fprintf(stderr, "%s = %d\n", #call, _r); exit(3); } } while (0)
 
-enum arm { ARM_GPU, ARM_PINNEDCOPY, ARM_HOSTCOPY, ARM_PINNED, ARM_HOST };
+/* ARM_HOSTATTR is the discriminating experiment for the small-transfer gap.
+ * At 256 KiB the gpu arm beats every host arm by 41-64%, which the H2D copy
+ * cannot explain (it is 2.5% of chunk latency there) and which the host vs
+ * pinned controls do not explain either. Two candidates remain: GPU memory
+ * itself is faster to fill, or dfs_read_gpu's code path is cheaper than
+ * dfs_read's regardless of where the data lands.
+ *
+ * daos_mem_type_t has DAOS_MEM_TYPE_HOST = 0, so this arm calls dfs_read_gpu
+ * with a pinned HOST buffer -- the _gpu entry point, host destination. If it
+ * comes out fast, the win is the code path and the ordinary connector can have
+ * it; if it stays slow, the win belongs to device memory. */
+enum arm { ARM_GPU, ARM_PINNEDCOPY, ARM_HOSTCOPY, ARM_PINNED, ARM_HOST,
+	   ARM_HOSTATTR };
 
 static enum arm          arm;
 static int               wants_h2d, wants_pinned;
@@ -165,13 +177,19 @@ static int read_one(struct worker *w, size_t off, int timed)
 
 	sgl.sg_nr = 1; sgl.sg_nr_out = 0; sgl.sg_iovs = &iov;
 	t0 = now();
-	if (arm == ARM_GPU) {
+	if (arm == ARM_GPU || arm == ARM_HOSTATTR) {
 		daos_mem_attr_t ma;
 
 		memset(&ma, 0, sizeof(ma));
-		ma.ma_mem_type  = DAOS_MEM_TYPE_CUDA;
-		ma.ma_device_id = 0;
-		d_iov_set(&iov, (void *)(uintptr_t)w->dptr, chunk);
+		if (arm == ARM_GPU) {
+			ma.ma_mem_type  = DAOS_MEM_TYPE_CUDA;
+			ma.ma_device_id = 0;
+			d_iov_set(&iov, (void *)(uintptr_t)w->dptr, chunk);
+		} else {
+			ma.ma_mem_type  = DAOS_MEM_TYPE_HOST;
+			ma.ma_device_id = 0;
+			d_iov_set(&iov, w->hbuf, chunk);
+		}
 		rc = dfs_read_gpu(dfs, w->obj, &sgl, off, &got, &ma);
 		t1 = t2 = now();
 	} else {
@@ -266,12 +284,17 @@ int main(int argc, char **argv)
 	else if (!strcmp(armnm, "hostcopy"))   arm = ARM_HOSTCOPY;
 	else if (!strcmp(armnm, "pinned"))     arm = ARM_PINNED;
 	else if (!strcmp(armnm, "host"))       arm = ARM_HOST;
+	else if (!strcmp(armnm, "hostattr"))   arm = ARM_HOSTATTR;
 	else {
-		fprintf(stderr, "arm: gpu|pinnedcopy|hostcopy|pinned|host\n");
+		fprintf(stderr,
+			"arm: gpu|pinnedcopy|hostcopy|pinned|host|hostattr\n");
 		return 1;
 	}
-	wants_h2d    = (arm == ARM_PINNEDCOPY || arm == ARM_HOSTCOPY);
-	wants_pinned = (arm == ARM_PINNEDCOPY || arm == ARM_PINNED);
+	wants_h2d = (arm == ARM_PINNEDCOPY || arm == ARM_HOSTCOPY);
+	/* hostattr must be pinned like the 'pinned' arm: the two differ only by
+	 * which entry point is called, or the comparison proves nothing. */
+	wants_pinned = (arm == ARM_PINNEDCOPY || arm == ARM_PINNED ||
+			arm == ARM_HOSTATTR);
 
 	if (nw < 1 || nw > 256) { fprintf(stderr, "workers out of range\n"); return 1; }
 	total -= total % chunk;
