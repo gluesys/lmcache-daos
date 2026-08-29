@@ -602,13 +602,87 @@ Stored    ... cost 93.4513 ms, throughput 6.7298 GB/s;
 Retrieved ... cost 181.7296 ms, throughput 3.4607 GB/s
 ```
 
-**store 에서 DAOS 쓰기(`put_time`)는 0.13 ms 인데 offload 가 93.28 ms 다 — 약 700배.**
-리트리브도 3.46 GB/s 로, 같은 하드웨어의 raw DFS 스테이징 처리량(35 GB/s)의 1/10 이다.
+⚠️ **정정.** 이 문서의 앞 판은 위 수치를 "DAOS 쓰기 0.13 ms vs offload 93.28 ms = 약 700배"
+라고 읽었다. **틀렸다.** LMCache 소스를 확인하면(`cache_engine.py`) 두 타이머는 이렇다:
 
-즉 운영 경로에서 **스토리지·전송은 병목의 근처에도 없고**, 시간은 LMCache 의 offload
-파이프라인(GPU→CPU 이동, 직렬화, GIL)에서 쓰인다. 전송 계층을 GPU-direct 로 바꿔서 줄일
-수 있는 몫이 애초에 전체의 몇 %도 되지 않는다. Phase B 의 판정과 같은 방향이며, 이쪽이
-훨씬 강한 근거다.
+```python
+offload_time = (store_stats.process_tokens_time + store_stats.from_gpu_time)
+with store_stats.profile_put():
+    self.storage_manager.batched_put(...)      # <- put_time 이 감싸는 것
+```
+
+`batched_put()` 은 **비동기 제출**이다. 즉 `put_time` 0.13 ms 는 큐에 넣는 비용이고
+**실제 DAOS 쓰기 시간을 포함하지 않는다.** 따라서 이 수치로 말할 수 있는 것은
+"스토리지가 700배 빠르다" 가 아니라 **"store 경로에서 스토리지 쓰기는 동기 임계경로 밖에
+있다"** 는 것뿐이다. 700배 비교는 철회한다.
+
+리트리브 쪽은 다르다. prefill 전에 토큰이 실제로 적재되어야 하므로 **동기**이고,
+`cost 181.7296 ms, throughput 3.4607 GB/s` 는 DAOS 읽기를 포함한 진짜 end-to-end 값이다.
+같은 하드웨어의 raw DFS 스테이징이 35 GB/s 인데 여기서는 3.46 GB/s — **1/10** 이다.
+이 차이는 DAOS 읽기 밖의 몫(디시리얼라이즈, H2D, GIL, 파이프라인)에서 나온다.
+
+즉 운영 경로에서 **전송 계층을 GPU-direct 로 바꿔 줄일 수 있는 몫은 전체의 일부에
+불과하다.** Phase B 의 판정과 같은 방향이며, 리트리브의 10배 격차가 그 근거다.
+아래에서 그 격차를 실제로 분해했다.
+
+#### 분해 결과: 99% 가 GPU⇄CPU 복사이고, 그 대부분은 배칭 부재다
+
+LMCache 는 store 를 `offload_time` 하나로만 찍고 retrieve 는 분해를 아예 찍지 않는다.
+그런데 타이머 자체는 이미 존재한다(`process_tokens_time`, `from_gpu_time`, `to_gpu_time`,
+`broadcast_time`). 그래서 그것들을 출력하도록 두 파일을 패치해 읽었다
+(`../tests/patch_lmcache_timers.py`, 앵커 5개 전부 fail-closed 검사). py-spy 는 쓸 수
+없었다 — vLLM 의 스레드 수가 많아 5초 창에서 **128초 뒤처졌고**, 측정 대상 구간이 60~160 ms
+라 표본이 잡히지 않는다.
+
+Qwen3-1.7B, 6000 토큰 프롬프트, 0.6289 GB, 8회 반복(store 첫 회는 워밍업이라 제외):
+
+| 단계 | store | retrieve |
+|---|---|---|
+| `process_tokens` (해싱·청킹·할당) | 0.50 ms (**0.8%**) | 0.22 ms (**0.13%**) |
+| **GPU⇄CPU 복사** (`from_gpu`/`to_gpu`) | **61.0 ms (99.2%)** | **163.9 ms (99.7%)** |
+| `broadcast` | — | 0.00 ms |
+| `put` (비동기 제출) | 0.11 ms | — |
+| 합계 | 61.5 ms | 164.5 ms |
+| 실효 대역폭 | 10.3 GB/s (D2H) | **3.84 GB/s (H2D)** |
+
+**토큰 처리는 사실상 0 이다.** 착수 전 "해싱·직렬화가 지배할 것" 이라는 예상은 틀렸다 —
+0.8% / 0.13% 다. 시간은 전부 vLLM paged KV ⇄ 연속 버퍼 이동에 있다.
+
+원인은 소스에 그대로 있다 (`v1/gpu_connector/gpu_connectors.py`):
+
+```python
+def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+        self.to_gpu(memory_obj, start, end, **kwargs)
+
+# TODO(Yuwei): need to optimize to enable real batching
+def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+    for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+        self.from_gpu(memory_obj, start, end, **kwargs)
+```
+
+**`batched_*` 는 이름만 배칭이고 실제로는 chunk 단위 Python 루프다.** LMCache 자신의 TODO
+가 그렇게 적어놨다. 5888 토큰 / chunk 256 = 23 chunk 이므로 retrieve 는 chunk 당 7.1 ms 다
+(chunk 28 MiB → 3.9 GB/s).
+
+#### 이 분해가 GDS 에 주는 함의: Phase B 판정이 유지된다
+
+`to_gpu` 는 0.6289 GB 를 PCIe 로 넘겨야 한다. 이 호스트에서 측정한 H2D 점근 대역폭은
+54 GB/s 이므로 **순수 데이터 이동의 하한은 11.6 ms** 다. 관측된 `to_gpu` 는 163.9 ms 이므로:
+
+- PCIe 데이터 이동: **≤ 7.1%**
+- 나머지 **≥ 92.9%**: chunk 당 고정비용(Python 루프, 커널 런치, 동기화, scatter 입도)
+
+`DaosGdsBackend` 가 MemoryObj 를 GPU 상주로 만들면 PCIe 몫(≤7.1%)이 사라지고 scatter 입도
+손해의 일부가 개선될 수 있다. 그러나 **Python 루프와 커널 런치 오버헤드는 목적지를 바꿔도
+남는다.** 즉 지배 항목이 스토리지도 전송도 아니고 GDS 로 제거되지도 않는다.
+
+**따라서 최우선 개선은 LMCache 의 `batched_*` 배칭이고, 그것은 스토리지와 무관하다.**
+Phase B 의 부정 판정은 유지된다 — 근거가 하나 더 늘었다.
+
+(부수 관찰: 24개 프롬프트를 연속 투입했을 때 LMCache 가
+`Ref count of MemoryObj ... is negative: -1. Double free occurred somewhere` 경고를 다수
+출력했다. LMCache 자체 버그이고 이 작업 범위 밖이지만 부하 시 재현되므로 기록해둔다.)
 
 **따라서 다음 작업은 스토리지 쪽이 아니라 LMCache offload 경로다.**
 
