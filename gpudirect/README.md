@@ -262,6 +262,57 @@ GPU 경로의 열세는 GPU/NIC 를 같은 노드에 두어도 사라지지 않�
 `gpu` 는 6.20–8.76 이다. 원인은 규명하지 않았고, 남은 후보는 GPU BAR 로의 PCIe 쓰기
 대역폭과 UCX 가 device memory 를 다루는 방식(전송별 등록/rendezvous)이다.
 
+### 전송 계층에서 본 원인: GPU BAR 쓰기는 QP 당 제한된다
+
+DAOS 를 배제하고 두 GPU 호스트(client-5 ↔ client-6, 동일 perftest 6.29, 동일 400G NDR)
+사이에서 직접 쟀다. DAOS 객체 fetch 는 **서버가 클라이언트 버퍼로 push(RDMA write)** 하므로
+write 방향이 관심 대상이고, read 는 대조군으로 함께 쟀다.
+
+| 연산 | 크기 / QP | 대상=호스트 | 대상=GPU |
+|---|---|---|---|
+| write | 4 MiB, 1 QP | 46.24 | **22.07** |
+| write | 4 MiB, 4 QP | 46.28 | **39.89** |
+| write | 32 MiB, 1 QP | 46.29 | 30.85 |
+| read | 4 MiB, 1 QP | 10.54 | **10.59** |
+| read | 4 MiB, 4 QP | — | 37.56 |
+| read | 4 MiB, 8 QP | — | 40.54 |
+
+세 가지가 나온다.
+
+- **GPU 페널티는 write 에만 있다.** 1 QP write 는 호스트 46 vs GPU 22 GB/s 인데, read 는
+  호스트 10.54 vs GPU 10.59 로 **동일**하다. GPU 메모리가 느린 것이 아니라 GPU BAR 로의
+  RDMA write 가 QP 당 제한된다.
+- **하드웨어 한계가 아니다.** QP 를 늘리면 write 39.89, read 40.54 GB/s 까지 나온다.
+- **전송 단위가 클수록 유리하다.** 1 QP write 가 4 MiB 에서 22.07, 32 MiB 에서 30.85 다.
+
+그리고 **DAOS GPU-direct 의 천장 19~24 GB/s 는 1 QP GPU write 천장(22)과 일치한다.** 이것이
+열세의 직접적인 설명이다 — 토폴로지가 아니라 GPU BAR 쓰기의 QP 당 대역폭이다.
+
+#### 그룹 폭을 넓혀도 해결되지 않는다 (오히려 나빠진다)
+
+서버 측 병렬 엔드포인트를 늘리면 QP 수 효과를 볼 수 있을 것으로 보고, 그룹 폭만 다른
+컨테이너 세 개를 만들어 쟀다 (16 워커, 8 GiB, chunk 4 MiB 동일, client-6).
+
+| oclass | `gpu` 중앙값 (범위) | `pinnedcopy` 중앙값 |
+|---|---|---|
+| `RP_2G1` | 12.06 (11.88–12.11) | 11.67 |
+| `RP_2G4` | **20.01** (16.48–22.44) | 34.02 |
+| `RP_2G8` | **12.65** (12.20–16.76) | 34.77 |
+
+스테이징은 G4 → G8 에서 34.0 → 34.8 로 영향이 없는데 GPU 는 20.0 → 12.7 로 **떨어진다.**
+위의 "전송 단위가 클수록 유리하다" 와 맞물리는 결과다 — 그룹을 넓히면 32 MiB 요청이 더
+많은 샤드로 쪼개져 전송 단위가 작아지고, 그 손해를 GPU 경로만 부담한다. 이 환경에서
+GPU-direct 의 최적점은 `RP_2G4` 이고, 더 넓히면 손해다.
+
+#### UCX 노브로는 재현되지 않았다
+
+`UCX_MAX_RNDV_LANES` 는 **존재하지 않는 변수**다(`ucx_info -f` 에 없음) — 그것으로 한
+초기 실험은 전부 무효였다. 실제로 있는 것은 `UCX_MAX_RNDV_RAILS`(기본 2),
+`UCX_RNDV_SCHEME`, `UCX_RNDV_FRAG_SIZE=host:512K,cuda:4M`, `UCX_MIN_RNDV_CHUNK_SIZE` 다.
+다만 rails 는 **여러 디바이스를 병렬로 쓰는 멀티레일** 설정이라 NIC 포트가 하나인 이
+환경에서는 perftest 의 `-q 4`(같은 포트에 QP 4개)를 재현할 수 없다. 서버 엔진에 주입해
+확인하려 했으나 daos_server 재시작이 아래의 SPDK wedge 를 유발해 측정에 이르지 못했다.
+
 ### 측정 이력과 정정
 
 이 문서의 앞선 두 판은 잘못된 수치를 실었다. 원인은 매번 **컨테이너 구성** 이었다.
@@ -280,9 +331,18 @@ GPU 경로의 열세는 GPU/NIC 를 같은 노드에 두어도 사라지지 않�
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency
   (1→32)는 측정했으나, **write 경로**(`dfs_write_gpu`)와 vLLM 수준의 TTFT 는 미측정이다.
-- **GPU-direct 가 왜 뒤지는지 확정하지 않았다.** 토폴로지는 위에서 배제했다. 남은 후보는
-  GPU BAR 로의 PCIe 쓰기 대역폭과 UCX 의 device memory 처리(전송별 등록/rendezvous)이며,
-  둘 다 측정하지 않았다. 프로세스 NUMA 고정 효과도 미측정이다.
+- **GPU BAR 쓰기의 QP 당 제한을 DAOS 안에서 우회하는 방법을 찾지 못했다.** 원인은 위에서
+  특정했지만(1 QP write 22 GB/s, 4 QP 39.9), DAOS/Mercury/UCX 가 하나의 포트에서 QP 를
+  늘리도록 만드는 설정을 찾지 못했다. 그룹 폭 확대는 역효과였다. 프로세스 NUMA 고정
+  효과도 미측정이다.
+- **`daos_server` 재시작이 반복적으로 SPDK 를 wedge 시킨다.** 이 클러스터에서 재시작
+  때마다 `device_unplugged` 와 `failed to init spdk context ... DER_NONEXIST` 가 재현되어,
+  bdev_list 전체 wipe → `setup.sh reset` → 재기동 → format 을 거쳐야 복구된다. format 은
+  풀을 파기하므로 **엔진 설정을 바꾸는 실험마다 풀 재구축 비용이 든다.** 이것이 서버 측
+  전송 노브 실험을 막고 있는 실질적 장애물이다.
+- **호스트별 `fabric_iface` 이름이 다르다** (cell1 `ens2`, cell2 `ens2np0`). 설정 파일을
+  호스트 간에 그대로 복사하면 cell2 가 `can't determine device class for "ens2"` 로 기동
+  실패한다. 실제로 한 번 그렇게 망가뜨렸다.
 - **DRAM 이득의 값어치를 아직 모른다.** 실제 vLLM 워크로드에서 호스트 DRAM 대역폭이
   경합하는지를 재지 않았으므로, 이 경로를 채택할 근거의 크기를 말할 수 없다.
 - **2엔진/호스트 토폴로지는 이 클러스터에서 불가능하다.** `provider: ucx+rc_v` 는 Mercury 가
