@@ -1,3 +1,26 @@
+Advertise CUDA registration on IB when dmabuf is available.
+
+SCOPE AND SAFETY -- this patch is DEFAULT ON (opt out with DAOS_IB_DMABUF_CUDA=0),
+unlike its companion mercury-0001, which is opt-in for a reason.
+
+It is measured harmless. The configuration that passed
+tests/test_rawio_integrity.py 80/80 (28 MiB, 16 threads) on client-6 had THIS
+patch active and mercury-0001's CUDA components disabled via
+NA_UCX_EXTRA_TLS=. So advertising CUDA registrability on the memory domain
+does not by itself disturb host-memory transfers; adding cuda_copy/cuda_ipc to
+the UCX TLS list does, and that is the other patch.
+
+Record the validated combination, because only this one has been tested:
+
+    ucx-0001      : enabled  (default)
+    mercury-0001  : disabled (NA_UCX_EXTRA_TLS unset or empty)
+    result        : raw DFS I/O byte-exact, 80/80
+
+Both patches exist only to make dfs_read_gpu()/dfs_write_gpu() work, and
+gpudirect/PLAN.md records the decision not to build the GPU-direct backend. If
+you enable the CUDA components, re-run test_rawio_integrity.py and require a
+clean pass first -- the failure mode is silent corruption, not an error.
+
 diff --git a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
 index 265d53e0a..a3a80a2e0 100644
 --- a/src/uct/ib/base/ib_md.c

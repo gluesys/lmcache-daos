@@ -106,6 +106,34 @@ deps)
 	apply_git "$UCX" "$PATCHES/ucx-0001-advertise-cuda-reg-via-dmabuf.patch"
 	apply_plain "$HG" "$PATCHES/mercury-0001-keep-cuda-memtype-tls.patch"
 
+	cat <<-'WARN'
+
+	  ---------------------------------------------------------------------
+	  These two patches exist to make dfs_read_gpu()/dfs_write_gpu() work.
+	  They are NOT wanted by the production (host-memory) path, and one of
+	  them used to break it.
+
+	  The Mercury patch adds UCX memory-type components (cuda_copy,
+	  cuda_ipc) to the TLS list. An earlier version did that by DEFAULT, and
+	  on any client where CUDA is loadable that silently corrupted ordinary
+	  host-memory bulk transfers: one 4 MiB region per transfer, only with 4
+	  or more concurrent readers, sizes and return codes all normal. It is
+	  now opt-in -- nothing happens unless NA_UCX_EXTRA_TLS names the
+	  components.
+
+	  So after building with these patches:
+	    * leave NA_UCX_EXTRA_TLS unset/empty for anything that is not a
+	      GPU-direct experiment
+	    * if you do set it, re-run tests/test_rawio_integrity.py (28 MiB,
+	      16 threads) and require a clean pass before trusting any result
+	      measured with it -- the failure mode is silent
+
+	  Note that gpudirect/PLAN.md records the decision not to build the
+	  GPU-direct backend, so on current evidence there is no reason to
+	  enable the CUDA components at all.
+	  ---------------------------------------------------------------------
+	WARN
+
 	cat <<-EOF
 
 	  Rebuild both components straight into PREFIX -- DAOS loads the prereq
