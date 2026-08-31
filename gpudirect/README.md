@@ -1184,7 +1184,66 @@ client-6, 이 측정은 client-5 다. **둘을 가르지 않았으므로 어느 
 | 손상 형태 | 버퍼 앞부분은 대개 정확, 중간이 가변 크기로 깨짐. 드물게 객체 전체가 타 스레드 데이터 |
 | **`daos-0004` (rkey 스텁 → HMEM 폴백)** | **열림** |
 
-##### 스톡 검증이 막혀 있다 — 판단 필요
+##### ★ 결론: 스톡 DAOS 2.9.100 이 손상시킨다 — 우리 패치는 무죄
+
+버전을 고정한 스톡 대조군을 만들어 확정했다. `daos-stack/daos` 의 같은 저장소에서
+**GPU-direct API 도입 커밋(`133e6f8ca`)의 부모인 `841487de8`** 를 체크아웃해
+(`v2.9.100-tb` 태그가 조상) 별도 prefix 로 빌드했고, **prereq(mercury/UCX)는 패치된 것을
+그대로 복사해 재사용**했다. 즉 두 arm 의 차이는 **DAOS 코어 라이브러리 하나뿐**이다.
+
+| | A: 패치 | B: 스톡 |
+|---|---|---|
+| `libdaos.so` 크기 | 8950616 | **8922384** |
+| `libcart` → `HG_Bulk_import_rkey` | 1 (참조) | **0** |
+| DAOS 버전 | 2.9.100 | **2.9.100 동일** |
+| 기준 커밋 | `c87080a70` (cuFile draft) | **`841487de8`** |
+| mercury/UCX prereq | 동일 바이너리 | **동일 바이너리** |
+| 서버·호스트·컨테이너 속성·테스트 | 동일 | 동일 |
+| **실패 / 208** | **2 (1.0%)** | **4 (1.9%)** |
+
+각 arm 에서 실제 로드된 `libdaos` 크기를 출력해 번들 교체를 확인했다.
+
+**둘 다 실패하며 구간이 겹친다. `daos-0002`·`daos-0004` 는 원인이 아니다.**
+
+⚠️ 배제되지 **않은** 변수 하나: 두 arm 이 **같은 패치 mercury/UCX prereq** 를 쓴다. 따라서
+"완전 스톡 스택"(스톡 DAOS + 스톡 mercury + 스톡 UCX)은 시험하지 않았다. 다만 그 패치가
+이 경로에서 무해하다는 근거는 있다 — 추가한 `HG_Bulk_import_rkey` 스텁은 **스톡 DAOS 가
+호출하지 않고**, TLS 로직은 `NA_UCX_EXTRA_TLS` 가 비면 upstream 과 동일한
+`ucp_config_modify(config, "TLS", tls)` 한 줄로 축약된다. 이것은 코드 근거이고 측정은
+아니다. 완전 스톡 prereq 는 `--build-deps=yes` 재빌드가 필요하다.
+
+##### 최종 인과 사슬
+
+```
+스톡 DAOS 2.9.100: 동시 다중 chunk 읽기에서 데이터 손상 (28 MiB·16스레드에서 1~4%)
+  → read_obj_into 가 payload_len 을 반환하므로 조용함 (got == payload_len 통과)
+  → 커넥터가 손상된 KV chunk 를 정상으로 반환
+  → 프롬프트당 ~19 chunk → 재조회당 ~17-30%
+  → end-to-end 게이트 30-85% 실패
+```
+
+배제된 것: 커넥터 zero-copy·MemoryObj alias·LMCache·`daos-0002`·`daos-0004`·dfs_sys 캐시·
+목적지 버퍼 타입·chunk 정렬·호스트 코드 버전.
+
+**이것은 상류 DAOS 이슈다.** 재현기는 `../tests/test_rawio_integrity.py` 하나로
+충분하다 — DAOS + Python 만 필요하고 LMCache·GPU·torch·모델이 불필요하다.
+
+##### 부수 기록: CI 클러스터(192.168.35.40/41/42)는 대조군이 못 된다
+
+접근은 되지만 `provider: ofi+verbs;ofi_rxm` 이다 — v4 문서가 "대용량 RDMA read 를 조용히
+손상시킨다" 고 특정하고 UCX 로 전환해 해결한 **바로 그 provider**. 여기서 손상이
+재현되어도 RxM 버그를 본 것일 뿐이고, "스톡에서도 재현 → 우리 패치 무죄" 라는 **거짓
+결론**을 낼 위험이 있다. 추가로 VM(QEMU NVMe·zvol), `targets: 1`(운영 8),
+rank 0·3 Excluded, `daos_server` 전부 inactive, 클라이언트/서버 빌드 불일치
+(151.g4d2012d79 / 340.g31214ce07). **다른 사람이 같은 함정에 빠지지 않도록 기록한다.**
+
+##### 빌드 트리 주의
+
+스톡 빌드는 `/var/daosbuild/daos-stock`(사본, `841487de8`)에서 `PREFIX=/opt/daos-stock`
+으로 만들었으나 **빌드 디렉터리를 원본과 공유**한다(`/var/daosbuild/build-gpu`). 설치본
+`/opt/daos-gds*` 는 무손상이지만, **패치 버전을 재빌드하려면 패치를 다시 적용해야 한다.**
+
+##### (이전 판) 스톡 검증이 막혀 있다 — 해결됨
 
 `daos-0004` 를 가르려면 패치 없는 구성이 필요한데 세 경로 모두 막혔다:
 
