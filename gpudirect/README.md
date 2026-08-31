@@ -844,6 +844,68 @@ alias 100% [83.9, 100] 대 copy 85% [64.0, 94.8] — **신뢰구간이 겹친다
 **바이트는 DFS 계층에서 정확한데 end-to-end 는 깨진다.** 따라서 원인은 전송·스토리지가
 아니라 **커넥터의 DFS 사용 방식 또는 LMCache 통합**에 있다. 이것은 이제 근거가 충분하다.
 
+##### MemoryObj 소유권 규약 검증: 위반은 실재했으나 원인은 아니었다
+
+규약은 serializer 를 backend 옆에 놓고 읽어야 보인다. `NaiveSerializer.serialize()` 는
+**같은 객체**에 `ref_count_up()` 한 번을 더해 돌려주고(= 소비자 몫),
+`remote_backend.batched_submit_put_task()` 는 자기 몫만 내린다:
+
+```python
+for mo in memory_objs: mo.ref_count_up()                    # backend 몫 +1
+try:     compressed = [serialize(mo) for mo in memory_objs]  # 소비자 몫 +1
+finally: for mo in memory_objs: mo.ref_count_down()          # 자기 몫만 -1
+... connection.batched_put(keys, compressed_memory_objs)
+```
+
+`remote_backend.py` 전체에 `ref_count_down` 은 **두 곳뿐**이고 둘 다 위의 "자기 몫" 이다 —
+콜백(`batched_put_callback`/`put_callback`)은 참조를 내리지 않는다. 따라서 `put()` /
+`batched_put()` 에 도착하는 객체는 **커넥터가 반납해야 하는 참조**를 지닌다. 우리 커넥터는
+두 경로 모두에서 반납하지 않았고, `support_batched_put()` 이 True 이므로 실제 사용 경로인
+`batched_put` 이 chunk 마다 참조를 누출했다. `cache_engine.py` 의 주석
+"we implicitly rely on batched_put to call ref_count_down" 도 같은 규약을 말한다.
+
+**규약 위반은 실재했다. 그러나 고쳐도 손상은 사라지지 않았다:**
+
+| 구성 | 실패율 | 95% CI |
+|---|---|---|
+| 기준 (참조 누출 상태) | 85% | [64.0, 94.8] |
+| **참조 반납 추가** | **70%** | **[48.1, 85.5]** |
+
+구간이 겹치므로 **유의한 개선이 아니다.** 수정은 유지한다 — 누출은 실재하고 풀이 영구히
+회수되지 않으므로 규약상 필요하다 — 다만 **이것이 손상을 고친다고 주장하지 않는다.**
+
+부수 관찰 하나가 중요하다: 참조를 반납하자 `Double free` 경고가 시행당 57 → 95 로
+**늘었다**(총 1900건). 우리 반납이 정당하다면 줄어야 한다. 늘어난 것은 그 경고가
+"refcount 가 음수가 된 사건" 을 세기 때문이고, **이미 다른 곳에서 과다 해제가 일어나
+카운트가 0 인 상태**에 우리의 정당한 해제가 얹히면 또 한 건이 찍힌다. 즉 **경고 수는 우리
+쪽 변경의 정당성 지표가 아니며**, 과다 해제의 주체는 LMCache 쪽이다.
+
+##### 종합 판정
+
+| 계층 | 상태 |
+|---|---|
+| raw DFS I/O (16 스레드, 반복) | **정확** (80/80) |
+| LMCache `LocalCPUBackend` | **정확·결정적** |
+| **LMCache DAOS remote 경로** | **70~85% 손상** |
+
+세 줄을 나란히 놓으면 결론이 하나로 좁혀진다 — 바이트도, 전송도, 스토리지도 정상이고
+LMCache 의 공통 경로도 정상인데 **remote 백엔드 경로만 깨진다.** 그리고 그 경로에서만
+LMCache 자신이 MemoryObj 이중 해제를 수백~수천 건 보고한다.
+
+**현재 상태로 이 DAOS 백엔드는 사용할 수 없다.** 이 문서의 성능 수치들은 바이트 양은
+옮긴 상태에서 측정된 것이므로 대역폭 지표로는 참고가 되지만 정상 동작하는 구현의 값은
+아니다.
+
+##### 권고: 상류로 올린다
+
+여기서 커넥터를 더 고치는 것은 근거가 없다. 남은 후보가 LMCache 내부의 MemoryObj 수명
+관리이므로, **최소 재현기**를 만들어 상류에 올리는 것이 생산적이다. 재현기에 필요한
+요소는 이미 다 있다:
+- 손상 판정: `../tests/kv_correctness_gate.sh` (산문 프롬프트, 캐시 히트 확인 포함)
+- 실패율: `../tests/kv_failure_rate.sh` (실행별 nonce, A-miss 단정, 비침습 관측)
+- 계층 배제: `../tests/test_rawio_integrity.py` (DFS 는 무죄)
+- 대조: `local_cpu: true` 단독 구성은 통과
+
 ##### 좋은 소식: 이제 A/B 가 싸다
 
 기준율이 85% 이고 계측이 검증됐으므로, 진짜 수정은 20 시행으로도 명확히 드러난다

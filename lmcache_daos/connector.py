@@ -261,9 +261,57 @@ class DaosConnector(RemoteConnector):
             else:
                 yield idx, res
 
+    @staticmethod
+    def _drop_put_ref(memory_obj) -> None:
+        """Release the reference the serializer took on our behalf.
+
+        Required by LMCache's contract, which is only visible if you read the
+        serializer next to the backend. NaiveSerializer.serialize() is::
+
+            def serialize(self, memory_obj):
+                memory_obj.ref_count_up()
+                return memory_obj
+
+        -- the same object, with one reference added FOR THE CONSUMER. And
+        remote_backend.batched_submit_put_task() drops only its own::
+
+            for mo in memory_objs: mo.ref_count_up()
+            try:     compressed = [serialize(mo) for mo in memory_objs]
+            finally: for mo in memory_objs: mo.ref_count_down()
+            ... connection.batched_put(keys, compressed_memory_objs)
+
+        So every memory_obj arriving at put()/batched_put() carries a reference
+        that the connector owns and must release. This connector never did, on
+        either path, and support_batched_put() is True so the batched one is the
+        one in use -- a leaked reference per stored chunk.
+
+        A leak does not corrupt by itself; it stops the CPU pool from ever
+        reclaiming. What makes it a correctness problem is what the allocator
+        then does under pressure on the get path, where _get_sync() calls
+        local_cpu_backend.allocate() for every chunk. LMCache already reports
+        "Ref count of MemoryObj ... is negative: -1. Double free occurred
+        somewhere" on this path in the hundreds per run and never under
+        LocalCPUBackend, so its accounting is demonstrably inconsistent here.
+
+        Written as its own method rather than reusing _release(): that one tries
+        ref_count_down, then release, then free, for the torn-object path where
+        any of them will do. Here exactly one ref_count_down is owed, so
+        falling through to a different method would be wrong.
+        """
+        fn = getattr(memory_obj, "ref_count_down", None)
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:
+            pass
+
     async def put(self, key, memory_obj: "MemoryObj"):
         header, src, n = self._prep_write(memory_obj)
-        await self._run(self._put_sync, _key_to_path(key), header, src, n)
+        try:
+            await self._run(self._put_sync, _key_to_path(key), header, src, n)
+        finally:
+            self._drop_put_ref(memory_obj)
 
     # Aliasing the MemoryObj on the store path is UNSAFE and is off by default.
     # See _prep_write. Set DAOS_UNSAFE_ALIAS_STORE=1 only to reproduce the bug.
@@ -389,10 +437,16 @@ class DaosConnector(RemoteConnector):
         # the asyncio loop thread plus a 5.24 GB transient. _prep_write only
         # aliases each buffer, so nothing is materialised here.
         prepped = [self._prep_write(mo) for mo in memory_objs]
-        await asyncio.gather(*(
-            self._run(self._put_sync, _key_to_path(k), h, s, n)
-            for k, (h, s, n) in zip(keys, prepped)
-        ))
+        try:
+            await asyncio.gather(*(
+                self._run(self._put_sync, _key_to_path(k), h, s, n)
+                for k, (h, s, n) in zip(keys, prepped)
+            ))
+        finally:
+            # One reference owed per object -- see _drop_put_ref. This is the
+            # path LMCache actually uses, since support_batched_put() is True.
+            for mo in memory_objs:
+                self._drop_put_ref(mo)
 
 
 
