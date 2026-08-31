@@ -317,6 +317,27 @@ class DaosConnector(RemoteConnector):
     # See _prep_write. Set DAOS_UNSAFE_ALIAS_STORE=1 only to reproduce the bug.
     _ALIAS_STORE = os.environ.get("DAOS_UNSAFE_ALIAS_STORE") == "1"
 
+    # Diagnostic for the KV corruption: read into a private bytearray and copy
+    # into the MemoryObj, instead of letting DAOS write straight into the
+    # MemoryObj's (torch-backed) memory.
+    #
+    # It discriminates the one hypothesis left standing. Concurrency is the
+    # trigger -- 0/200 sequential against 6/208 concurrent -- and the failures
+    # start at exact 4 MiB DFS chunk boundaries and lose exactly one or two
+    # chunks, with the head of the buffer holding the CORRECT key's data. The
+    # same 28 MiB at the same thread count into a plain bytearray
+    # (tests/test_rawio_integrity.py) is byte-exact 80/80, so the destination
+    # buffer is the variable that decides whether the defect appears.
+    #
+    #   corruption disappears -> the aliased MemoryObj destination is the
+    #       cause, and the fix is a copy here or a registered/pinned buffer
+    #   corruption persists   -> the destination is innocent and the fault is
+    #       in concurrent multi-chunk DFS reads, one layer down
+    #
+    # Off by default: it reintroduces the full copy per chunk that the aliased
+    # read exists to avoid.
+    _READ_VIA_BYTEARRAY = os.environ.get("DAOS_READ_VIA_BYTEARRAY") == "1"
+
     def _prep_write(self, memory_obj):
         """Build ``(header, src, n)`` for the write.
 
@@ -571,9 +592,24 @@ class DaosConnector(RemoteConnector):
                 view = memoryview(view)
             view = view.cast("B")
             n = metadata.length
+            off = serde.prefix_size() + meta_len
+
+            if self._READ_VIA_BYTEARRAY:
+                # Experiment: read into a private bytearray, then copy. Costs
+                # one full copy per chunk, which is exactly what the aliased
+                # path exists to avoid -- see _READ_VIA_BYTEARRAY.
+                tmp = bytearray(payload_len)
+                got = dfs.read_obj_into(
+                    obj, off, payload_len,
+                    (ctypes.c_char * payload_len).from_buffer(tmp))
+                if got != payload_len:
+                    self._release(memory_obj)
+                    return None
+                view[:n] = memoryview(tmp)[:n]
+                return memory_obj
+
             dest = (ctypes.c_char * n).from_buffer(view[:n])
-            got = dfs.read_obj_into(
-                obj, serde.prefix_size() + meta_len, payload_len, dest)
+            got = dfs.read_obj_into(obj, off, payload_len, dest)
             if got != payload_len:
                 # Truncated payload: give the buffer back and report a miss.
                 self._release(memory_obj)
