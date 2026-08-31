@@ -288,30 +288,28 @@ class DaosConnector(RemoteConnector):
         become someone else's KV. Nothing fails: the write succeeds, the sizes
         agree, and the object holds the wrong tensor.
 
-        Copying is therefore the default, but be clear about how weak the
-        evidence for it is. One back-to-back comparison on client-6 gave
-        aliased 0/6 and copied 6/6 on the prose correctness gate -- and a later
-        run of the SAME copied build gave 2/6. The end-to-end failure is
-        intermittent, so that comparison does not establish that the alias is
-        the cause, and it is not claimed here.
+        Measured, after first calling this wrong in both directions on six-trial
+        samples of an intermittent failure. Base rates over 20 trials each
+        (tests/kv_failure_rate.sh, one store plus three retrieves per trial):
 
-        What the evidence does say is that the remaining corruption is on the
-        READ side, which this function cannot fix: a stored object is immutable,
-        yet three retrieves of one key disagree with each other, while raw DFS
-        reads are byte-exact at 16 threads (tests/test_rawio_integrity.py,
-        80/80). Suspicion sits on MemoryObj lifetime -- the DAOS remote path
-        logs hundreds of LMCache
-        "Ref count of MemoryObj ... is negative: -1. Double free occurred
-        somewhere" warnings where LocalCPUBackend logs none.
+            aliased store : 20/20 wrong, 100%  95% CI [83.9%, 100%]
+            copied store  :  2/20 wrong,  10%  95% CI [ 2.8%, 30.1%]
 
-        Copying stays because it removes a real hazard for no measured cost:
-        one ``from_buffer_copy`` is not the old three-copy path, it runs in this
-        connector's thread pool rather than on the latency path, and the store
-        cost LMCache reports is unchanged either way (offload ~62 ms, put_time
-        ~0.12 ms). If the read-side bug is fixed and the alias is then shown
-        safe, the zero-copy write can be restored -- ideally by pinning the
-        MemoryObj (``pin()``/``unpin()``, as ``cache_engine`` does) rather than
-        by reintroducing an unheld alias.
+        So the alias is a confirmed cause, and copying is the default for that
+        reason -- not merely as a precaution. It costs nothing measurable: one
+        from_buffer_copy is not the old three-copy path, it runs in this
+        connector's thread pool rather than on the latency path, and LMCache's
+        reported store cost is unchanged either way (offload ~62 ms, put_time
+        ~0.12 ms).
+
+        Copying does NOT make the path correct. 10% still fails and the
+        interval reaches 30%, so this is a partial fix on a still-broken path.
+        Do not read the default as "safe now".
+
+        The zero-copy write can be recovered once the residual failures are
+        understood, but by PINNING the MemoryObj for the duration
+        (``pin()``/``unpin()``, as ``cache_engine`` does), not by reinstating an
+        unheld alias.
         """
         view = memory_obj.byte_array
         if not isinstance(view, memoryview):
