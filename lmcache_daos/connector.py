@@ -288,23 +288,33 @@ class DaosConnector(RemoteConnector):
         become someone else's KV. Nothing fails: the write succeeds, the sizes
         agree, and the object holds the wrong tensor.
 
-        Measured, after first calling this wrong in both directions on six-trial
-        samples of an intermittent failure. Base rates over 20 trials each
-        (tests/kv_failure_rate.sh, one store plus three retrieves per trial):
+        Copying is the default as a precaution, and that is ALL the evidence
+        supports. Do not read it as a fix.
 
-            aliased store : 20/20 wrong, 100%  95% CI [83.9%, 100%]
-            copied store  :  2/20 wrong,  10%  95% CI [ 2.8%, 30.1%]
+        The honest history: this was claimed as the cause, retracted, re-claimed
+        with a "100% vs 10%" rate comparison, and then that comparison turned
+        out to be invalid too. The 10% came from a measurement whose reference
+        pass was itself a cache hit -- prompts repeated across runs, so pass A
+        read the same stale object as pass B and corrupt-matching-corrupt scored
+        as success. With the instrument fixed (per-run nonce, pass A asserted to
+        miss, container verified empty, non-perturbing checks) the rates are:
 
-        So the alias is a confirmed cause, and copying is the default for that
-        reason -- not merely as a precaution. It costs nothing measurable: one
-        from_buffer_copy is not the old three-copy path, it runs in this
-        connector's thread pool rather than on the latency path, and LMCache's
-        reported store cost is unchanged either way (offload ~62 ms, put_time
-        ~0.12 ms).
+            aliased store : 100%  95% CI [83.9%, 100%]
+            copied store  :  85%  95% CI [64.0%, 94.8%]
 
-        Copying does NOT make the path correct. 10% still fails and the
-        interval reaches 30%, so this is a partial fix on a still-broken path.
-        Do not read the default as "safe now".
+        Those intervals overlap, so copying is NOT shown to help. It stays
+        because the alias is unsafe on its own terms -- batched_put() is an
+        async submit and LMCache ref_count_downs without waiting -- and because
+        it costs nothing measurable: one from_buffer_copy is not the old
+        three-copy path, it runs in this connector's thread pool rather than on
+        the latency path, and LMCache's reported store cost is unchanged either
+        way (offload ~62 ms, put_time ~0.12 ms).
+
+        The path is broken roughly 85% of the time either way. What IS
+        established is the layer: raw DFS reads and writes are byte-exact at 16
+        threads (tests/test_rawio_integrity.py, 80/80) while end-to-end KV
+        fails 85%, so the fault is in how this connector uses DFS or in the
+        LMCache integration -- not in transport or storage.
 
         The zero-copy write can be recovered once the residual failures are
         understood, but by PINNING the MemoryObj for the duration
