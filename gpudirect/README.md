@@ -686,6 +686,116 @@ Phase B 의 부정 판정은 유지된다 — 근거가 하나 더 늘었다.
 
 **따라서 다음 작업은 스토리지 쪽이 아니라 LMCache offload 경로다.**
 
+## 🔴 정합성 버그: 동시 읽기에서 4 MiB chunk 하나가 조용히 깨진다
+
+배칭 작업에 착수하려다 두 개의 선행 문제를 발견했고, 두 번째가 심각하다.
+
+### 발견 경로
+
+`batched_*` 최적화 전에 기준선을 확인하려고 **생성 결과 동일성 게이트**를 만들었다
+(`../tests/kv_correctness_gate.sh`). 같은 프롬프트를 temperature 0 으로 두 번 보내
+(1회차=계산·저장, 2회차=캐시 적재) 토큰이 같은지 본다. 결과:
+
+| 구성 | 결과 |
+|---|---|
+| LMCache `LocalCPUBackend` (DAOS 없음) | A=B1=B2=B3, 일관·정확 |
+| **DAOS 백엔드 (`enable_async_loading: True`)** | **A≠B, 그리고 B1≠B2≠B3** |
+| **DAOS 백엔드 (`enable_async_loading: False`)** | **동일하게 실패** |
+
+즉 엔진은 결정적이고 LMCache 로컬 경로는 정확하며, **DAOS 경로만 틀린 값을 돌려주고
+그 값이 매 호출마다 다르다.** async 로딩을 꺼도 재현되므로 async 경로 문제가 아니다.
+
+### 하위 계층에서 재현: 원인은 4 MiB chunk 경계다
+
+LMCache 를 배제하고 DFS 바인딩만 시험했다 (`../tests/test_rawio_integrity.py`,
+28 MiB × 16 스레드, 커넥터와 동일한 aliased ctypes 버퍼 + 헤더/페이로드 2회 오프셋 쓰기):
+
+```
+t2 r0: MISMATCH at byte 12582876, 1024/7168 sampled pages differ
+t3 r0: MISMATCH at byte 20971484, 1024/7168 sampled pages differ
+t4 r0: MISMATCH at byte  4194268, 1024/7168 sampled pages differ
+```
+
+오프셋이 결정적이다. 헤더가 **36 B**(prefix 8 + meta 28)이므로 페이로드 위치 `p` 의 파일
+오프셋은 `p+36` 이고:
+
+| 페이로드 위치 | +36 = 파일 오프셋 |
+|---|---|
+| 4194268 | **4 MiB** |
+| 8388572 | **8 MiB** |
+| 12582876 | **12 MiB** |
+| 16777180 | **16 MiB** |
+| 20971484 | **20 MiB** |
+
+**모든 손상이 정확히 4 MiB 파일 오프셋 경계에서 시작한다** — 컨테이너의 DFS chunk
+크기(`4194304`)와 일치한다. 그리고 매번 **정확히 4 MiB 한 덩어리**만 깨진다
+(7168개 샘플 페이지 중 1024개 = 4 MiB).
+
+### 동시성 의존이다
+
+| 스레드 | 결과 |
+|---|---|
+| 1 | PASS |
+| 2 | PASS |
+| **4** | **FAIL** |
+| **16** | **FAIL (9/48 사이클)** |
+
+**커넥터는 기본 16 워커로 동작한다**(`self._workers = 16`). 즉 이 버그는 정상 운영
+조건에서 재현된다.
+
+### 성격과 영향
+
+- **조용하다.** 크기는 맞고(`got == payload_len`), `Retrieved 5888 out of 5888` 이 정상
+  출력되고, 오류 로그가 없다. 생성은 계속 유창해서 눈에 띄지 않는다.
+- **헤더 36 B 때문에 모든 페이로드 전송이 chunk 경계에 대해 비정렬**이다. 즉 4 MiB 를
+  넘는 모든 KV chunk 가 다중 chunk straddling 경로를 탄다.
+- 이 문서의 리트리브 **처리량** 수치(3.46~3.86 GB/s)는 바이트 양은 옮겼으므로 대체로
+  유효하지만, **정확한 구현의 비용이라고는 말할 수 없다.** 재측정이 필요하다.
+
+### 이것이 v2 포맷 계획의 우선순위를 바꾼다
+
+`PLAN.md` Phase 1 의 v2 포맷은 "GPU 등록·DMA 정렬" 을 위한 것이었는데, 지금은 **정합성
+문제**로 승격된다. 다만 4 KiB 헤더로는 부족하다 — 4 KiB 정렬은 4 MiB chunk straddling 을
+없애지 못한다. 후보:
+
+1. **페이로드를 chunk 크기에 정렬한다** (헤더를 4 MiB 로 패딩, 또는 메타데이터를 별도
+   객체/dkey 로 분리해 페이로드가 오프셋 0 에서 시작하게 한다). straddling 자체를 없앤다.
+2. **비정렬 다중 chunk 동시 전송 경로의 실제 버그를 찾는다** — DFS 바인딩,
+   `dfs_sys_read` 사용법, 또는 DAOS array 계층. 근본 수정이지만 범위가 크다.
+3. 임시 완화: 워커를 2 이하로 제한. 정확하지만 처리량을 버린다.
+
+**1번을 먼저 하고 2번을 병행 조사하는 것을 권한다.** 그리고 어떤 성능 작업보다 이것이
+우선이다 — 지금 상태로는 KV 캐시가 조용히 틀린 값을 준다.
+
+## LMCache 의 fused c_ops 는 이 이미지에서 한 번도 동작한 적이 없다
+
+배칭 착수 전 발견한 첫 번째 문제다. `import lmcache.c_ops` 가 조용히
+`python_ops_fallback.py` 로 대체된다:
+
+```
+Failed to import backend lmcache.c_ops: libcudart.so.13: cannot open shared object file
+```
+
+컴파일된 `c_ops.cpython-310-x86_64-linux-gnu.so`(31.8 MB)는 이미지에 있지만 로드되지
+않는다. `kvsup:052` 는 **torch 2.10.0+cu128** 위에 **CUDA 13 으로 빌드된 LMCache 휠**을
+얹었다. 확인한 것:
+
+- LMCache 0.5.0 / 0.5.1 / 0.5.2 / 0.5.3 휠 **전부** `libcudart.so.13` 을 요구한다.
+  버전을 내려도 해결되지 않는다.
+- c_ops 가 참조하는 c10 심볼 47개 중 **딱 2개**가 이 torch 에 없다:
+  `c10::cuda::CUDAStream::query()` 와 `::synchronize()` (이 빌드에서는 헤더 인라인).
+
+**따라서 이 문서의 모든 GPU⇄CPU 복사 수치(to_gpu 163.9 ms, from_gpu 61.0 ms,
+3.84/10.3 GB/s)는 fused CUDA 커널이 아니라 Python 폴백에서 나온 값이다.**
+
+빠진 심볼 2개를 `stream()`(이건 export 되어 있다)으로 정의하는 shim
+(`../tests/c10_cudastream_shim.cpp`)을 만들면 fused 확장이 로드되고 시작 경고도 사라진다.
+그러나 **정합성 게이트가 4개 중 3개 불일치로 실패했다.** 그래서 fused 커널의 값어치는
+이 방법으로 측정할 수 없고, shim 은 배포에 쓸 수 없다. 근본 해결은 이미지의 torch 와
+LMCache 빌드를 맞추는 것(또는 LMCache 를 cu128 torch 로 소스 빌드)이다.
+
+shim 은 측정 도구로만 저장소에 남긴다. 파일 상단에 배포 금지 사유를 적었다.
+
 ### 측정 이력과 정정
 
 이 문서의 앞선 판들은 잘못된 수치를 실었다. 앞의 세 번은 매번 **컨테이너 구성** 이 원인이었고,
