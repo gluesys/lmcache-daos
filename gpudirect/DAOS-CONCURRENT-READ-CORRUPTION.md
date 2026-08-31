@@ -3,8 +3,12 @@
 작성 2026-09-01. 근거 커밋 `e26cf27` (브랜치 `streaming-get-and-client6-assets`).
 상세 조사 서술은 `README.md`, 배포 정보는 `../deploy/MANIFEST.md`.
 
-이 파일은 두 목적을 겸한다 — **DAOS 상류 이슈 초안**과 **새 세션 인계서**. 다음 세션은
-"DAOS 문제인지 파보는" 단계이므로, 이미 배제된 것을 다시 검증하지 않도록 §3 을 먼저 볼 것.
+이 파일은 두 목적을 겸한다 — **DAOS 상류 이슈 초안**과 **새 세션 인계서**.
+
+> **2026-09-01 갱신: §12 를 먼저 읽을 것.** "DAOS 문제인가"는 그 날 **측정으로 확정**됐다
+> (완전 스톡 클라이언트가 같은 비율로 실패 — §12.1). §12 는 §1·§2·§5·§10 을 대체한다:
+> §1 의 "동시 읽기" 표현은 부정확하고(쓰기가 섞여야 한다 — §12.3), §5 의 서명은 모호한
+> 패턴으로 얻은 것이라 §12.2 의 태그 페이로드 결과로 교체됐다.
 
 ---
 
@@ -16,7 +20,18 @@
 
 ## 2. 재현
 
-**필요한 것: DAOS 클라이언트 + Python 3.7+. LMCache·GPU·torch·모델 전부 불필요.**
+**필요한 것: DAOS 클라이언트뿐. LMCache·GPU·torch·모델 전부 불필요.**
+
+**권장 재현기는 이제 C 판이다** — `tests/dfs_integrity.c` (§12.2 의 태그 페이로드, Wilson
+구간, arm 분리 플래그 포함). 아래 Python 판은 원본 기록으로 남긴다.
+
+```bash
+gcc -O2 -pthread -o dfs_integrity tests/dfs_integrity.c \
+    -I$DAOS/include -L$DAOS/lib64 -ldfs -ldaos -ldaos_common -lgurt -lm \
+    -Wl,-rpath,$DAOS/lib64
+NA_UCX_EXTRA_TLS= ./dfs_integrity -p <pool> -c <cont> -s 28 -t 16 -r 40
+```
+
 
 ```bash
 DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> \
@@ -50,12 +65,9 @@ DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> \
 | DFS chunk 정렬 / 헤더 36 B straddling | 페이로드 오프셋 0·4 MiB 정렬에서도 재현 |
 | 목적지 버퍼 타입 | `bytearray` 와 torch 백업 메모리 양쪽 재현 |
 | 4 MiB chunk 크기 자체 | 32 MiB chunk 컨테이너에서도 재현(더 심한 형태) |
-
-**배제되지 않은 것 하나:** 완전 스톡 prereq. 스톡 대조 실험의 두 arm 이 **같은 패치
-mercury/UCX** 를 공유했다. 무해하다는 근거는 코드 수준이며 측정이 아니다 — 추가한
-`HG_Bulk_import_rkey` 스텁을 스톡 DAOS 는 호출하지 않고, `NA_UCX_EXTRA_TLS` 가 비면 TLS
-로직이 upstream 과 같은 `ucp_config_modify(config,"TLS",tls)` 한 줄로 축약된다.
-**완전 스톡 확인은 `--build-deps=yes` 재빌드가 필요하고, 이것이 다음 세션의 1순위다.**
+| **완전 스톡 prereq (mercury/UCX 포함)** | **2026-09-01 에 측정으로 배제됨 — §12.1.** 남은 마지막 변수였고, 이제 없다. |
+| oclass·복제 | RP_2G1/G4/G8·SX(rd_fac 0)·S1 전부에서 재현 — §12.4 |
+| 클라이언트 읽기 동시성 자체 | 조용히 쓴 객체를 16 스레드로 읽기만 하면 **0/4320** — §12.3 |
 
 ## 4. 스톡 대조 실험 (핵심 증거)
 
@@ -186,13 +198,13 @@ NVMe·zvol), `targets: 1`, rank 0·3 Excluded, `daos_server` 전부 inactive, �
 
 ## 10. 다음 세션 작업 순서 (권고)
 
-1. **완전 스톡 prereq 로 재확인** — §3 의 유일한 미배제 변수.
+1. ~~**완전 스톡 prereq 로 재확인**~~ — **완료 2026-09-01, §12.1. 스톡도 같은 비율로 실패.**
    `/var/daosbuild/daos-stock` 에서 `--build-deps=yes` 로 mercury/UCX 까지 스톡 빌드
    (별도 prefix). draft 의 broken `0006_import_rkey.patch` 는 `841487de8` 에 존재하지
    않으므로 스톡 빌드가 성립한다. 여기서도 재현되면 상류 제출 근거가 완결된다.
-2. **재현기를 C 로 이식** — 현재 Python/ctypes. `dfs_sys_open/read/close` 직접 호출하는
+2. ~~**재현기를 C 로 이식**~~ — **완료, `tests/dfs_integrity.c`.** `dfs_sys_open/read/close` 직접 호출하는
    단일 파일 C 프로그램이 상류에 훨씬 설득력 있다. `tests/dfs_gpu_rt.c` 구조를 재활용.
-3. **최소 조건 탐색** — 상류 이슈의 질을 좌우한다. 스레드 수(4가 최소였는지 재확인),
+3. **최소 조건 탐색** — 일부 완료(§12.3·§12.4): 쓰기+읽기 혼합이 필요조건, oclass 는 무관. 스레드 수(4가 최소였는지 재확인),
    객체 크기, oclass(`SX`/`RP_2G1` 등), `rd_fac`, 서버 target 수를 한 번에 하나만 바꿔
    각 수백 검사로.
 4. **서버 로그 확보** — 손상 발생 시각의 engine 로그(`D_LOG_MASK=DEBUG` 는 과하니
@@ -224,3 +236,167 @@ NVMe·zvol), `targets: 1`, rank 0·3 Excluded, `daos_server` 전부 inactive, �
 
 **다음 세션 규칙:** 인과를 주장하기 전에 (a) 계측 전제를 코드로 강제하고, (b) 신뢰구간을
 붙이고, (c) 한 번에 변수 하나만 바꾼다.
+
+---
+
+# 12. 2026-09-01 세션 — DAOS 로 확정, 서명 확보
+
+이 세션의 질문은 "정합성 문제가 DAOS 문제인지"였고, **답은 그렇다**. §3 의 마지막 미배제
+변수를 측정으로 닫았고, 손상의 정확한 형태를 얻었다. 재현기는 C 로 이식했다
+(`tests/dfs_integrity.c`, 보조 `tests/dfs_integrity_ab.sh`·`tests/agg_ab.sh`).
+
+client-6 은 다른 사용자의 CXL 작업 때문에 사용하지 않았다. 전부 **client-5** 에서 했다.
+
+## 12.1 완전 스톡 클라이언트도 같은 비율로 실패 (핵심)
+
+cell1 `/var/daosbuild/daos-stock`(스톡 `841487de8`)를 **`--build-deps=yes` 로 prereq 까지
+새로 빌드**(mercury 는 0006 rkey 패치 없음, UCX 는 `--without-cuda --without-gdrcopy`),
+prefix `/var/daos-stockfull`. RPATH 보존을 위해 client-5 에도 **같은 경로**로 rsync.
+
+교차(interleaved) A/B, 28 MiB · 16 스레드 · burst, 컨테이너 `crp2g4`:
+
+| arm | 결과 |
+|---|---|
+| 패치 클라(`/opt/daos-gds-gpu`) | 25/3840 = **0.651 %** (95 % CI 0.441–0.959) |
+| **완전 스톡 클라(`/var/daos-stockfull`)** | 34/3840 = **0.885 %** (95 % CI 0.634–1.235) |
+
+구간이 겹치고 스톡이 오히려 높다. 두 arm 을 **블록이 아니라 교차**로 돌린 것이 중요하다 —
+실패율은 서버 상태에 따라 시간당 편차가 크고, §11 이 기록한 실패가 전부 그 편차를 arm 차이로
+읽은 것이었다. 검증: 스톡 `libcart.so.4` 에 `HG_Bulk_import_rkey` 심볼 0개, mercury 트리에
+0006 패치 미적용, `ucx_info -b` 에 CUDA/gdrcopy 매크로 없음.
+
+⇒ **우리 패치·커넥터·LMCache·GPU-direct prereq 전부 무죄. DAOS 자체의 결함이다.**
+
+## 12.2 손상의 정확한 서명 (태그된 페이로드로 확보)
+
+이전 패턴 `base[i] = (i*31 + tid*101) & 0xff` 은 **다른 스레드의 데이터와 같은 스레드의
+오프셋 이동 데이터가 수학적으로 구별 불가**였다(둘 다 바이트값을 상수만큼 이동). 그래서
+"own pattern shifted by 245" 같은 판독이 나왔다 — 실제로는 다른 객체의 데이터였을 수 있다.
+지금은 8바이트 워드마다 `(tid<<56)|(round<<48)|payload_offset` 을 심어 **모든 바이트가
+자기 출처를 말한다**.
+
+관측된 실패의 압도적 다수는 하나의 형태다:
+
+> **읽기 버퍼의 정확히 DFS chunk 하나(4 MiB = 524288 워드) 구간이, 같은 오프셋·같은 라운드의
+> _다른 객체_ 데이터로 채워져 돌아온다.** 나머지 구간은 전부 정확하다.
+
+- 구간 크기는 **컨테이너 chunk 크기를 따라간다**: chunk 1 MiB 컨테이너(`ci_1m`)에서는 손상
+  구간도 ~1 MiB(131 072 워드). ⇒ "chunk 하나가 통째로 잘못 배달된다"가 정확한 표현이다.
+- 드물게 **zeros**(구멍) 또는 **stale round**(같은 객체의 이전 라운드 데이터)도 나온다.
+- 시작 오프셋은 대개 파일 오프셋 기준 4 MiB 경계(payload_off 36 이므로 워드 4194264 부터).
+- **at-rest 는 대체로 정상**: 같은 런에서 스레드 종료 후 단일 스레드로 다시 읽으면 깨끗하다.
+  ⇒ 저장된 바이트는 맞고, **읽기가 저장되지 않은 바이트를 돌려준다.**
+- 부하 중 즉시 재읽기: A/B 전체에서 clean 25 / STILL WRONG 34 — **틀린 답이 남을 수도 있다.**
+
+## 12.3 방아쇠는 "쓰기와 읽기가 섞일 때"
+
+한 번에 하나만 바꾼 결과(모두 `tests/dfs_integrity.c` 플래그):
+
+| 구성 | 결과 |
+|---|---|
+| 조용한 단일 스레드 쓰기 + 조용한 검증 3회 (`-W -Q -V 3`) | 깨끗 (48/48) |
+| 조용히 쓴 뒤 **읽기만** 16 스레드 (`-W -M`) | **0/4320** (18 GB/s) |
+| **쓰기만** 16 스레드 + 조용한 검증 (`-N -V 3`) | 깨끗 |
+| 단일 스레드 쓰기+읽기 150 라운드 (`-t 1`) | 0/150 |
+| 16 스레드 쓰기+읽기 (기본) | **0.2–1.9 %** |
+| 16 스레드, 쓰기와 읽기 사이 2초 대기 (`-d 2000`) | 0/240 (표본 부족, 참고만) |
+
+⇒ 읽기 동시성만으로는 안 나오고, 쓰기 동시성만으로도 안 나온다. **둘이 섞여야** 나온다.
+
+## 12.4 gate 가 아닌 것
+
+- **복제·oclass 아님**: `SX`(rd_fac 0, 복제 없음) 0.21–0.78 %, `RP_2G1`·`RP_2G4`·`RP_2G8`
+  전부 재현. 처음 `S1`(단일 shard)이 0/2560 으로 깨끗해 "shard fan-out 이 조건"이라 봤으나
+  표본을 1920 으로 올리자 **S1 도 2/1920 실패** → **그 판독은 철회한다.** 같은 배치에서
+  S4·SX 가 0/1920 이었다 — 0.2~0.9 % 대에서 2000 표본은 arm 을 가르지 못한다(§6, §11).
+- **컨테이너 신선도 아님**: 갓 만든 `ci_plain` 도 6/1920.
+
+## 12.5 서버 쪽 증거 — DAOS 가 스스로 손상을 검출한다
+
+**양 rank** 의 엔진 로그(`/var/log/daos/daos_engine.0.log`, cell1·cell2):
+
+```
+csum src/vos/vos_csum_recalc.c:111 csum_agg_verify() calc ({... first_csum: 0 ...})
+                                                  != phy ({... first_csum: 2092910456 ...})
+vos src/vos/vos_aggregate.c:1230 fill_one_segment() CSUM verify error: DER_CSUM(-2021)
+vos src/vos/vos_aggregate.c:1817 flush_merge_window() Fill segments 0-3fffff error: DER_CSUM
+RAS EVENT id: [device_media_error] msg: [Device: ba123b03 csum error logged from tgt_id:6]
+```
+
+- 실패하는 창은 **정확히 `0-3fffff` = 4 MiB**, 즉 클라이언트가 보는 손상 구간과 같은 크기다.
+- `dmg storage query list-devices --health`: 모든 NVMe 가 **Media/Read/Write Errors 0**,
+  그러나 장치마다 **Checksum Errors 2–6**. ⇒ 하드웨어 미디어 오류가 아니라 **DAOS 내부**
+  검사 실패다.
+- 이 DER_CSUM 은 **checksum 을 켠 컨테이너(`ci_csum`)를 쓰기 시작한 시각부터** 나타난다.
+  즉 원래도 손상되고 있었고, checksum 이 없을 때는 **아무도 검출하지 않고 클라이언트로
+  배달**된 것이다.
+
+## 12.6 checksum 은 해결책이 아니라 검출기
+
+`cksum:crc32,srv_cksum:on` 컨테이너에서 **조용한 손상은 관측되지 않았다**(약 4 000 읽기).
+대신 일부 런이 **EIO 로 중단**됐다(스레드 rc=5). 즉 침묵이 오류로 바뀐다 — KV 백엔드에
+당장 쓸 수 있는 **탐지** 수단이지만 정합성 보장은 아니다.
+
+## 12.7 부수 증상 2건 (같은 부하에서)
+
+1. **지속 부하에서 쓰기가 실패한다**: `dfs_write` → `daos_array_write()` →
+   `DER_MISC(-1025)` → 앱에는 EIO. 16 스레드·28 MiB 를 몇 분 돌리면 나오고, **한가해지면
+   회복**된다(가벼운 부하는 정상). 이 때문에 후반 측정의 표본이 잘렸다 — 런당 완료 읽기 수를
+   반드시 요약줄에서 되읽을 것.
+2. **컨테이너 close 마다** `dtx_flush_on_close() Some DTX in CoS cannot be committed` +
+   `Fail to flush CoS cache: rc = -1025`(양 rank). 소스(`src/dtx/dtx_common.c:1559`)를 보면
+   회계 조건에서 루프를 끊고 비동기 배치 커밋으로 넘기는 경로라 즉시 데이터 손상 경로는
+   아니지만, 상류 제출 시 함께 붙일 것.
+
+## 12.8 유력 가설 (미확정) — VOS aggregation
+
+정황이 모두 한 곳을 가리킨다: **반복 덮어쓰기로 겹친 extent 를 VOS aggregation 이 병합할 때
+chunk 하나가 다른 객체/에폭의 데이터로 바뀐다.**
+
+근거: (a) 실패 창이 정확히 4 MiB 이고 손상 구간도 그 크기, (b) aggregation 자신의 checksum
+재계산이 그 창에서 실패, (c) 쓰기 동시성이 있어야만 발생(겹친 extent 가 생김), (d) 클라이언트
+빌드와 무관(서버 백그라운드 작업), (e) 이전 세션에서 libfabric·UCX 두 전송 모두에서 발생.
+
+직접 A/B(`tests/agg_ab.sh`, `reclaim:lazy` vs `reclaim:disabled`, 런타임 pool 속성이라 서버
+재시작 불필요):
+
+| arm | 결과 |
+|---|---|
+| aggregation ON | 6/921 |
+| aggregation OFF | **0/737** |
+
+ON 비율(0.65 %)에서 737 읽기가 전부 통과할 확률은 ≈ 0.8 % 이므로 **시사적이지만 확정은
+아니다**. 게다가 §12.7-1 의 EIO 때문에 두 arm 모두 표본이 잘렸다. **다음 세션 1순위는 이
+A/B 를 제대로 검정력 있게 다시 하는 것**(한가한 풀, 짧은 런 다수, arm 교차, 각 arm 수천 읽기).
+
+## 12.9 환경 (다음 세션이 이어받을 상태)
+
+- cell1: `/var/daos-stockfull`(완전 스톡 2.9.100, 빌드 트리 `/var/daosbuild/build-stockfull`,
+  로그 `/var/daosbuild/build-stockfull.log`, 스크립트 `/var/daosbuild/build_stockfull.sh`).
+  기존 `/var/daosbuild/build-gpu` 와 별도라 패치 빌드는 그대로 살아 있다.
+- client-5: `/var/daos-stockfull`(같은 경로 필수), `/root/dfs_integrity.c`,
+  `/root/dfs_integrity_{patched,stock}`, `/root/dfs_integrity_ab.sh`. cell1: `/root/agg_ab.sh`.
+- 새 컨테이너(gdspool): `ci_plain`(RP_2G4 4 MiB) `ci_csum`(+crc32) `ci_1m`(1 MiB chunk)
+  `ci_s1` `ci_s2` `ci_s4` `ci_sx`. 풀 `reclaim` 은 **lazy 로 복원**해 두었다.
+- 서버는 건드리지 않았다(패치 빌드 그대로 실행 중, 재시작 없음 — §8-1 준수).
+
+## 12.10 다음 작업 순서 (개정)
+
+1. **§12.8 aggregation A/B 를 검정력 있게 재실행.** 확정되면 상류 이슈의 제목이 바뀐다
+   ("concurrent read corruption" → "VOS aggregation mis-merges a chunk").
+2. `ci_1m` 외에 chunk 512 KiB·16 MiB 로 손상 구간 크기 = chunk 크기를 한 번 더 확인.
+3. 손상 발생 시각의 엔진 로그를 `DD_SUBSYS=vos,bio,object` 로 좁혀 확보(런타임
+   `dmg server set-logmasks` 로 가능, 재시작 불필요).
+4. **상류 제출**: §12.1 A/B 표, §12.2 서명(태그 페이로드 출력 원문), §12.5 서버 로그 + 장치
+   카운터, §12.3 방아쇠 표, §12.6 checksum 거동, §12.7 부수 증상 2건, 재현기 C 파일.
+5. Hub 정정 공지(`719497ff-…`) 갱신 — "원인 미해결" → "DAOS 확정, aggregation 의심".
+6. **그때까지 이 백엔드는 사용 불가로 유지한다.**
+
+## 12.11 이 세션에서 철회/정정한 것
+
+| 주장 | 실제 |
+|---|---|
+| "S1(단일 shard)은 면역" | 표본 늘리자 2/1920 실패. 0/2560 은 검정력 부족이었다 |
+| "checksum 켜면 손상이 사라진다" | 조용한 손상은 사라지지만 EIO 로 나온다. 검출기이지 수정이 아니다 |
+| "at-rest 도 손상된다"(초판 판독) | 두 계측 결함이었다 — (a) 태그 형식이 바뀐 객체를 옛 형식으로 검증, (b) EIO 로 쓰기가 중단된 객체는 라운드가 섞인 게 정상 |
+| "쓰기 동시성만으로 at-rest 가 깨진다" | `-N -V 3` 깨끗 |
