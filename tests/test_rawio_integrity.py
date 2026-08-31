@@ -38,10 +38,19 @@ that call for completely different fixes:
 
     DAOS_TEST_POOL=gdspool DAOS_TEST_CONT=kvlmc \\
         python3 tests/test_rawio_integrity.py \\
-            [chunk_MiB] [threads] [rounds] [payload_offset]
+            [chunk_MiB] [threads] [rounds] [payload_offset] [mode]
 
 payload_offset accepts a byte count, or "hdr" for the connector's real 36-byte
 layout, or "chunk" for one full 4 MiB chunk.
+
+mode is loop (default) or burst, and it matters more than any other parameter.
+In loop mode each thread interleaves its own write and read, so concurrent
+READS are sparse -- that is why this test reported PASS 80/80 on the same 28
+MiB and 16 threads where the LMCache-level reproducer failed, since
+batched_get releases sixteen reads at once. burst holds every thread after its
+write and releases the reads together, reproducing that density with no
+LMCache and no Python object as the destination. A loop-mode pass is therefore
+not evidence of absence.
 """
 
 from __future__ import annotations
@@ -79,6 +88,9 @@ def main() -> int:
     nthr = int(sys.argv[2]) if len(sys.argv) > 2 else 16
     rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     off_arg = sys.argv[4] if len(sys.argv) > 4 else "hdr"
+    mode = sys.argv[5] if len(sys.argv) > 5 else "loop"
+    if mode not in ("loop", "burst"):
+        print('mode: loop|burst'); return 2
 
     meta = b"m" * 28
     hdr_len = serde.prefix_size() + len(meta)          # the connector's 36 B
@@ -96,10 +108,12 @@ def main() -> int:
     dfs = DfsSys(pool=POOL, cont=CONT)
     print(f"pool={POOL} cont={CONT} chunk={chunk >> 20}MiB threads={nthr} "
           f"rounds={rounds} payload_off={payload_off} "
-          f"({'chunk-aligned' if payload_off % DFS_CHUNK == 0 else 'straddling'})")
+          f"({'chunk-aligned' if payload_off % DFS_CHUNK == 0 else 'straddling'}) "
+          f"mode={mode}")
 
     errors: list[str] = []
     lock = threading.Lock()
+    barrier = threading.Barrier(nthr) if mode == "burst" else None
 
     def worker(tid: int) -> None:
         want = pattern(tid, chunk)
@@ -118,6 +132,17 @@ def main() -> int:
                 dfs.write_obj_from(obj, payload_off, chunk, src)
             finally:
                 dfs.close_obj(obj)
+
+            if barrier is not None:
+                # Burst mode. Without this each thread interleaves its own
+                # write and read, so concurrent READS are sparse -- which is
+                # why this test passed 80/80 while the LMCache-level
+                # reproducer, whose batched_get releases 16 reads at once,
+                # failed on the same sizes and thread count. Holding every
+                # thread here until all writes are done and then releasing
+                # the reads together reproduces that density without LMCache
+                # or any Python object in the destination.
+                barrier.wait()
 
             dst_buf = bytearray(chunk)
             dst = (ctypes.c_char * chunk).from_buffer(dst_buf)
