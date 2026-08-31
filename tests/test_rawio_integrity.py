@@ -105,11 +105,21 @@ def main() -> int:
               f"header; use 0 to skip the header write")
         return 2
 
-    dfs = DfsSys(pool=POOL, cont=CONT)
+    # DAOS_SFLAGS lets this test toggle dfs_sys's own caching/locking without
+    # touching the binding's production default (0 = cache on, lock on).
+    # Motivation: a burst run against a freshly created container returned
+    # ENTIRE objects belonging to a different thread -- 7168/7168 pages wrong,
+    # head matching another thread's pattern -- even though every thread only
+    # ever opens its own path. Wrong-object reads with locking already enabled
+    # point at dfs_sys's open-handle cache, so NO_CACHE (1) is the arm that
+    # tests it. NO_LOCK (2) must NOT be used here: the handle is shared across
+    # threads and daos_fs_sys.h reserves that flag for single-threaded callers.
+    sflags = int(os.environ.get("DAOS_SFLAGS", "0"))
+    dfs = DfsSys(pool=POOL, cont=CONT, sflags=sflags)
     print(f"pool={POOL} cont={CONT} chunk={chunk >> 20}MiB threads={nthr} "
           f"rounds={rounds} payload_off={payload_off} "
           f"({'chunk-aligned' if payload_off % DFS_CHUNK == 0 else 'straddling'}) "
-          f"mode={mode}")
+          f"mode={mode} sflags={sflags}")
 
     errors: list[str] = []
     lock = threading.Lock()
