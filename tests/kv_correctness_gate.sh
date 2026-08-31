@@ -39,11 +39,24 @@ trap 'rm -rf "$TMP"' EXIT
 python3 - "$N" "$MAXTOK" "$TMP" <<'PY'
 import json, sys
 n, maxtok, tmp = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-words = ["storage","cache","tensor","kernel","latency","fabric","replica","stream"]
+
+# Coherent prose, NOT a repeated word list. The first version of this gate used
+# " ".join of a cycling 8-word vocabulary, and that is the worst possible prompt
+# for an argmax-equality test: with the same few tokens repeating, the top
+# candidates sit within noise of each other, so a difference far too small to
+# matter flips the sampled token and the gate reports corruption that is not
+# there. It scored 2 of 4 on a configuration whose retrieves were provably
+# self-consistent and identical to the computed pass on prose. Prose keeps a
+# margin between the top logits, so a flip means the KV really changed.
+para = ("Distributed object storage separates metadata from bulk data so that "
+        "clients can address a shard directly without consulting a central "
+        "server on every request. In practice the metadata service still "
+        "becomes a bottleneck when the working set is small and the request "
+        "rate is high, because each lookup costs a round trip. ")
 for k in range(n):
-    # 6000-ish tokens so the prompt spans many chunks; unique prefix per k so
+    # ~6000 tokens so the prompt spans many chunks; unique prefix per k so
     # pass A is always a genuine miss.
-    txt = f"gate{k} " + " ".join(words[(i + k) % len(words)] for i in range(6000))
+    txt = f"gate{k} " + (para * 90)
     json.dump({"model": "qwen3", "prompt": txt, "max_tokens": maxtok,
                "temperature": 0, "seed": 1234},
               open(f"{tmp}/g{k}.json", "w"))

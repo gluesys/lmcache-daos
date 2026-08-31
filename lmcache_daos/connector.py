@@ -265,16 +265,53 @@ class DaosConnector(RemoteConnector):
         header, src, n = self._prep_write(memory_obj)
         await self._run(self._put_sync, _key_to_path(key), header, src, n)
 
-    def _prep_write(self, memory_obj):
-        """Build ``(header, src, n)`` for a zero-copy write.
+    # Aliasing the MemoryObj on the store path is UNSAFE and is off by default.
+    # See _prep_write. Set DAOS_UNSAFE_ALIAS_STORE=1 only to reproduce the bug.
+    _ALIAS_STORE = os.environ.get("DAOS_UNSAFE_ALIAS_STORE") == "1"
 
-        The old path did ``bytes(byte_array)`` -> ``serde.pack`` concat ->
+    def _prep_write(self, memory_obj):
+        """Build ``(header, src, n)`` for the write.
+
+        History, because the obvious "optimisation" here is a correctness bug.
+
+        The original path did ``bytes(byte_array)`` -> ``serde.pack`` concat ->
         ``create_string_buffer``: THREE full copies of every chunk, 120 MB of
-        GIL-held memcpy per 40 MB chunk, measured as ~1 GB/s effective store
-        (+5.2 s on a 5.24 GB store). Here ``src`` merely *aliases* the MemoryObj
-        buffer, and header and payload are written as two offset writes so the
-        payload is never concatenated. Store overhead went +5178 -> +65 ms at 8K
-        and +136 ms at 31K.
+        GIL-held memcpy per 40 MB chunk, ~1 GB/s effective store (+5.2 s on a
+        5.24 GB store). That was replaced by having ``src`` merely *alias* the
+        MemoryObj buffer, with header and payload written as two offset writes
+        so the payload is never concatenated: +5178 -> +65 ms at 8K.
+
+        The alias is unsafe in principle: ``put()`` is driven from LMCache's
+        ``batched_put()``, which is an ASYNC SUBMIT, and LMCache drops its
+        reference (``ref_count_down``) and recycles the MemoryObj without
+        waiting for us -- so an aliased write can land after the buffer has
+        become someone else's KV. Nothing fails: the write succeeds, the sizes
+        agree, and the object holds the wrong tensor.
+
+        Copying is therefore the default, but be clear about how weak the
+        evidence for it is. One back-to-back comparison on client-6 gave
+        aliased 0/6 and copied 6/6 on the prose correctness gate -- and a later
+        run of the SAME copied build gave 2/6. The end-to-end failure is
+        intermittent, so that comparison does not establish that the alias is
+        the cause, and it is not claimed here.
+
+        What the evidence does say is that the remaining corruption is on the
+        READ side, which this function cannot fix: a stored object is immutable,
+        yet three retrieves of one key disagree with each other, while raw DFS
+        reads are byte-exact at 16 threads (tests/test_rawio_integrity.py,
+        80/80). Suspicion sits on MemoryObj lifetime -- the DAOS remote path
+        logs hundreds of LMCache
+        "Ref count of MemoryObj ... is negative: -1. Double free occurred
+        somewhere" warnings where LocalCPUBackend logs none.
+
+        Copying stays because it removes a real hazard for no measured cost:
+        one ``from_buffer_copy`` is not the old three-copy path, it runs in this
+        connector's thread pool rather than on the latency path, and the store
+        cost LMCache reports is unchanged either way (offload ~62 ms, put_time
+        ~0.12 ms). If the read-side bug is fixed and the alias is then shown
+        safe, the zero-copy write can be restored -- ideally by pinning the
+        MemoryObj (``pin()``/``unpin()``, as ``cache_engine`` does) rather than
+        by reintroducing an unheld alias.
         """
         view = memory_obj.byte_array
         if not isinstance(view, memoryview):
@@ -288,7 +325,10 @@ class DaosConnector(RemoteConnector):
             memory_obj.get_memory_format(),
         ).serialize()
         header = serde.prefix_pack(len(meta_bytes), n) + meta_bytes
-        return header, (ctypes.c_char * n).from_buffer(view), n
+        buf = (ctypes.c_char * n)
+        if self._ALIAS_STORE:
+            return header, buf.from_buffer(view), n
+        return header, buf.from_buffer_copy(view), n
 
     def _put_sync(self, path, header, src, n):
         obj = self._dfs.open_rdwr_create(path)

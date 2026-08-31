@@ -806,9 +806,35 @@ t4 r0: MISMATCH at byte  4194268, 1024/7168 sampled pages differ
 관측한 `Ref count of MemoryObj ... negative: -1. Double free occurred somewhere` 경고가
 이 가설과 맞는다.
 
-다음 확인 방법(아직 안 함): 같은 프롬프트를 두 번 저장해 **저장된 객체 바이트가
-동일한지** 본다. LocalCPU 게이트로 KV 자체가 결정적임을 이미 확인했으므로, 두 저장의
-바이트가 다르면 store 경로가 경합이다.
+#### 원인 2 는 **read 측**이다 (store alias 가설은 확정하지 못했다)
+
+조사했다. 결론부터: **아직 고쳐지지 않았고, 위치는 read 측으로 좁혀졌다.**
+
+`_prep_write()` 의 alias 를 복사로 바꿔 한 번 비교했을 때는 alias 0/6, 복사 6/6 이었다.
+그런데 **같은 복사 빌드를 다시 돌리니 2/6** 이었다. end-to-end 실패가 간헐적이므로
+그 비교는 원인을 확정하지 못한다 — 앞서 "store alias 가 원인" 이라고 쓴 것은 근거가
+약하다. 철회한다.
+
+확정할 수 있는 것은 위치다:
+
+| 관측 | 함의 |
+|---|---|
+| raw DFS 읽기가 16 스레드에서 바이트 일치 (80/80, 반복 재현) | DFS 계층은 깨끗하다 |
+| 저장된 객체는 불변인데 **같은 키를 3번 읽으면 결과가 매번 다르다** | 손상은 **read/반환 경로**다 |
+| DAOS remote 경로에서 LMCache `Double free occurred somewhere` 경고 **304건**, `LocalCPUBackend` 에서는 **0건** | MemoryObj 수명 관리가 유력 |
+
+즉 DFS 읽기는 정확한 바이트를 주는데, 그 바이트를 담은 MemoryObj 가 vLLM 이 쓰기 전에
+재활용되는 것으로 보인다. store 를 복사로 바꿔도 read 측이므로 고쳐지지 않는다.
+
+복사는 기본값으로 남긴다 — alias 는 원리적으로 위험하고(비동기 제출 + `ref_count_down`)
+측정 가능한 비용이 없다(offload ~62 ms, put_time ~0.12 ms 양쪽 동일). 다만 **그것이
+버그를 고친다고 주장하지 않는다.** `DAOS_UNSAFE_ALIAS_STORE=1` 로 재현할 수 있다.
+
+다음 확인 대상: `_get_sync()` 가 `local_cpu_backend.allocate()` 로 받은 MemoryObj 의
+소유권 규약. 우리가 반환한 객체에 대해 LMCache 가 기대하는 refcount 와 실제가 어긋나면
+(우리 쪽 `ref_count_down` 중복 또는 누락) 정확히 이 증상이 된다. 커넥터에는
+`ref_count_down`/`release`/`free` 를 순서대로 시도하고 예외를 삼키는 코드가 세 곳 있어,
+LMCache 버전에 따라 이중 해제가 되기 쉽다.
 
 ### 이것이 v2 포맷 계획의 우선순위를 바꾼다
 
