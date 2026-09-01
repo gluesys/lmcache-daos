@@ -1458,3 +1458,50 @@ DTX 커밋 블롭(쿼터/ENOSPC) 문맥 — **fetch 데이터 흐름 변경 0건
    "같은 VM 에서 우리 빌드도 clean 인가" 확인(플랫폼 축 확정용 음성 대조).
 3. 실 NVMe vs 가상: 우리 클러스터에 `class: file`(sparse file) 로 가상 디스크 흉내 → clean 이면
    실 NVMe 하드웨어/드라이버 상호작용으로 좁혀진다.
+
+---
+
+# 25. UIO arm 시도 — 우리 하드웨어에서 구조적으로 불가 (2026-09-02)
+
+§24.3-1 실행: `disable_vfio: true`(UIO) 단일변수.
+
+## 25.1 진행과 벽
+
+1. yml 에 `disable_vfio: true` 추가 → 기동 실패:
+   `code = 614 "disable_vfio: true in config while running as non-root user with NVMe devices"`.
+   ⇒ **UIO 는 daos_server 를 root 로 돌려야 한다**(34.x 는 수동 root 실행이었다).
+2. systemd drop-in 에 `User=root/Group=root` 추가 → **UIO 바인딩 성공**
+   (`uio_pci_generic` 2개, vfio 0개).
+3. 그러나 포맷 시 `EAL: Bus (pci) probe failed` →
+   `NVMe SSDs [0000:02:00.0 0000:03:00.0] not found`.
+
+## 25.2 원인 — MSI-X
+
+```
+lspci -vv 0000:02:00.0 → Capabilities: MSI-X: Count=257
+modinfo uio_pci_generic → "Generic UIO driver for PCI 2.3 devices"
+```
+`uio_pci_generic` 은 **PCI 2.3 legacy INTx 전용**이라 MSI-X 257 벡터를 쓰는 PASCARI NVMe 를
+DPDK 가 probe 하지 못한다. DPDK 로 MSI-X 장치를 UIO 로 쓰려면 `igb_uio`(out-of-tree)가
+필요한데 이 커널엔 없다. 34.x 의 QEMU 가상 NVMe 는 MSI-X 요구가 가벼워 통과했던 것.
+
+⇒ **UIO 축은 우리 하드웨어에서 시험 불가**(실 NVMe + in-tree 커널 조합의 구조적 제약).
+"VFIO 가 조건인가"는 여전히 미검증이며, **34.x 의 UIO 통과는 하드웨어(가상 NVMe) 덕이라
+UIO 자체의 공로로 볼 근거도 없다.**
+
+## 25.3 환경 원복
+`/root/daos_server.yml.vfio-arm` 복원, drop-in 의 root 오버라이드 제거, VFIO 재바인딩,
+재포맷 → 양 rank Joined(2 디바이스, MD-on-SSD, targets 1/helpers 0 = 24 % arm 유지).
+
+## 25.4 다음 실험 (남은 것)
+
+1. **34.31 에 우리 stockfull 서버 투입** — 같은 VM·같은 가상 디스크에서 **빌드만 우리 것**으로.
+   §24 로 빌드가 배제됐으니 예상은 clean 이고, 그러면 **플랫폼(가상 NVMe/VM)이 조건**으로 확정.
+   34.31 에 이미 헤더·재현기·systemd 유닛 절차가 준비돼 있어 값이 싸다.
+2. **우리 클러스터에 `class: file`** (sparse file bdev) — 실 NVMe 를 파일로 대체해 SPDK
+   userspace 경로는 유지하되 하드웨어를 제거. clean 이면 **실 NVMe 드라이버/디바이스 상호작용**
+   으로 좁혀지고, 손상되면 **SPDK blobstore 로직 자체**로 좁혀진다. §21.2 의 kdev 와 달리
+   file bdev 는 4 K 섹터 제약이 없어 성립할 가능성이 높다.
+3. 실 NVMe 축이 남으면: 다른 모델/다른 서버의 실 NVMe 에서 재현 시도(하드웨어 일반성 확인).
+
+2번이 가장 정보량이 크다 — "SPDK 로직 vs 실 하드웨어"를 우리 장비 안에서 가른다.
