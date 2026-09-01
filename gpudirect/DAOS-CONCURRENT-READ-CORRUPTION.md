@@ -740,3 +740,109 @@ component 가 EC 이고 우리는 RP 이므로 경로가 EC 전용인지 확인�
 
 즉 **2.8-rc3 는 2.9.100 이 가진 fetch/aggregation 수정 두 건을 아직 안 갖고 있는데도 손상
 비율이 같은 자릿수**(§13.3)다. 이 조합은 "그 두 수정이 원인이 아니다"는 쪽 근거다.
+
+---
+
+# 15. 원인 분기 트리 완주 — transport 무관, mercury core/서버 fetch 경로로 수렴 (2026-09-01 야간)
+
+외부 검토 계획(/tmp/daos-fix.md)의 Phase 1~2 + P1 transport arm 을 실행했다. **계측 빌드 없이
+가능한 배제는 전부 끝났고, 남은 용의자는 mercury core bulk 로직과 DAOS 서버 fetch/bulk 버퍼
+수명 둘뿐이다.**
+
+## 15.1 Phase 1 — 런타임 검증 (전부 통과)
+
+- 세 노드(cell1·cell2 엔진, client-5)가 **실제 로딩하는** `libna_plugin_ucx.so` 에
+  `ucp_ep_flush_nbx` 심볼 존재 = **DAOS-18862 의 Mercury put-flush 수정이 이미 들어 있다.**
+  ⇒ 상류 제출 프레임: **"fix present, reproducer still fails."**
+- UCX 1.20.0 확인. `0005_ucx_put_flush.patch` 는 2.8/2.9 트리 동일 해시.
+- rcache 환경변수 정정 확인: 소스(`crt_init.c:579`)는 `UCX_RCACHE_ENABLE=n` 을 설정.
+  `CRT_MRC_ENABLE=0` → `FI_MR_CACHE_MAX_COUNT=0` + `UCX_RCACHE_ENABLE=n` + 로그
+  `Disabling MR CACHE`. **2.8 은 클라이언트 MRC 기본 ON**(c22a79582a 정책, 2.9 트리엔 없음).
+
+## 15.2 Phase 2 — 교차 A/B 3종 (전부 "원인 아님")
+
+하네스: `tests/crossover_ab.sh`(AB BA BA AB 균형 순서, stderr 보존, **런 단위 부호반전
+순열검정** — 기존 dfs_integrity_ab.sh 의 결함 3종 수정판), `tests/procmatrix_ab.sh`.
+재현기에 `-T`(tid base)·`-A`/`DFSI_BUFMODE`(reuse|malloc|mmap) 추가 — **`-T` 없인 멀티프로세스
+arm 이 구조적으로 장님**(전 프로세스 tid 0 → 교차 치환이 정답으로 검증됨).
+
+| arm | 결과 | 판정 |
+|---|---|---|
+| client MR cache off (`CRT_MRC_ENABLE=0`+`UCX_RCACHE_ENABLE=n`, 마커 로그 확인) | 46/5120 vs 기준 79/5120, p=0.25 | **원인 아님 — off 에서도 손상** |
+| 버퍼 VA 재사용 (reuse vs 매 라운드 새 mmap·기존 매핑 유지) | 59/4659 vs 64/4513, p=0.98 | **원인 아님** |
+| 1×16 threads vs 16×1 processes | T 60/3666 vs P 16/4007, p=0.44 | **원인 아님 — 프로세스 분리로도 발생** |
+
+## 15.3 서버 BIO bulk-handle cache — 원인 아님
+
+`DAOS_IO_BYPASS=srv_bulk_cache` 를 양 엔진에 적용(로그 `debugging mode: srv_bulk_cache is
+disabled` 양쪽 확인) 후 fresh pool 에서: **DFS 33/5120 손상 지속**(18/640·3/640·12/640),
+raw obj 0/1920. cached bulk handle 은 무죄. 단 **DMA chunk 버퍼 풀 자체는 bypass 대상이
+아니므로** bio DMA 버퍼 재사용은 아직 용의선상에 있다.
+
+## 15.4 `ucx+tcp` — 측정 불가, 그 자체가 별도 결함
+
+provider 를 `ucx+tcp` 로 바꾸면 **모든 update RPC 가 서버에서 결정적으로 실패**:
+`hg_bulk_deserialize() Could not deserialize address` → DER_HG → 클라 DER_MISC. fresh pool
+첫 RPC부터 100 %, 양 rank. 작은 RPC(pool 연결)는 정상 — **bulk 핸들(클라 워커 주소 내장)이
+든 RPC 만** 깨진다. rc_v 에서 부하 시 간헐 발생하던 것(§12.8c)과 같은 실패가 tcp 주소
+형식에선 항상 발생. **na_ucx 주소 직렬화 결함으로 상류에 별도 보고 가치.**
+
+## 15.5 ★ `ofi+tcp` — RDMA 없이도 같은 서명으로 손상 (결정적)
+
+libfabric NA 플러그인 + 커널 TCP(RDMA·MR·NIC DMA 전무)로 전환, fresh pool:
+
+| | 결과 |
+|---|---|
+| DFS 16×40 ×8 | **83/5120 = 1.62 %** (10.78 %·0 ×5·0.94 %·1.25 % — 버스트 패턴 동일) |
+| raw obj ×3 | **49/1920** (9·40·0) |
+| 서명 | **동일**: 4 MiB chunk 하나가 같은 라운드·같은 오프셋의 다른 객체 데이터 |
+
+⇒ **UCX·RDMA·NIC/PCIe DMA·MR 캐시 전부 최종 배제.** 서로 무관한 두 전송(ucx+rc_v RDMA,
+ofi+tcp 소켓)이 같은 서명으로 손상 = 결함은 그 위 공통층이다.
+
+## 15.6 분기 트리 최종 상태
+
+```
+client MRC off        → 손상 지속   (§15.2)
+VA 재사용 제거        → 손상 지속   (§15.2)
+프로세스 분리         → 손상 지속   (§15.2)
+server bulk-hdl cache → 손상 지속   (§15.3)
+raw obj API (dc_array/DFS 배제, nr=1 단일 recx) → 손상 지속 (아래)
+ofi+tcp (UCX/RDMA 배제) → 손상 지속 (§15.5)
+─────────────────────────────────────────────
+남은 용의자:
+  (a) mercury core bulk 로직 (mercury_bulk.c — 두 NA 플러그인 공용)
+  (b) DAOS 서버 fetch 경로의 DMA/bulk 버퍼 수명
+      (vos fetch 채움 ↔ bulk PUT 완료 사이 재사용; srv_bulk_cache 는 핸들만 캐시)
+  (c) crt/object 층의 bulk 디스크립터-태스크 매칭
+판별 수단 = Phase 3 경계 해싱 (S1/S2/S3/C1/C2/C3, 계측 빌드 필요)
+```
+
+**raw object 재현기**(`tests/obj_integrity.c`, 신규): daos_obj_fetch 직접 호출, dkey=chunk
+번호, IOD 1개·recx 1개 — DFS·dc_array 완전 배제 상태에서 26/385·20/144 손상, 서명 동일.
+계획서 §3.1 의 "DAOS-19569(EC IOM merge)는 우리 경로가 아니다"가 코드와 실측 양쪽으로 확정.
+
+## 15.7 운영 발견 (재현·복구 조작법)
+
+1. **§8-1 SPDK wedge 의 실제 원인 하나를 특정**: stale `/var/tmp/spdk_pci_lock_0000:*` +
+   `/var/run/dpdk/spdk_pid*`. **rm 만으로 복구**되는 경우가 있다(dd·재포맷 불필요).
+2. 그래도 blobstore 가 깨졌으면: setup.sh reset → **PCI 주소로 열거한 데이터 NVMe 만**
+   `blkdiscard`(nvme24n1=OS 접근 금지 가드 포함) → SCM/raft 정리 → format.
+3. **provider 전환 절차**: server.yml provider 수정 + 양쪽 재포맷 + **cell1 로컬 agent 와
+   client agent 의 domain 을 provider 에 맞게**(ucx: `mlx5_0:1`, tcp 계열: netdev 명) + agent
+   재시작. 서버 재기동 후 클라 agent 도 재시작(구 attach 정보로 DER_HG).
+4. **client-5 firewalld 가 ofi+tcp bulk 를 막는다**: mercury tcp bulk 는 서버→클라 역방향
+   연결. `firewall-cmd --zone=trusted --change-interface=ens255np0` (런타임, --permanent 아님).
+5. cell1 의 daos_agent 는 이 날까지 2.9-gds 바이너리로 돌고 있었다(서버측 CLI 만 사용해 무해).
+
+## 15.8 현재 환경 (다음 세션)
+
+- **cell1/cell2: 2.8.0-rc3, provider `ofi+tcp`** — 재현되는 가장 단순한 전송이라 디버깅에
+  유리해 이 상태로 남겼다. pool `gdspool`(416 GB), 컨테이너 `ci_m28`·`ci_obj`.
+- rc_v 로 되돌리려면: yml provider 수정 + §15.7-3 절차(재포맷 포함).
+- client-5: `/root/dfs_integrity_28`·`/root/obj_integrity_28`(2.8 링크), `-T`/`-A` 지원판.
+  결과 로그: `/root/mrcab`·`/root/bufab`·`/root/procab`·`/root/bulkoff`·`/root/ofitcp`.
+- 다음 작업 = **Phase 3 경계 해싱**: 서버 debug 빌드(cell1 `/root/daos-2.8` 소스, S1~S3 지점)
+  + 클라 C1~C3. 그 전에 값싼 것: `ofi+tcp` 상태에서 kernel tcpdump 로 fetch bulk 페이로드를
+  wire 에서 캡처해 S(송신)–C(수신) 을 코드 수정 없이 비교할 수 있다 — tcp 로 남긴 또 하나의
+  이유.

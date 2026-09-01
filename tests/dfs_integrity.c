@@ -45,6 +45,10 @@
  *   -Q          verify existing objects only, write nothing
  *   -V N        quiet verify passes at the end (default 1)
  *   -R N        round tag for the quiet writer (vary it across overwrites)
+ *   -T N        base tid for tags/paths (multi-process arm: give each process
+ *               a distinct base or cross-process substitution is undetectable)
+ *   -A MODE     buffer strategy: reuse (default) | malloc | mmap
+ *               (mmap keeps old mappings so no virtual address is reused)
  *   -p POOL -c CONT
  *
  * Exit status: 0 everything correct, 1 corruption seen, 2 usage/DAOS error.
@@ -66,6 +70,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -99,6 +104,26 @@ static int      g_vpasses = 1;
  * indistinguishable from correct data.
  */
 static int      g_wround  = 0;
+/*
+ * -T: base thread-id for tags and paths. Needed for the multi-process arm:
+ * sixteen single-thread processes all default to tid 0, which makes their
+ * payload tags IDENTICAL for the same round and offset -- a cross-process
+ * chunk substitution would then verify as correct and the arm would be
+ * blind by construction. Distinct bases restore detection.
+ */
+static int      g_tid_base = 0;
+/*
+ * -A: destination/source buffer strategy per round (buffer VA reuse matrix,
+ * plan §6.4). MR-cache defects are sensitive to virtual-address recycling:
+ *   reuse  - allocate once per thread, reuse every round (default; maximally
+ *            MR-cache friendly, the historical behaviour)
+ *   malloc - fresh allocation every round, freed after (VA likely recycled
+ *            by the allocator, so stale-MR bugs can still hit)
+ *   mmap   - fresh mmap every round, previous mappings kept until thread
+ *            exit so no VA is ever reused (stale-MR bugs cannot hit)
+ */
+enum buf_mode { BUF_REUSE, BUF_MALLOC, BUF_MMAP };
+static enum buf_mode g_bufmode = BUF_REUSE;
 static const char *g_pool = "gdspool";
 static const char *g_cont = "kvlmc";
 
@@ -160,10 +185,11 @@ static void diagnose(const void *got, size_t nbytes, int tid, int round,
 		if (v == 0) { n_zero++; continue; }
 
 		tag_decode(v, &t, &r, &o);
-		if (t >= g_threads)             n_junk++;
-		else if (t != tid)              n_tid++;
-		else if (r != round)            n_round++;
-		else if (o != want_off)         n_off++;
+		if (t != tid && o == want_off)  n_tid++;   /* another object, same offset */
+		else if (t == tid && r != round) n_round++;
+		else if (t == tid && o != want_off) n_off++;
+		else if (t != tid && (o % 8) == 0 && o < (1ULL << 36))
+			n_tid++;                            /* foreign object, other offset */
 		else                            n_junk++;
 	}
 
@@ -179,7 +205,7 @@ static void diagnose(const void *got, size_t nbytes, int tid, int round,
 			snprintf(detail, sizeof(detail),
 				 "own data from round %d (this is round %d), offset %zu",
 				 f_round, round, f_off);
-		else if (f_tid < g_threads)
+		else if ((f_off % 8) == 0 && f_off < (1ULL << 36))
 			snprintf(detail, sizeof(detail),
 				 "object t%d's data (round %d, offset %zu)",
 				 f_tid, f_round, f_off);
@@ -266,8 +292,9 @@ static void *worker(void *p)
 	 * just stops doing I/O. Leaving early would hang every other thread
 	 * and turn one error into a dead run.
 	 */
-	if (posix_memalign((void **)&src, PAGE, g_chunk) ||
-	    posix_memalign((void **)&dst, PAGE, g_chunk)) {
+	if (g_bufmode == BUF_REUSE &&
+	    (posix_memalign((void **)&src, PAGE, g_chunk) ||
+	     posix_memalign((void **)&dst, PAGE, g_chunk))) {
 		a->rc = ENOMEM;
 		dead = true;
 	}
@@ -276,6 +303,34 @@ static void *worker(void *p)
 	for (int r = 0; r < g_rounds; r++) {
 		dfs_obj_t *obj = NULL;
 		daos_size_t sz;
+
+		/*
+		 * Buffer strategy (§6.4 of the plan). malloc: fresh pair every
+		 * round, freed at the end of the round, so the allocator may
+		 * hand the same virtual addresses back. mmap: fresh pair every
+		 * round and the old mappings are deliberately kept until the
+		 * thread exits, so no virtual address is EVER reused -- a
+		 * stale-MR / registration-cache defect cannot follow us here.
+		 */
+		if (!dead && g_bufmode == BUF_MALLOC) {
+			free(src);          /* previous round's pair, if any */
+			free(dst);
+			src = dst = NULL;
+			if (posix_memalign((void **)&src, PAGE, g_chunk) ||
+			    posix_memalign((void **)&dst, PAGE, g_chunk)) {
+				a->rc = ENOMEM;
+				dead = true;
+			}
+		} else if (!dead && g_bufmode == BUF_MMAP) {
+			src = mmap(NULL, g_chunk, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			dst = mmap(NULL, g_chunk, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (src == MAP_FAILED || dst == MAP_FAILED) {
+				a->rc = ENOMEM;
+				dead = true;
+			}
+		}
 
 		obj_path(path, sizeof(path), tid, r);
 		if (!dead)
@@ -392,8 +447,11 @@ static void *worker(void *p)
 		pthread_mutex_unlock(&g_log);
 	}
 
-	free(src);
-	free(dst);
+	if (g_bufmode == BUF_REUSE) {
+		free(src);
+		free(dst);
+	}
+	/* malloc/mmap per-round buffers: freed per round / kept until exit */
 	return NULL;
 }
 
@@ -413,7 +471,8 @@ static int quiet_write_all(dfs_sys_t *sys)
 	}
 	memset(header, 'm', sizeof(header));
 
-	for (int tid = 0; tid < g_threads; tid++) {
+	for (int i = 0; i < g_threads; i++) {
+		int tid = g_tid_base + i;
 		dfs_obj_t *obj = NULL;
 		daos_size_t sz;
 		char path[64];
@@ -462,7 +521,8 @@ static int verify_at_rest(dfs_sys_t *sys, int pass)
 		return -1;
 	}
 
-	for (int tid = 0; tid < g_threads; tid++) {
+	for (int i = 0; i < g_threads; i++) {
+		int tid = g_tid_base + i;
 		dfs_obj_t *obj = NULL;
 		daos_size_t sz = g_chunk;
 		char path[64], detail[256];
@@ -507,7 +567,20 @@ int main(int argc, char **argv)
 	int opt, rc, ret = 0;
 	struct timespec t0, t1;
 
-	while ((opt = getopt(argc, argv, "p:c:s:t:r:o:m:f:H:d:F:V:R:WNMQh")) != -1) {
+	/*
+	 * DFSI_BUFMODE mirrors -A so the crossover harness, which can only
+	 * vary environment between arms, can drive the buffer strategy too.
+	 * The command-line flag still wins if both are given.
+	 */
+	{
+		const char *bm = getenv("DFSI_BUFMODE");
+
+		if (bm && !strcmp(bm, "malloc"))    g_bufmode = BUF_MALLOC;
+		else if (bm && !strcmp(bm, "mmap")) g_bufmode = BUF_MMAP;
+		else if (bm && !strcmp(bm, "reuse")) g_bufmode = BUF_REUSE;
+	}
+
+	while ((opt = getopt(argc, argv, "p:c:s:t:r:o:m:f:H:d:F:V:R:T:A:WNMQh")) != -1) {
 		switch (opt) {
 		case 'p': g_pool = optarg; break;
 		case 'c': g_cont = optarg; break;
@@ -522,6 +595,13 @@ int main(int argc, char **argv)
 		case 'F': g_fresh = atoi(optarg) != 0; break;
 		case 'V': g_vpasses = atoi(optarg); break;
 		case 'R': g_wround = atoi(optarg) & 0xff; break;
+		case 'T': g_tid_base = atoi(optarg); break;
+		case 'A':
+			if (!strcmp(optarg, "reuse"))       g_bufmode = BUF_REUSE;
+			else if (!strcmp(optarg, "malloc")) g_bufmode = BUF_MALLOC;
+			else if (!strcmp(optarg, "mmap"))   g_bufmode = BUF_MMAP;
+			else { usage(argv[0]); return 2; }
+			break;
 		case 'W': g_qwrite = true; break;
 		case 'N': g_noread = true; break;
 		case 'M': g_nowrite = true; break;
@@ -531,7 +611,7 @@ int main(int argc, char **argv)
 	}
 	/* tid and round each occupy one byte of every tag. */
 	if (g_threads < 1 || g_threads > 255 || g_rounds < 1 || g_rounds > 255 ||
-	    g_chunk < PAGE) {
+	    g_tid_base < 0 || g_tid_base + g_threads > 255 || g_chunk < PAGE) {
 		usage(argv[0]);
 		return 2;
 	}
@@ -553,6 +633,9 @@ int main(int argc, char **argv)
 	       g_burst ? "burst" : "loop", g_sflags,
 	       g_perthr ? "per-thread" : "shared", g_delay_ms,
 	       g_fresh ? "fresh per round" : "reused");
+	printf("tid_base=%d bufmode=%s\n", g_tid_base,
+	       g_bufmode == BUF_REUSE ? "reuse" :
+	       g_bufmode == BUF_MALLOC ? "malloc" : "mmap");
 	printf("phases: quiet-write=%s concurrent-write=%s concurrent-read=%s "
 	       "verify-passes=%d\n",
 	       g_qwrite ? "yes" : "no",
@@ -567,7 +650,7 @@ int main(int argc, char **argv)
 	pthread_t *th = calloc(g_threads, sizeof(*th));
 	struct targ *args = calloc(g_threads, sizeof(*args));
 	for (int i = 0; i < g_threads; i++) {
-		args[i].tid = i;
+		args[i].tid = g_tid_base + i;
 		args[i].sys = g_sys;
 		if (g_perthr) {
 			/*
