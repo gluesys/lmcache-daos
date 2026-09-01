@@ -1298,3 +1298,42 @@ engines:
 
 환경 현재: **targets 1 / helpers 0, RP_2G1 컨테이너**로 두었다(손상률 10.6 % 로 재현이 빨라
 후속 A/B 에 유리). 8/2 복귀는 `/root/daos_server.yml.nvme-arm` 백업 참조.
+
+## 22.5 34.x 저장 레이아웃 모방 실측 — 이 축도 배제 (오히려 24 %)
+
+§22.4-1 실행: 우리 하드웨어에 34.x 의 레이아웃을 맞췄다 — **디바이스 2개**(0000:02·03:00.0),
+**`bdev_roles: [wal, meta, data]`**(MD-on-SSD), `control_metadata`, **scm_size 4**,
+targets 1 / helpers 0 유지.
+
+| arm | 클라이언트 손상 | 서버 FILLHASH |
+|---|---|---|
+| targets 8/helpers 2, 8dev, 롤 없음(ram SCM+nvme data) | 67/5120 = 1.3 % | 171 |
+| targets 1/helpers 0, 8dev, 롤 없음 | 271/2560 = 10.6 % | 562 |
+| **targets 1/helpers 0, 2dev, MD-on-SSD 롤** | **618/2560 = 24.1 %** | **1680** (644+1036) |
+
+서명 동일(`t12` chunk5 ← `t10 r0 off 25165824`, foreign=524288, retry STILL WRONG).
+
+⇒ **저장 레이아웃(디바이스 수·메타데이터 위치/롤)도 원인이 아니다.** 34.x 구성을 하나씩 맞출
+때마다 손상률이 **1.3 % → 10.6 % → 24.1 %** 로 올라갔다 — 즉 34.x 가 통과하는 이유는
+**소프트웨어 구성이 아니다.** (구성을 좁힐수록 노출이 커지는 방향이므로, 34.x 의 통과는 구성이
+아닌 다른 요인 덕이다.)
+
+### 소프트웨어 구성 축 소진 — 남은 것은 하드웨어/빌드
+
+| 축 | 상태 |
+|---|---|
+| targets/helpers, 디바이스 수, bdev_roles/메타 위치, oclass, provider, SPDK 버전, bio class(kdev 시도) | **전부 배제 또는 무관** |
+| **논리 섹터 4096 B vs 512 B** | ★ 미검증 — 최우선 |
+| **실 NVMe vs QEMU 가상 NVMe** | ★ 미검증 (가상 디스크가 결함을 감출 가능성) |
+| disable_vfio(UIO) | 미검증 (SPDK DMA 매핑 경로) |
+| DAOS 빌드 `exastor.402.g64a818563` vs `841487de8` | 미검증 (커밋 로컬에 없음) |
+
+### 다음 실험 (개정)
+1. **`disable_vfio: true`(UIO)** — 가장 값싼 남은 단일변수(yml 한 줄, 재포맷 불필요할 수도).
+2. **512 B 재포맷**: `nvme format -l <lbaf_512>` 로 데이터 SSD 1~2개를 512 B 로 바꿔 A/B.
+   PASCARI 가 512 B lbaf 를 지원하는지 `nvme id-ns` 로 먼저 확인. **디스크 내용 파기됨**.
+3. exastor RPM 커밋 fetch 후 bio/vos/vea diff (그 빌드에 수정이 들어있을 가능성).
+4. 34.x 에 **4 KiB 가상 디스크**를 추가해 거기서 재현되는지 — 역방향 검증으로 가장 결정적.
+
+환경: **targets 1/helpers 0, 2dev, MD-on-SSD, RP_2G1, pool 206 GB** 유지(손상률 24 % 로 A/B 가
+가장 빠름). 이전 arm 백업 `/root/daos_server.yml.nvme-arm`(8dev/8targets), `/root/daos_server.yml.t1arm`.
