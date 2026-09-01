@@ -1337,3 +1337,68 @@ targets 1 / helpers 0 유지.
 
 환경: **targets 1/helpers 0, 2dev, MD-on-SSD, RP_2G1, pool 206 GB** 유지(손상률 24 % 로 A/B 가
 가장 빠름). 이전 arm 백업 `/root/daos_server.yml.nvme-arm`(8dev/8targets), `/root/daos_server.yml.t1arm`.
+
+---
+
+# 23. ★★ 역방향 검증: 34.x 를 4 KiB 섹터로 바꿔도 통과 — 섹터 크기 배제 (2026-09-02)
+
+§22.5 의 §22.4-4("34.x 에 4 KiB 디스크를 붙여 재현 시도")를 실행했다. **우리 장비를 파괴적으로
+재포맷할 필요가 없었다**: 34.31 의 QEMU NVMe 가 `LBA Format 4 = 4096 B` 를 지원해 그 자리에서
+바꿀 수 있었다.
+
+## 23.1 절차 (재현용)
+
+```bash
+# 34.31 (root/gluesys!!, dev 박스 직결). 두 데이터 디바이스 = 0000:00:03.0/04.0 = nvme0/1
+nvme id-ns /dev/nvme0n1 -H | grep "LBA Format"   # lbaf 4 = 4096B 지원 확인
+nvme format /dev/nvme{0,1}n1 --lbaf=4 --force    # 512B -> 4096B (내용 파기)
+cat /sys/block/nvme0n1/queue/logical_block_size   # 4096 확인
+```
+기동 함정 4건: ① `ib0` 에 IPv4 없음 → `fabric_iface: ens19`(10.10.34.31), provider 는
+§15.5 로 비-gate 이므로 `ofi+tcp` 로 대체 ② `/var/run/daos_server` 디렉터리 필요
+③ nohup/setsid 로는 ssh 종료 시 죽음 → `systemd-run --unit=... --collect`
+④ 34.31 은 daos-devel 없음 → cell1 의 `/var/daos-stockfull/include` 를 복사하고
+`libuuid-devel` 설치, `.so` 심볼릭 없어 `libdaos.so.2`·`libgurt.so.4`·`libdaos_common.so`
+직접 링크.
+
+구성: `class: nvme`(SPDK), 디바이스 2개 **4096 B**, `bdev_roles:[wal,meta,data]`,
+targets 1 / helpers 0, `disable_vfio: true`, pool `p4k` 63 GB, 컨테이너 SX(단일 rank).
+
+## 23.2 결과 — 4 KiB 에서도 통과
+
+| arm | 결과 |
+|---|---|
+| 34.31, 4 KiB 섹터, 16×20 ×3 | **0/960** |
+| 34.31, 4 KiB 섹터, 16×40 ×4 | **0/2560** |
+
+⇒ **논리 섹터 크기는 원인이 아니다.** §22.5 의 최우선 가설 기각. (§21.2 의 kdev EINVAL 은
+별개의 구성 문제였을 뿐 손상과 무관.)
+
+## 23.3 남은 차이 축 — 두 개로 좁혀졌다
+
+소프트웨어 구성(§22.2·§22.5)과 섹터 크기(§23.2)가 모두 배제된 뒤 남은 것:
+
+| 축 | 우리(손상 1.3~24 %) | 34.x(0/3520) | 비고 |
+|---|---|---|---|
+| **DAOS 빌드** | source `841487de8`(upstream) | RPM **`exastor.402.g64a818563`** | 커밋이 우리 트리에 없음 → **그 빌드에 수정이 들어있을 가능성** |
+| **하드웨어/플랫폼** | 베어메탈, 실 PASCARI NVMe ×2~8, EPYC 다중 NUMA | **KVM VM**, QEMU 가상 NVMe, 단일 NUMA | 가상 디스크가 결함을 감출 수 있음(타이밍·큐 깊이·DMA 경로) |
+| disable_vfio | false(VFIO) | **true(UIO)** | 아직 미검증 — 값싼 단일변수 |
+
+## 23.4 다음 실험 (개정, 값싼 순)
+
+1. **우리 클러스터에 `disable_vfio: true`(UIO)** — yml 한 줄. clean 이면 VFIO/IOMMU DMA 경로가
+   조건(플랫폼 축과 연결).
+2. **exastor 커밋 `64a818563` 확보** — `git fetch gitlab`(exastor/daos) 후
+   `841487de8` 와 `src/{bio,vos,vea,object}` diff. 수정이 있으면 그것을 우리 소스빌드에
+   cherry-pick 해 A/B → 확정되면 상류 제출은 "이미 고쳐진 버그" 로 프레임이 바뀐다.
+3. **34.x 에 우리 빌드 투입**(반대 방향): 34.31 에 `/var/daos-stockfull` 서버를 올려
+   같은 VM 에서 재현되는지. 재현되면 **빌드 차이가 원인**으로 확정, 안 되면 플랫폼 축.
+
+3번이 가장 결정적이다 — 같은 VM·같은 디스크에서 빌드만 바꾸는 단일변수다.
+
+## 23.5 34.x 환경 상태 (원복 필요 항목)
+- **두 QEMU NVMe 를 4096 B 로 재포맷했다**(원래 512 B). 원복: `nvme format --lbaf=0`.
+- 추가한 것: `/etc/daos/daos_server_4k.yml`, `/etc/daos/daos_agent_4k.yml`,
+  transient 유닛 `daos-srv4k`·`daos-agent4k`(둘 다 실행중), pool `p4k`, 컨테이너 `ci_obj`,
+  `/root/{obj_integrity,obj_integrity.c,dh/}`, `libuuid-devel` 설치.
+- 사용자의 원본 `daos_server_nvme_blob.yml`·`daos_control_nvme_blob.yml` 은 **그대로 보존**.
