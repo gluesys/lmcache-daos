@@ -44,6 +44,7 @@
  *   -M          threads read only    (isolates the read path; pair with -W)
  *   -Q          verify existing objects only, write nothing
  *   -V N        quiet verify passes at the end (default 1)
+ *   -R N        round tag for the quiet writer (vary it across overwrites)
  *   -p POOL -c CONT
  *
  * Exit status: 0 everything correct, 1 corruption seen, 2 usage/DAOS error.
@@ -91,6 +92,13 @@ static bool     g_noread  = false;
 static bool     g_nowrite = false;
 static bool     g_verify_only = false;
 static int      g_vpasses = 1;
+/*
+ * Round tag used by the quiet writer. Varying it across successive quiet
+ * overwrites is what makes a stale chunk identifiable: without it every
+ * generation writes round 0 and "the previous generation's data" is
+ * indistinguishable from correct data.
+ */
+static int      g_wround  = 0;
 static const char *g_pool = "gdspool";
 static const char *g_cont = "kvlmc";
 
@@ -412,7 +420,7 @@ static int quiet_write_all(dfs_sys_t *sys)
 		int rc;
 
 		obj_path(path, sizeof(path), tid, 0);
-		fill_tagged(src, tid, 0, g_chunk);
+		fill_tagged(src, tid, g_wround, g_chunk);
 
 		rc = dfs_sys_open(sys, path, S_IFREG | 0644, O_RDWR | O_CREAT,
 				  0, 0, NULL, &obj);
@@ -499,7 +507,7 @@ int main(int argc, char **argv)
 	int opt, rc, ret = 0;
 	struct timespec t0, t1;
 
-	while ((opt = getopt(argc, argv, "p:c:s:t:r:o:m:f:H:d:F:V:WNMQh")) != -1) {
+	while ((opt = getopt(argc, argv, "p:c:s:t:r:o:m:f:H:d:F:V:R:WNMQh")) != -1) {
 		switch (opt) {
 		case 'p': g_pool = optarg; break;
 		case 'c': g_cont = optarg; break;
@@ -513,6 +521,7 @@ int main(int argc, char **argv)
 		case 'd': g_delay_ms = strtol(optarg, NULL, 0); break;
 		case 'F': g_fresh = atoi(optarg) != 0; break;
 		case 'V': g_vpasses = atoi(optarg); break;
+		case 'R': g_wround = atoi(optarg) & 0xff; break;
 		case 'W': g_qwrite = true; break;
 		case 'N': g_noread = true; break;
 		case 'M': g_nowrite = true; break;
