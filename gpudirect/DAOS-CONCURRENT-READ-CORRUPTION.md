@@ -1565,3 +1565,63 @@ VFIO/IOMMU 를 통해 DMA 할 때만** 나타난다. QEMU 가상 NVMe 로는 재
 **상류 제출 시 반드시 명시할 것**: "VM/가상 NVMe 에서는 재현되지 않고, 베어메탈 실 NVMe +
 VFIO 에서만 재현된다. 따라서 상류 CI(대부분 VM)가 이 결함을 잡지 못한다." — 이것이
 §14.2 에서 "같은 서명의 보고가 없다"는 사실과 정확히 맞물린다.
+
+---
+
+# 27. ★★★ 최종 확정: `class: file` 은 깨끗 — 조건은 "실 NVMe 를 통한 SPDK DMA" (2026-09-02)
+
+§26.4-1 실행. **같은 베어메탈·같은 서버 빌드·같은 구성(targets 1/helpers 0, 2 디바이스,
+`bdev_roles:[wal,meta,data]`, RP_2G1, ofi+tcp)에서 백엔드만 `class: nvme` → `class: file`**
+(sparse file bdev, `/var/daos/bdevfiles/nvme{0,1}.img` 60 GB) 로 바꾼 단일변수 실험.
+
+## 27.1 결과 — 실 NVMe 를 빼면 손상이 사라진다
+
+| 백엔드 (모든 조건 동일) | raw object | DFS | 서버 FILLHASH |
+|---|---|---|---|
+| `class: nvme` (실 PASCARI NVMe ×2, VFIO) | **618/2560 = 24.1 %** | 손상 | **1680** |
+| **`class: file` (sparse file ×2, 실 NVMe 미사용)** | **0/2560** | **0/2560** | **0** |
+
+SPDK userspace blobstore·VOS·bio DMA 버퍼 로직은 **그대로 사용**하면서(파일 bdev 도 SPDK
+`bdev_aio`/blobstore 경유) 실 NVMe 컨트롤러만 제거했을 때 손상이 **완전히** 사라졌다.
+
+## 27.2 최종 판정
+
+> **손상은 SPDK blobstore/VOS/bio 의 순수 소프트웨어 로직이 아니라, SPDK userspace 드라이버가
+> 실제 NVMe 컨트롤러에 VFIO/IOMMU 로 DMA 할 때만 발생한다.**
+
+이로써 §19(채움 단계에서 발생)와 결합해 결함 위치가 최종적으로 좁혀진다:
+**`nvme_rw()` → SPDK NVMe 드라이버 → VFIO/IOMMU → 실 NVMe 컨트롤러 DMA** 구간.
+
+배제된 것 총정리(§12~§27): DAOS 빌드 전체, 클라이언트 전체, 전송/provider, oclass·복제,
+chunk 정렬, aggregation, bulk-handle cache, targets/helpers, 디바이스 수, bdev_roles·메타
+위치, 논리 섹터 크기, **그리고 SPDK blobstore/bio/VOS 소프트웨어 로직(§27)**.
+
+## 27.3 남은 후보 (모두 "실 NVMe DMA" 안쪽)
+
+1. **SPDK NVMe 드라이버의 큐/PRP 처리** — 4 MiB 요청이 PRP 리스트로 쪼개질 때의 경합.
+   파일 bdev 는 이 경로를 안 탄다(aio → 커널). 가상 NVMe 는 큐 깊이·MSI-X 규모가 작다.
+2. **VFIO/IOMMU DMA 매핑** — IOVA 재사용/무효화 타이밍. §25 에서 UIO 대조는 하드웨어 제약으로
+   불가했으므로 이 축은 여전히 미분리.
+3. **NVMe 컨트롤러/펌웨어**(PASCARI XX208, MSI-X 257) — 다중 큐 동시 read 에서의 컨트롤러측
+   문제. 다른 모델에서의 재현 여부가 이 축을 가른다.
+
+### 다음 세션 우선순위
+1. **다른 모델 실 NVMe 로 재현 시도** — 2·3 을 가른다. 재현되면 SPDK/VFIO(범용), 안 되면
+   PASCARI 고유(펌웨어/컨트롤러) → 상류 이슈의 성격이 완전히 달라진다.
+2. `iommu=pt` 제거/추가, ATS/PRI 토글 A/B (2번 축).
+3. SPDK 자체 도구로 우리 NVMe 직접 검증: `spdk_nvme_perf`/`nvme_manage` 로 태그 데이터를
+   4 MiB 다중 큐 read 하며 검증 — DAOS 를 완전히 제거한 최소 재현기. **가장 결정적이고
+   상류(SPDK) 제출까지 이어질 수 있다.**
+
+## 27.4 상류 제출 프레임 (수정)
+
+DAOS 상류 이슈로는 여전히 유효하나 **성격이 바뀐다**: "DAOS 가 특정 실 NVMe + VFIO 조합에서
+fetch 채움 데이터를 조용히 오염시킨다. VM/가상 NVMe·파일 bdev 에서는 재현되지 않아 상류 CI 가
+구조적으로 잡을 수 없다." 3번(SPDK 최소 재현기)이 성공하면 **SPDK 프로젝트 이슈**가 더 정확한
+제출처가 된다.
+
+## 27.5 환경 상태
+현재 **`class: file` arm** 으로 떠 있다(양 rank Joined, pool gdspool 100 GB, 컨테이너
+ci_obj·ci_m28, 손상 0). 실 NVMe arm 복귀: `/root/daos_server.yml.nvme2dev`(2 디바이스 24 % arm)
+또는 `/root/daos_server.yml.nvme-arm`(8 디바이스 원본) 복원 후 VFIO 재바인딩·재포맷.
+34.31 에는 우리 빌드 서버(`daos-ours`)가 여전히 실행중 — 그들 구성 복귀는 `daos-srv4k` 유닛.
