@@ -1689,3 +1689,75 @@ cluster 매핑/IO 분할**, 그리고 그것을 쓰는 **DAOS bio 의 blob I/O �
 현재 **실 NVMe 2 디바이스 DAOS arm 복원**(양 rank Joined, pool gdspool 100 GB,
 컨테이너 ci_obj, 13 % 재현 확인). SPDK 재현기는 cell1 `/tmp/spdk_nvme_tagio`(소스는 레포
 `tests/spdk_nvme_tagio.c`). SPDK 단독 실행 시 DAOS 를 정지해야 한다(디바이스 배타 점유).
+
+---
+
+# 29. ★★★ blobstore 계층도 깨끗 — SPDK 전 계층 무죄, 결함은 DAOS 의 blob 사용 (2026-09-02)
+
+§28.4-1 실행. **DAOS 를 제거하고 SPDK blobstore 만** 시험하는 재현기를 작성
+(`tests/spdk_blob_tagio.c`, 빌드 `tests/spdk_blob_tagio.build.sh`).
+
+## 29.1 재현기 설계 (DAOS bio 형태 모방)
+
+- `spdk_bs_init()` on **nvme bdev**(`bdev_nvme_attach_controller` JSON) — 즉 §27 에서
+  손상이 나던 그 조합(blobstore + nvme bdev)을 DAOS 없이 재현.
+- 워커당 blob 1개(=VOS blob per target), 워커당 `spdk_bs_alloc_io_channel()` 1개,
+  `spdk_blob_io_write/read` 로 **4 MiB(=DFS chunk) I/O**, 전 워커 동시 진행.
+- `spdk_zmalloc(SPDK_MALLOC_DMA)` 4 KiB 정렬 버퍼, 0xA5 poison, 같은 자기술 태그.
+- SPDK app framework(단일 reactor, 비동기 상태기계) 사용 — blobstore 호출은 SPDK 스레드에서만.
+
+빌드/실행 함정 4건: ① `-R` 은 SPDK 예약 옵션 → 라운드 플래그를 `-N` 으로.
+② `spdk_bs_unload()` 는 blob 이 열려 있으면 거부 → teardown 에서 blob 을 순차 close 하고,
+**판정 출력은 unload 전에** 한다(teardown 실패가 측정을 가리지 않게). ③ accel 이
+isal_crypto·lz4 를 요구 → `-lisal_crypto -llz4` 추가. ④ 비정상 종료 시
+`/var/tmp/spdk_cpu_lock_*` 이 남아 다음 실행이 코어 락 실패 → 삭제 필요.
+
+## 29.2 결과 — 깨끗
+
+```
+blobstore: page=4096 cluster=1048576 free_clusters=3648520 | workers=16 rounds=40 io=4MiB
+PASS: 0/640   PASS: 0/640
+```
+
+| 계층 (같은 디바이스 0000:02:00.0) | 결과 |
+|---|---|
+| DAOS (class:nvme, 실 NVMe) | **13~24 % 손상** (§27·§28) |
+| **SPDK blobstore + nvme bdev** (DAOS 없음), 16 blob × 40 라운드 ×2 | **0/1280** |
+| SPDK NVMe 드라이버 직접 (§28) | 0/2560 |
+| DAOS class:file (blobstore + aio bdev) (§27) | 0/2560 |
+
+## 29.3 판정 — SPDK 전 계층 무죄
+
+> **NVMe 드라이버·bdev_nvme·blobstore 모두 무결하다. 4 MiB 다중 blob·다중 채널 동시
+> read 를 같은 하드웨어에서 해도 깨끗하다. 결함은 DAOS 가 blobstore 를 쓰는 방식에 있다.**
+
+이제 §19(손상은 `bio_iod_prep()` 반환 시점에 이미 존재 = NVMe→DMA 채움 구간)와 결합하면
+용의 코드가 **DAOS bio 의 blob I/O 경로**로 확정된다:
+
+```
+nvme_rw()            src/bio/bio_buffer.c   — 영역별 blob I/O 발행
+ └ bio_blob_rw()/spdk_blob_io_read(ov)
+    - blob 오프셋 계산: bio_iov 의 ba_off → blob page/cluster
+    - SGL 경로: spdk_blob_io_readv 사용 시 iov 배열 구성
+    - 채널: 엔진 xstream 당 blob io_channel 공유
+```
+
+**§27 의 class:file 이 깨끗한 이유도 여기서 설명된다**: 같은 DAOS 코드라도 aio bdev 는
+동기적 완료·단일 큐라 경합 창이 없고, nvme bdev 는 다중 큐/비동기라 DAOS 측 계산·수명 오류가
+드러난다. 즉 **DAOS 버그이며, nvme bdev 에서만 노출된다.**
+
+## 29.4 다음 실험 (최종 좁히기)
+
+1. **`nvme_rw()` 계측**: 발행하는 (blob, blob_offset, length, buffer_addr) 를 로깅하고,
+   §19 의 FILLHASH 가 잡은 손상 chunk 의 요청 파라미터가 **다른 blob 의 영역과 겹치는지**
+   직접 확인. 겹치면 DAOS 의 오프셋 계산 오류로 **원인 확정**.
+2. `spdk_blob_io_readv`(SGL) 대 `spdk_blob_io_read`(단일 버퍼) 경로 확인 — DAOS 가 어느 쪽을
+   쓰는지, iov 구성에 오류가 없는지.
+3. 확정 후 상류 제출: **DAOS 이슈**(SPDK 아님)로, 재현기 3종(DAOS 레벨·SPDK blobstore 음성
+   대조·SPDK 드라이버 음성 대조)을 함께 첨부하면 "우리 계층 아님"을 선제적으로 차단할 수 있다.
+
+## 29.5 환경
+DAOS 는 정지 상태이고 0000:02:00.0 은 SPDK(vfio)에 바인딩돼 blobstore 재현기가 그 위에
+blobstore 를 새로 만들었다(**디바이스 내용 파기됨 — DAOS 재사용 시 재포맷 필요**).
+DAOS arm 복귀: `/root/daos_server.yml.nvme2dev` 유지 상태이므로 서버 기동 → 재포맷 → pool·컨테이너
+재생성. 재현기: cell1 `/tmp/spdk_blob_tagio`(+`/tmp/blob_nvme.json`), `/tmp/spdk_nvme_tagio`.
