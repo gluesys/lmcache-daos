@@ -1505,3 +1505,63 @@ UIO 자체의 공로로 볼 근거도 없다.**
 3. 실 NVMe 축이 남으면: 다른 모델/다른 서버의 실 NVMe 에서 재현 시도(하드웨어 일반성 확인).
 
 2번이 가장 정보량이 크다 — "SPDK 로직 vs 실 하드웨어"를 우리 장비 안에서 가른다.
+
+---
+
+# 26. ★★★ 빌드 스왑 결정 실험 — 우리 빌드도 34.x VM 에서 깨끗: 플랫폼이 조건 (2026-09-02)
+
+§25.4-1 실행. **같은 VM·같은 가상 디스크·같은 구성에서 서버 빌드만 우리 것으로** 바꾸는
+단일변수 실험. §24 에서 빌드가 배제됐으므로 이건 플랫폼 축을 확정하는 음성 대조다.
+
+## 26.1 절차
+
+1. cell1 `/var/daos-stockfull`(519 MB, tar 177 MB) → dev 박스 경유 → 34.31 `/var` 에 전개.
+   **FILLHASH 계측 포함 확인**(`libobj.so` 에 문자열 2건), `daos_server_helper` setuid 복원.
+2. 그들 유닛(`daos-srv4k`) 정지 → `/etc/daos/daos_server_ourbuild.yml`(그들 4K 구성 복사 +
+   경로만 분리 + `FILLHASH_DEBUG=1`) 로 우리 서버를 `systemd-run --unit=daos-ours` 로 기동.
+3. 함정 2건: ① 이전 arm 들의 tmpfs 3개(`/mnt/daos{0,1,_nvme_blob0}`)가 RAM 을 잡아
+   `MemAvailable 3.3 GiB < 3.6 GiB` 로 포맷 거부 → umount + drop_caches 로 9 GiB 확보.
+   ② `scm_size: 2` 는 최소값 미달(code 730) → 4 유지.
+4. 포맷 → rank 0 Joined, pool `pours` 63 GB, 컨테이너 `ci_obj`(SX), 재현기를 우리 lib 로 재링크.
+
+## 26.2 결과
+
+| 서버 빌드 | 플랫폼 | 결과 |
+|---|---|---|
+| 34.x exastor RPM `64a818563` | 34.31 VM, 가상 NVMe | 0/3520 (§23) |
+| **우리 stockfull `841487de8` + fillhash** | **34.31 VM, 같은 가상 NVMe** | **0/960 → 0/3520, FILLHASH 0건** |
+| 우리 stockfull `841487de8` + fillhash | **cell1/cell2 베어메탈, 실 NVMe** | **1.3 % → 24 %**, FILLHASH 171~1680건 |
+
+⇒ **빌드는 완전히 무죄다.** 같은 소스·같은 바이너리가 VM 에서는 3520 읽기 무손상, 베어메탈
+에서는 최대 24 % 손상. **차이는 플랫폼(가상 NVMe/VM) 뿐이다.**
+
+## 26.3 이로써 확정된 재현 조건
+
+지금까지의 배제를 합치면 재현 조건이 하나로 수렴한다:
+
+| 축 | 판정 |
+|---|---|
+| DAOS 빌드(upstream/exastor/GDS/WSD) | **무관** (§18·§24·§26) |
+| 클라이언트 전체(API·캐시·버퍼·프로세스) | **무관** (§15.2) |
+| provider / 전송(UCX RDMA·ofi+tcp) | **무관** (§15.5) |
+| oclass·복제·chunk 정렬·컨테이너 신선도 | **무관** (§12.4·§13.5) |
+| VOS aggregation | **무관** (§12.8) |
+| targets/helpers 동시성, 디바이스 수, bdev_roles/메타 위치 | **무관** (§22) |
+| 논리 섹터 크기(512 B/4 KiB) | **무관** (§23) |
+| server BIO bulk-handle cache | **무관** (§15.3) |
+| **실 NVMe 하드웨어 + VFIO/IOMMU DMA 경로(베어메탈)** | **★ 조건** |
+
+즉 이 결함은 **SPDK userspace NVMe 드라이버가 실제 NVMe 컨트롤러(MSI-X 257, 4 KiB)에
+VFIO/IOMMU 를 통해 DMA 할 때만** 나타난다. QEMU 가상 NVMe 로는 재현되지 않는다.
+
+## 26.4 남은 실험과 상류 제출 프레임
+
+1. **`class: file`**(sparse file bdev, 우리 베어메탈): SPDK blobstore 로직은 유지하되 실 NVMe
+   를 제거. **clean 이면 "실 NVMe DMA 경로" 로 최종 확정**, 손상되면 SPDK blobstore 로직으로.
+   → 남은 단 하나의 값싼 분기. 다음 세션 1순위.
+2. 다른 모델 실 NVMe(다른 서버)에서 재현 — 하드웨어 일반성(PASCARI 고유인지) 확인.
+3. IOMMU 관련: `iommu=pt` 유무, `intel_iommu`/`amd_iommu` 옵션, ATS/PRI 설정 A/B.
+
+**상류 제출 시 반드시 명시할 것**: "VM/가상 NVMe 에서는 재현되지 않고, 베어메탈 실 NVMe +
+VFIO 에서만 재현된다. 따라서 상류 CI(대부분 VM)가 이 결함을 잡지 못한다." — 이것이
+§14.2 에서 "같은 서명의 보고가 없다"는 사실과 정확히 맞물린다.
