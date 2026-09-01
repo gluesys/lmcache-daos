@@ -1121,3 +1121,59 @@ clobber"(S4)는 계측으로 제거. §19.2 의 "chunk 전체 = 다른 객체" �
   srv_obj.c 에 fillhash_check_sgl/enabled, **커밋 안 함**. cell1 `/var/daosbuild/daos-stock`
   에 동일 패치 적용본). 원복하려면 `/tmp/srv_obj.c.orig` 복원 후 재빌드.
 - 결과 로그: client-5 `/root/fh2/`, 서버 `/var/log/daos/daos_engine.0.log`.
+
+---
+
+# 20. ★★★ 손상이 안 나는 대조 클러스터 — 차이는 bio 백엔드 class (2026-09-01)
+
+사용자 제공: **192.168.34.30/31/32(ExaCI4)에서는 재현 안 됨.** 접속 `root/gluesys!!`(직결,
+dev 박스에서). 34.30=client(`ExaCI4-3J`), 34.31=server(`FlexA_3433_1-A`), access_points=[34.31].
+
+## 20.1 두 환경 비교
+
+| 축 | 우리(손상) | 34.x(정상) |
+|---|---|---|
+| DAOS | source `841487de8`(+wsd/gds) 및 stockfull | RPM `2.9.100-4.exastor.402.g64a818563` |
+| **bio class** | **`nvme` (SPDK userspace, vfio-pci)** | **`kdev` (커널 블록 디바이스)** |
+| vfio 바인딩 | 8개 | **0개** |
+| 데이터 디바이스 | 실 PASCARI NVMe ×8 | QEMU 가상 NVMe(1b36) + **zvol** `/dev/zvol/daoshdd/daosdata` |
+| bdev_roles | (ram=meta) + (nvme=data) 분리 | `[wal,meta,data]` 단일 디바이스 |
+| targets/engine | **8** | **1** |
+| provider | ucx+rc_v → ofi+tcp | ofi+verbs;ofi_rxm |
+| **SPDK** | **v26.01** | **v26.01 (daos-spdk-26.01-2)** ← 동일 |
+| 하드웨어 | 베어메탈 | VM |
+
+## 20.2 해석 — SPDK 버전이 아니라 SPDK userspace NVMe 경로
+
+**양쪽 SPDK 26.01 동일** → §17.4/§19 의 "SPDK v26.01 회귀" 프레임은 **버전 문제가 아니다**로
+정제. 남는 최유력 단일 차이는 **bio class: `nvme`(SPDK vfio userspace blobstore-over-raw-NVMe)
+vs `kdev`(커널 블록)**. 우리 §19 결론(손상 = NVMe→DMA 채움, 즉 blobstore read)과 정확히
+정합: **kdev 는 SPDK userspace NVMe 읽기 경로를 통째로 우회**하므로 손상이 안 나는 것과 부합.
+
+단 34.x 에는 교란요인이 많다(targets 1 vs 8, VM 가상디스크, provider verbs, RPM 빌드 상이).
+1-target VM 이 애초에 우리의 동시성/멀티타깃 부하를 못 만든다는 가능성도 배제 못 함. 그래서
+34.x 는 "kdev 가 원인"의 증명이 아니라 **강한 정황 + 단일변수 실험 설계의 근거**다.
+
+⚠️ 관측 시점: 34.31 daos_server 는 **현재 inactive**(구동 안 함). 사용자의 "문제 없음"은
+과거 구동 시 관측으로 이해. config 비교는 유효.
+
+## 20.3 결정적 단일변수 실험 (다음 세션)
+
+우리 클러스터에서 **다른 건 모두 고정하고 bio class 만 `nvme`→`kdev` 로**:
+1. `dmg storage` 정지 → vfio 에서 NVMe 언바인드 → 커널 nvme 드라이버로 복귀
+   (`/dev/disk/by-id/nvme-...`).
+2. server.yml storage tier 를 `class: kdev` + `bdev_list:[by-id 경로들]` 로. SCM=ram 유지.
+3. 재포맷 → 같은 obj_integrity/FILLHASH 배터리.
+- **kdev 에서 clean → SPDK userspace NVMe 읽기 경로(S1) 확정.** upstream 제출의 핵심 재현
+  경계가 된다("class:nvme 에서만, class:kdev 에선 안 남").
+- kdev 에서도 손상 → SPDK 아래(VEA/VOS 주소해석, S2) 또는 targets≥2 조건으로 범위 이동.
+
+보조 실험(교란 분리): 우리 클러스터를 **targets:1** 로 줄여도 나는지(멀티타깃이 조건인지),
+그리고 34.x 서버를 다시 띄워 **targets 를 8 로 올리고 class 를 nvme(가능하면)로** 바꿔 재현
+시도. 다만 34.x 는 가상디스크라 SPDK nvme class 부적합할 수 있음.
+
+## 20.4 부수 확정
+- **SPDK 버전은 범인이 아니다**(양쪽 26.01). §19.3 의 "SPDK v25 다운그레이드 A/B"는 우선순위
+  강등 — 대신 **class kdev A/B** 가 1순위.
+- 34.x 는 이전 세션이 "대조군으로 쓰지 말라"던 CI(35.x)와 같은 계열(VM·verbs·targets1·zvol)
+  이나 IP·빌드가 다름. verbs 라서가 아니라 **kdev·1-target 이라 안 나는 것**으로 재해석.
