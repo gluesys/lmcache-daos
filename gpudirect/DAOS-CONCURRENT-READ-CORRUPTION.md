@@ -1233,3 +1233,68 @@ vs `kdev`(커널 블록)**. 우리 §19 결론(손상 = NVMe→DMA 채움, 즉 b
   3. kdev 재도전: 롤 분리 + 디바이스 수 축소.
 - 환경은 **arm A(class:nvme)로 원복 완료**: 양 rank Joined, pool gdspool, ci_m28·ci_obj 재생성,
   fillhash 계측 서버 유지. 백업 `/root/daos_server.yml.nvme-arm`(양 cell).
+
+---
+
+# 22. 정정: 34.x 는 nvme blob 으로도 통과 — kdev 가설 폐기, 동시성 축도 배제 (2026-09-02)
+
+사용자 보고: **34.x 에서 `class: nvme`(SPDK blob) 구성으로도 정상 통과.** §20/§21 의
+"kdev 가 차이" 가설은 **폐기**한다.
+
+## 22.1 34.x 가 통과시킨 실제 구성 (`/etc/daos/daos_server_nvme_blob.yml`, 9/1 23:45)
+
+```yaml
+disable_vfio: true        # ← UIO, not VFIO
+disable_hotplug: true
+nr_hugepages: 2048
+control_metadata: {path: /var/daos/control_meta_nvme_blob_20260901}
+engines:
+- targets: 1              # ← 우리 8
+  nr_xs_helpers: 0        # ← 우리 2
+  storage:
+  - {class: ram, scm_size: 4}
+  - {class: nvme, bdev_list: ['0000:00:03.0','0000:00:04.0'],
+     bdev_roles: [wal, meta, data]}   # ← MD-on-SSD 롤; 우리는 롤 없는 ram+nvme 분리
+```
+디바이스는 **QEMU 가상 NVMe 2개, 논리섹터 512 B**(lspci 실 NVMe 0개). provider ofi+verbs;ofi_rxm.
+
+## 22.2 동시성 축(targets/helpers) 실측 — 조건 아님, 오히려 악화
+
+우리 하드웨어에서 그들의 동시성 설정만 맞췄다(`targets: 1`, `nr_xs_helpers: 0`, 나머지 고정).
+2-target 풀이 되므로 컨테이너·객체 oclass 를 **RP_2G1** 로(oclass 는 §12.4 에서 비-gate 확정).
+
+| arm | 클라이언트 | 서버 FILLHASH |
+|---|---|---|
+| targets 8 / helpers 2 (§21.1) | 67/5120 = **1.3 %** | 171 |
+| **targets 1 / helpers 0** | **271/2560 = 10.6 %** | **562** (cell1 134 + cell2 428) |
+
+⇒ 서버 동시성(멀티타깃·helper offload)은 **원인도 조건도 아니다.** 단일 target·offload 없음에서
+오히려 5배 심해졌다(부하가 한 xstream 에 집중되어 노출이 커진 것으로 해석). 서명 동일
+(`t4` 의 chunk0 이 `t2 r1 off 4194304` 데이터로, foreign=524288).
+
+## 22.3 남은 차이 축 (우선순위 재정렬)
+
+| 축 | 우리(손상) | 34.x(정상) | 평가 |
+|---|---|---|---|
+| **논리 섹터** | **4096 B** (실 PASCARI) | **512 B** (QEMU) | ★ 최우선. blob cluster/정렬 산술이 4K 에서만 깨질 수 있음. §21.2 의 kdev EINVAL 도 4K 정황 |
+| **디바이스 수** | 8 | 2 | ★ blob 이 여러 디바이스에 걸칠 때만? |
+| **bdev_roles** | 없음(ram SCM + nvme data 분리) | `[wal,meta,data]` MD-on-SSD | ★ 메타데이터 위치가 다름 = VOS/blob 레이아웃 상이 |
+| disable_vfio | false(VFIO) | **true(UIO)** | 중. SPDK DMA 매핑 경로 상이 |
+| 하드웨어 | 베어메탈 실 NVMe | VM 가상 NVMe | 중(가상 디스크가 결함을 감출 수 있음) |
+| DAOS 빌드 | source `841487de8` | RPM `exastor.402.g64a818563` | 중. 커밋 미확인(로컬 트리에 없음 — fetch 필요) |
+| targets/helpers | 8/2 | 1/0 | **배제(§22.2)** |
+| provider | ofi+tcp | ofi+verbs;ofi_rxm | **배제(§15.5)** |
+| oclass | RP_2G4/RP_2G1 | RP_2G1 | **배제(§12.4)** |
+| SPDK 버전 | v26.01 | v26.01 | **동일** |
+
+## 22.4 다음 실험 순서
+
+1. **`bdev_roles: [wal,meta,data]` + 디바이스 2개**로 34.x 레이아웃 모방(우리 하드웨어).
+   clean 이면 "메타데이터 위치/디바이스 수" 축, 계속 손상이면 하드웨어(4K/실NVMe)로 좁혀진다.
+2. **`disable_vfio: true`(UIO)** 단일변수.
+3. **4K vs 512B**: 우리 SSD 를 512 B 포맷으로 재구성(`nvme format --lbaf`)하거나, 34.x 에
+   4K 가상 디스크를 붙여 재현 시도 — 이 축이 남으면 사실상 결정적.
+4. exastor RPM 커밋 `64a818563` fetch 후 `841487de8` 와 bio/vos/vea diff.
+
+환경 현재: **targets 1 / helpers 0, RP_2G1 컨테이너**로 두었다(손상률 10.6 % 로 재현이 빨라
+후속 A/B 에 유리). 8/2 복귀는 `/root/daos_server.yml.nvme-arm` 백업 참조.
