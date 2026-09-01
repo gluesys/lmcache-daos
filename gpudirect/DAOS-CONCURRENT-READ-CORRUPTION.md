@@ -1402,3 +1402,59 @@ targets 1 / helpers 0, `disable_vfio: true`, pool `p4k` 63 GB, 컨테이너 SX(�
   transient 유닛 `daos-srv4k`·`daos-agent4k`(둘 다 실행중), pool `p4k`, 컨테이너 `ci_obj`,
   `/root/{obj_integrity,obj_integrity.c,dh/}`, `libuuid-devel` 설치.
 - 사용자의 원본 `daos_server_nvme_blob.yml`·`daos_control_nvme_blob.yml` 은 **그대로 보존**.
+
+---
+
+# 24. 빌드 축 배제 — 34.x 의 커밋에 수정은 없다 (2026-09-02)
+
+§23.4-2 실행. `git fetch gitlab` 로 34.x RPM 의 커밋 **`64a818563b`**("ci(flexa): RPM 버전
+가드가 set -e 로 죽던 회귀 수정 (#400)")을 확보했다. 우리 빌드(`841487de8`) 대비
+**81 커밋 앞**(우리가 16 앞 — 분기 관계).
+
+## 24.1 데이터패스 diff
+
+| 경로 | 우리 → 34.x |
+|---|---|
+| **`src/bio`** | **완전 동일** (0 변경) |
+| **`src/vea`** | **완전 동일** (0 변경) |
+| `src/vos` | 15 files, 793+/56− |
+| `src/object` | 11 files, 398+/22− |
+| `src/common` | 5 files, 152+/1− |
+
+**§19 가 손상을 확정한 채움 경로(`bio_buffer.c`·`bio_bulk.c`·`vea_alloc.c`)는 두 빌드가
+바이트 동일하다.**
+
+vos/object 변경의 실체(커밋 로그 + diff 육안 확인):
+- **프로젝트 쿼터(Lustre projid)** 기능 일습 — `ic_projid`/`ic_proj_held` 추가,
+  `vos_update_begin()` 시그니처에 projid 추가, `ds_obj_reproject_handler()` 신규,
+  `DAOS_PROP_CO_SPACE_LIMIT/SPACE_AMP` 컨테이너 속성.
+- **flat-dkey 존재확인 fetch 크래시 가드**(`iod_nr == 0` 일 때 `ic_iods[0]` 역참조 방지) —
+  우리 워크로드는 항상 `iod_nr == 1` 이므로 무관.
+- DTX 커밋 블롭 ENOSPC 폴백 수정.
+
+데이터 이동 키워드(`biov|bio_iod|dma|bulk|blob|cluster`) 검색 결과 4건은 전부 주석 또는
+DTX 커밋 블롭(쿼터/ENOSPC) 문맥 — **fetch 데이터 흐름 변경 0건.**
+
+## 24.2 판정
+
+> **34.x 가 통과하는 이유는 빌드가 아니다.** 그 빌드는 손상 경로를 우리와 동일한 코드로
+> 갖고 있고, 추가된 것은 쿼터·크래시가드·DTX ENOSPC 뿐이다. "이미 고쳐진 버그" 프레임은
+> 성립하지 않으며, 상류 제출은 그대로 유효하다.
+
+## 24.3 남은 축은 하나 — 플랫폼
+
+§22(구성)·§23(섹터)·§24(빌드)가 모두 배제됐다. 남은 차이:
+
+| | 우리(손상 1.3~24 %) | 34.x(0/3520) |
+|---|---|---|
+| 플랫폼 | 베어메탈 EPYC, 다중 NUMA | **KVM VM, 단일 NUMA** |
+| 디스크 | 실 PASCARI NVMe(4 K/512 무관 — §23) | **QEMU 가상 NVMe** |
+| DMA 바인딩 | VFIO | **UIO (`disable_vfio: true`)** |
+
+**다음 실험 순서(개정)**
+1. **`disable_vfio: true`(UIO)** 를 우리 클러스터에 — 남은 축 중 유일하게 값싼 단일변수.
+   clean 이면 **VFIO/IOMMU DMA 매핑 경로**가 조건 → 상류 이슈의 재현 조건이 크게 좁혀진다.
+2. **34.31 에 우리 stockfull 서버 투입**(§23.4-3) — 이제 빌드가 배제됐으니 이 실험의 의미는
+   "같은 VM 에서 우리 빌드도 clean 인가" 확인(플랫폼 축 확정용 음성 대조).
+3. 실 NVMe vs 가상: 우리 클러스터에 `class: file`(sparse file) 로 가상 디스크 흉내 → clean 이면
+   실 NVMe 하드웨어/드라이버 상호작용으로 좁혀진다.
