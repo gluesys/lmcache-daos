@@ -1625,3 +1625,67 @@ fetch 채움 데이터를 조용히 오염시킨다. VM/가상 NVMe·파일 bdev
 ci_obj·ci_m28, 손상 0). 실 NVMe arm 복귀: `/root/daos_server.yml.nvme2dev`(2 디바이스 24 % arm)
 또는 `/root/daos_server.yml.nvme-arm`(8 디바이스 원본) 복원 후 VFIO 재바인딩·재포맷.
 34.31 에는 우리 빌드 서버(`daos-ours`)가 여전히 실행중 — 그들 구성 복귀는 `daos-srv4k` 유닛.
+
+---
+
+# 28. ★★★ DAOS 없는 SPDK 최소 재현기 — 깨끗함. 결함은 DAOS 의 SPDK 사용 방식에 있다 (2026-09-02)
+
+§27.3-3 실행. **DAOS 를 완전히 제거하고** SPDK userspace NVMe 드라이버로 같은 디바이스에
+직접 태그 I/O 를 하는 최소 프로그램을 작성했다 (`tests/spdk_nvme_tagio.c`).
+
+## 28.1 재현기 설계
+
+- SPDK `spdk_nvme_probe/attach` → 원시 namespace, 큐페어 워커당 1개,
+  `spdk_nvme_ns_cmd_write/read` 로 **4 MiB(=DAOS DFS chunk) 단위 I/O**.
+- 버퍼는 `spdk_zmalloc(..., SPDK_MALLOC_DMA)` 4 KiB 정렬 — DAOS 의 DMA chunk 와 같은 성격.
+- 페이로드는 DAOS 재현기와 같은 자기술 태그 `(region<<48)|(round<<40)|offset`,
+  목적지는 0xA5 로 poison, 워커마다 자기 LBA 영역(겹침 없음).
+- 빌드(cell1, DAOS 번들 SPDK 빌드 트리 사용) — 링크 조합이 까다로웠다:
+  `libspdk_{nvme,env_dpdk,util,log,json,jsonrpc,rpc,sock,trace,vfio_user,keyring,dma,thread}.a`
+  + DPDK `librte_{eal,ring,mempool,mbuf,pci,bus_pci,kvargs,telemetry,log,mempool_ring}.a`
+  + `-lisal`(crc). **`libspdk_nvmf` 는 넣지 말 것**(bdev/accel 의존을 끌어온다).
+
+## 28.2 결과 — 순수 SPDK 는 손상되지 않는다
+
+| 계층 | 디바이스 | 결과 |
+|---|---|---|
+| **순수 SPDK**(DAOS 없음), 8 큐 × 20 라운드 | 0000:02:00.0 | 0/160 |
+| **순수 SPDK**, 16 큐 × 40 라운드 ×3 | 0000:02:00.0 | **0/1920** |
+| **순수 SPDK**, 16 큐 × 40 라운드 | 0000:03:00.0 | **0/640** |
+| **DAOS**(같은 두 디바이스, 직후 복원해 측정) | 0000:02·03:00.0 | **172/1280 = 13.4 %** |
+
+sector 4096 정상 인식, I/O 오류 0. 즉 **같은 하드웨어·같은 SPDK 드라이버·같은 VFIO 경로에
+같은 크기(4 MiB) 다중 큐 read 를 해도 SPDK 단독으로는 깨끗**하고, 그 위에 DAOS 를 올리면
+13 % 가 깨진다.
+
+## 28.3 판정 — §27 의 해석을 정정한다
+
+§27 은 "`class:file` 이 깨끗 ⇒ 실 NVMe DMA 구간의 결함"이라 했다. §28 은 그 결론을 **좁힌다**:
+
+> **실 NVMe + SPDK + VFIO 자체는 무결하다. 결함은 DAOS 가 그 위에서 하는 것 —
+> blobstore/bio 가 실 NVMe 경로에서만 드러내는 무언가 — 에 있다.**
+
+두 사실을 함께 놓으면:
+- `class:file`(SPDK aio bdev) 깨끗, `class:nvme`(SPDK nvme bdev) 손상 → **bdev 계층 아래
+  nvme 전용 경로**가 조건.
+- 순수 SPDK nvme 드라이버 직접 사용 깨끗 → **드라이버 자체가 아니라 DAOS 의 사용 방식**.
+
+⇒ 남은 후보가 아주 좁아졌다: **SPDK *blobstore*(`spdk_blob`)가 nvme bdev 위에서 하는
+cluster 매핑/IO 분할**, 그리고 그것을 쓰는 **DAOS bio 의 blob I/O 경로**
+(`bio_blob_rw`/`nvme_rw` → `spdk_blob_io_read`). 파일 bdev 에서는 같은 blobstore 코드가
+깨끗하므로 "blobstore + nvme bdev(4 MiB·다중 큐·큰 cluster)" 조합에 국소화된다.
+
+## 28.4 다음 실험 (개정)
+
+1. **SPDK blobstore 계층 최소 재현기** — `spdk_bs_init/spdk_blob_io_read` 로 blob 을 만들어
+   4 MiB 태그 I/O(다중 채널). DAOS 없이 **blobstore 만** 시험한다. 손상되면 **SPDK 프로젝트
+   이슈로 확정**(제출처 변경), 깨끗하면 DAOS bio 의 blob 사용 방식으로 최종 확정.
+   → `hello_blob` 예제가 이미 빌드 트리에 있어 골격 재활용 가능.
+2. `bdev_nvme` 계층(`bdevperf` + 검증 옵션)으로 중간 계층 확인.
+3. DAOS 측: `nvme_rw()` 에 요청 LBA/길이/blob 오프셋 로깅을 넣어 손상 chunk 의 blob→LBA
+   매핑이 다른 blob 과 겹치는지 직접 확인(§19 계측의 확장).
+
+## 28.5 환경
+현재 **실 NVMe 2 디바이스 DAOS arm 복원**(양 rank Joined, pool gdspool 100 GB,
+컨테이너 ci_obj, 13 % 재현 확인). SPDK 재현기는 cell1 `/tmp/spdk_nvme_tagio`(소스는 레포
+`tests/spdk_nvme_tagio.c`). SPDK 단독 실행 시 DAOS 를 정지해야 한다(디바이스 배타 점유).
