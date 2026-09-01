@@ -1177,3 +1177,59 @@ vs `kdev`(커널 블록)**. 우리 §19 결론(손상 = NVMe→DMA 채움, 즉 b
   강등 — 대신 **class kdev A/B** 가 1순위.
 - 34.x 는 이전 세션이 "대조군으로 쓰지 말라"던 CI(35.x)와 같은 계열(VM·verbs·targets1·zvol)
   이나 IP·빌드가 다름. verbs 라서가 아니라 **kdev·1-target 이라 안 나는 것**으로 재해석.
+
+---
+
+# 21. class:kdev A/B — arm A 확정, arm B 는 구성 장벽으로 미완 (2026-09-01)
+
+§20 의 1순위 실험(`class: nvme` → `kdev` 단일변수)을 시도했다. **결론: arm B 를 우리 하드웨어에
+세울 수 없었다.** 원인 격리는 진전 없음, 대신 계측의 적용 범위와 kdev 구성 요건을 배웠다.
+
+## 21.1 arm A (class:nvme) 기준선 — 같은 세션 대조로 확보
+
+| 워크로드 | 클라이언트 손상 | 서버 FILLHASH(실손상) |
+|---|---|---|
+| obj_integrity ×8 (16×40) | **67/5120** | **171건** (cell1 108 + cell2 63) |
+| dfs_integrity ×6 (16×40) | 148/3840 | **0건** |
+
+**중요 — FILLHASH 는 obj_integrity 에만 유효하다.** 계측이 `oid.lo = 0xC0FFEE00+tid` 센티넬로
+기대 tid 를 얻으므로, DFS 객체(센티넬 없음)에서는 조용히 건너뛴다. DFS 손상 148건에 FILLHASH
+0건인 것은 "DFS 는 채움이 정상"이 아니라 **검사 미적용**이다. §19 의 결론은 obj 경로 실측이라
+그대로 유효하되, DFS 경로의 채움 단계 검증은 별도 계측이 필요하다(오해 방지).
+
+**오탐 1종 확인**: `foreign=0 zero=1 offbad=0` 은 t0 객체 offset 0 의 첫 워드가
+`tag_of(0,0,0)==0` 이라 0 과 구별되지 않는 것 — 진짜 손상 아님. 집계에서 제외해야 한다.
+
+## 21.2 arm B (class:kdev) — 세우지 못함
+
+시도한 것과 각 단계의 벽:
+
+1. vfio → 커널 드라이버 복귀(setup.sh reset), by-id 경로 8개 확인 → OK.
+2. yml `class: nvme` → `class: kdev` + `bdev_list:[by-id 8개]` (targets 8 유지) → 기동 시
+   `bio_xstream.c:584 subsys_init_cb() subsystem init failed: -22`(EINVAL) →
+   `failed to init bdevs: DER_INVAL`.
+3. 로그의 `bdev_name2roles() bdev name:AIO_cell1_N_1_0, bdev role:0` 을 근거로 34.x 처럼
+   `bdev_roles: [wal, meta, data]` 추가 → `SCM format required` 로 진행(MD-on-SSD 로 인식),
+   `control_metadata: path:` 도 추가 → 포맷은 8 디바이스 성공.
+4. 그러나 엔진은 여전히 `failed to init spdk context ... DER_INVAL(-1003)`.
+
+미해결 가설(다음 세션):
+- **4 KiB 논리 섹터**: 우리 NVMe 는 `logical_block_size=4096`, 34.x 는 512 B QEMU 디스크.
+  SPDK AIO 자체 검사(512 이상·2^n)는 통과하므로 상위(bio blob/cluster 정렬, WAL 요건)에서
+  거부되는 것으로 의심. `block_size` 명시 주입 경로가 DAOS yml 에 없음.
+- **8 디바이스에 wal+meta+data 동시 롤**: 34.x 는 디바이스 1~2개. 롤 분리(예: 1개 wal/meta,
+  나머지 data)로 재시도할 가치 있음.
+- `class: file`(sparse file bdev)로 대체하면 SPDK userspace NVMe 경로를 우회하면서 4K 문제를
+  피할 수 있어, **kdev 대신 file 로 같은 판별을 얻는 우회로**가 유력하다.
+
+## 21.3 판정과 다음 순서
+
+- §20 의 "kdev 가 clean 의 원인" 가설은 **여전히 미검증**. 34.x 는 교란요인(targets 1, VM,
+  512 B, 단일 디바이스, verbs, 다른 RPM)이 많아 정황 이상으로 못 쓴다.
+- 우선순위 재조정:
+  1. **`class: file` A/B** — SPDK userspace NVMe 우회를 4K 섹터 문제 없이 달성(파일 bdev).
+     clean 이면 §19 의 "채움 = SPDK NVMe read" 를 강하게 지지.
+  2. **targets 8 → 1** 단일변수(멀티타깃이 조건인지) — 구성 변경이 가벼움.
+  3. kdev 재도전: 롤 분리 + 디바이스 수 축소.
+- 환경은 **arm A(class:nvme)로 원복 완료**: 양 rank Joined, pool gdspool, ci_m28·ci_obj 재생성,
+  fillhash 계측 서버 유지. 백업 `/root/daos_server.yml.nvme-arm`(양 cell).
