@@ -919,3 +919,75 @@ zeros 변종의 해석도 정리된다: **hole 이 아니라 "아직 채워지�
 "클라이언트가 무엇을 하든(어느 API, 어느 캐시 설정, 어느 프로세스 구성) 무관하고, **어느
 전송이든**(ucx+rc_v RDMA, ofi+tcp 소켓) 재현되며, **tcpdump 가 서버 송신 페이로드에서 이미
 다른 객체의 바이트를 보여준다.** 서버 fetch 데이터패스 결함이다."
+
+---
+
+# 17. 서버 코드 감사 (2026-09-01) — 정상 경로는 무죄, 용의 구간은 "채움 이하"로 축소
+
+§16 의 wire 판정("서버가 송신 전에 만든다")을 들고 서버 fetch 데이터패스를 감사했다.
+대상 트리: `port/2.8-wsd`(현재 2.8 서버의 소스), `c87080a70`(지난주 2.9-gds 서버),
+upstream `3604d406ef`(2.8.0-rc3)·`841487de8`(2.9.100).
+
+## 17.1 소스 계보 발견 — 두 서버의 커스텀 패치는 서로소다
+
+| 서버 빌드 | upstream 대비 커스텀 변경 |
+|---|---|
+| 2.9-gds (`c87080a70`, 지난주 전체) | **cart**(crt_bulk rkey import 배관 +165)·object(플래그/텔레메트리). **bio·vos 무변경** |
+| 2.8-wsd (`port/2.8-wsd`, 오늘) | **bio**(WS-D hot staging +368)·**vos**(zfs-cap staging +3525)·vea 소폭. **cart 무변경** |
+
+두 빌드가 같은 서명으로 손상되므로 **커스텀 패치는 어느 쪽도 원인이 될 수 없다**(교집합 없음).
+⇒ 결함은 양쪽이 공유하는 것: **upstream 코어(bio/vos/vea/object), prereq(SPDK v26.01 — upstream
+자체 bump, mercury 2.4.1+패치 5종), 그리고 MD-on-SSD 구성.**
+
+주의: §12.1 의 "스톡" A/B 는 클라이언트만 스톡이었다(§12.8d 그대로). 서버까지 완전 upstream
+인 검증은 여전히 미실시 — 다만 위 서로소 논증이 그 필요성을 크게 줄인다.
+
+## 17.2 mercury/cart bulk 코어도 배제된다 (기존 증거 재해석)
+
+§12.5 의 엔진 로그 — **VOS aggregation 의 `csum_agg_verify()` 가 DER_CSUM 으로 실패** —
+aggregation 의 내부 읽기는 **mercury/cart/bulk 를 전혀 타지 않는다**(bio 로 직접 읽음).
+즉 순수 서버 내부 읽기에서 이미 깨진 데이터가 보였다. §16(전송 전 손상)과 합치면:
+
+> **손상은 "NVMe → DMA 버퍼 채움" 구간 또는 그 이하에서 발생한다.**
+> (VOS 주소해석 → VEA → bio nvme_rw → SPDK blob read → NVMe)
+
+(단서: 그 로그는 2.9-gds 시기의 것. 2.8 에서 agg-내부-읽기 손상은 아직 재확인 안 함.)
+
+## 17.3 정상 경로 검증 — 순서는 안전하다 (file:line)
+
+| 검증 항목 | 결과 |
+|---|---|
+| fetch bulk 동기 대기 | `obj_local_rw` 는 `obj_bulk_transfer(..., p_arg=NULL)` = sync. eventual 은 부분 실패 시에도 in-flight 전부를 기다림 (`srv_obj.c` obj_bulk_comp_cb/done: 경로) |
+| DMA 해제 시점 | `bio_iod_post_async()` 는 **UPDATE 전용**(`bio_buffer.c` "Async post is for UPDATE only") — fetch 는 bulk 완료 후 동기 해제 |
+| NVMe 채움 대기 | upstream·2.8-wsd 모두 `dma_rw()` 꼬리에서 `if (!bd_async_post) iod_dma_wait()` — fetch 는 `bio_iod_prep()` 반환 전에 채움 완료 |
+| DMA 예약 산술 | `chunk_reserve()`/`dma_map_one()` 은 yield 없이 원자적(xstream 당 협조적 스케줄링) — 이중 예약 창 없음 |
+| WS-D 활성 여부 | hot_pool 미구성 → `bd_hot_ctxt == NULL` → plain 경로. `dma_rw_mixed` 미사용 |
+
+"send-before-fill" 가설(§16 말미)은 **정상 경로에서는 기각** — 순서 보장이 코드에 있다.
+
+## 17.4 남은 용의자 (순위·근거·판별 실험)
+
+**S1. SPDK v26.01 blobstore read** — 상류가 최근 bump 한 새 의존성(DAOS-18943, #18172),
+양 빌드 공유. cluster map 이 stale/경합이면 **미할당 cluster 읽기 = zeros, 잘못된 cluster =
+foreign** — 두 변종이 한 기전으로 설명되는 유일한 후보. 내부 읽기(aggregation)도 같은 경로.
+→ 판별: prereq 만 SPDK v25.x 로 내려 재빌드 A/B (엔진 재빌드 필요, cell1 에서 가능).
+
+**S2. VEA 이중 할당/extent 겹침** — foreign 을 설명하나, at-rest 가 대체로 깨끗한 것(지속성
+없음)과 부딪힘. → 판별: VEA free/alloc 에 겹침 assert 를 넣은 debug 빌드.
+
+**S3. VOS evtree 주소의 일시적 오해석**(동시 overwrite 하) — stale-round 변종은 설명하지만
+**타 객체 데이터는 구조적으로 설명 불가**(evtree 는 객체별). 하위 순위.
+
+**S4. bio 채움 후 clobber** — 예약 산술은 결백 판정. 하위 순위.
+
+**최우선 판별 실험(차기 세션): `bio_iod_prep()` 반환 직후 chunk 내용 해시**(서버 debug 빌드,
+계획서 §5.2 의 S1 지점 하나면 충분해졌다 — §16 이 C1~C3 를, §17.2 가 S2/S3 를 제거).
+- 해시가 이미 틀림 → S1/S2 (채움 이하) 확정 → SPDK 다운그레이드 A/B 로 분기
+- 해시가 맞음 → S4 재부상 (채움 후 clobber)
+
+## 17.5 감사 범위의 한계 (정직 고지)
+
+- `bio_bulk.c` 의 bulk-group 예약 경로(`bulk_map_one`)는 정독하지 못했다 — 단 bypass arm
+  (§15.3)이 그 경로 없이도 손상됐으므로 단독 원인은 아니다.
+- VEA 내부(aging/reuse 창)와 SPDK blobstore 소스는 미감사 — S1/S2 판별 실험이 먼저다.
+- 2.8 서버에서 agg-내부-읽기 손상 재확인(§17.2 단서) 미실시.
