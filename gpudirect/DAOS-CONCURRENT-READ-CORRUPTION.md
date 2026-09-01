@@ -465,3 +465,109 @@ wire 포맷 차이 때문일 가능성은 배제했다: 패치 mercury 와 스�
 | "쓰기 동시성만으로 at-rest 가 깨진다" | `-N -V 3` 깨끗 |
 | "aggregation 이 원인일 수 있다"(§12.8 초판, 0/737) | 검정력 있게 재시험하니 기각 — 실패가 버스트로 오고 순서를 뒤집으면 차이가 사라진다 |
 | "쓰기+읽기 혼합이 필요조건"(§12.3) | 덮어쓰기 세대를 쌓으면 **단일 스레드로도** 재현(§12.8b, 단 열화된 풀에서 관측) |
+
+---
+
+# 13. 2.8.0-rc3 에서도 동일하다 (2026-09-01, 서버 reformat 실측)
+
+질문: "2.8-rc3 에서도 동일할까?" — **동일하다.** 추론이 아니라 같은 하드웨어·토폴로지·provider
+에서 서버를 2.8.0-rc3 로 되돌려 측정했다(사용자 승인 후 gdspool 파기).
+
+## 13.1 왜 2.8-rc3 인지, 무엇이 같은 코드인지
+
+`port/2.8-wsd` 와 `verify/2.8-rc3-zoneinstr` 둘 다 `TAG=2.8.0-rc3`(상류 `3604d406ef`).
+2.8.0-rc3 ↔ 2.9.100(`841487de8`) diff:
+
+| 경로 | 차이 |
+|---|---|
+| `src/client/array/dc_array.c` — DFS 읽기를 chunk 로 쪼개는 곳 | **동일** |
+| `src/vos/vos_aggregate.c` | **동일** |
+| `src/vos/vos_csum_recalc.c` — DER_CSUM 을 찍는 함수 | **동일** |
+| `src/bio/` 전체 | **동일** |
+| `src/object/srv_obj.c` | 24+/74− |
+| `src/vos/vos_io.c` | 36+/14− |
+| `src/cart/` (crt_hg·crt_bulk 등) | 1128+/1079− |
+
+즉 손상 신호를 만드는 코드는 두 버전이 같고, 크게 바뀐 건 전송 계층뿐이다.
+
+## 13.2 전환 절차 (그대로 재현 가능)
+
+양 cell 에 **2.8.0-rc3 RPM 이 이미 설치돼 있었다**(`daos-server-2.8.0-4.el8`, `/usr/bin`).
+`/opt/daos`(소스빌드 prefix)와 RPM 은 **build-id 동일**(libdaos `8e52765f`, libdfs `54290720`)
+— stripped 여부만 다르므로 클라(prefix)와 서버(RPM)가 같은 빌드다. §8-3 의 불일치 함정 회피.
+
+1. 설정 백업: `/root/daos-cfg-backup-2.9/`(양 cell), `/root/daos-agent-unit-2.9.bak`(client-5)
+2. client-5 agent 정지 → 양 cell `systemctl stop daos_server`
+3. drop-in 을 `/usr/bin/daos_server` 로 교체 + `daemon-reload`
+4. 2.9 메타데이터 제거: `/var/daos/control_meta/daos_control/control_raft`, `/mnt/daos0/*`,
+   root shmem `ipcrm` → **여기서 풀이 파기된다**
+5. 기동 → `dmg -i storage format`(cell1) + **`dmg -i -l 10.100.230.82 storage format`**(cell2 는
+   명시 필요) → 양 rank Joined
+6. `dmg -i pool create gdspool --scm-size=8G --nvme-size=200G` (416 GB)
+7. client-5: cell1 `/opt/daos` 를 **같은 경로로** rsync, `libna_plugin_ucx.so`→`/usr/lib64/mercury`,
+   `/lib64/ucx` 심볼릭, agent unit 을 `/opt/daos` 로 sed 후 재시작
+8. 재현기 재빌드: `gcc ... -I/opt/daos/include -L/opt/daos/lib64 ... -o dfs_integrity_28`
+
+**SPDK wedge 는 일어나지 않았다** — format 이 한 번에 통과했다(§8-1 은 재시작 일반론이고, 이번
+전환에서는 문제 없었다).
+
+## 13.3 실측 (2.8.0-rc3, 갓 포맷한 풀, provider ucx+rc_v, RP_2G4/4 MiB)
+
+**정상상태에서 2.9.100 과 같은 범위다:**
+
+| arm | 2.8.0-rc3 | 2.9.100 (동일 프로토콜) |
+|---|---|---|
+| mixed 쓰기+읽기 16 스레드 (16×40 ×8) | **68/5120 = 1.33 %** | 34/5120 스톡=0.885 %, 25/5120 패치=0.651 % |
+| mixed, payload 오프셋 0(정렬) — 교대 A/B | 19/5120 = 0.37 % | (미측정) |
+| mixed, payload 오프셋 36(straddling) — 교대 A/B | 35/5120 = 0.68 % | 0.65–0.89 % |
+| read-only 동시성(조용히 쓴 뒤 읽기만) — 안정화 후 | 0/3840 | 0/4320 |
+| 단일 스레드·단일 객체 mixed | 0/100 | 0/150 |
+
+서명도 같다: 4 MiB 한 chunk 가 **같은 오프셋의 다른 객체 데이터**, 또는 같은 객체의 다른
+오프셋 데이터(`own data from offset N (-20971520)`), 드물게 stale round.
+
+⇒ **결함은 2.9 에서 새로 생긴 것도, GPU-direct 백포트가 만든 것도 아니다.** 2.8/2.9 공용
+코드(§13.1)에 있다.
+
+## 13.4 포맷 직후 과도 구간 — 훨씬 심하다 (기록용, 재현 실패)
+
+포맷 후 첫 1시간 동안은 비율이 자릿수로 달랐다:
+
+- 첫 smoke test(4 스레드×3): **8/12 = 67 %**
+- 조용한 대조군(동시성 전무, 16 객체 단일 스레드 쓰기→읽기): **10~13/16 객체 오류** — 2.9 에서는
+  이 arm 이 항상 깨끗했다
+- read-only 동시성 8회 연속: **275 → 181 → 152 → 133 → 96 → 57 → 29 → 0 /640** (단조 감소)
+
+이후 같은 arm 들이 재현되지 않았다(read-only 0/3840, 조용한 대조군 clean 3회). 덮어쓰기를
+반복하면 "치유"되는 초기 상태 의존 현상으로 보이며, **mixed load 로 다시 유도되지 않았다**
+(cycle 3회: read-only before/after 모두 0/640). 원인 미규명 — 상류에 붙일 만한 관측이지만
+현재 상태로는 주장하지 말 것.
+
+## 13.5 정렬(alignment)은 완화책이 아니다
+
+한 번의 측정에서 straddling 25.5 % 대 aligned 5.5 % 가 나와 완화책처럼 보였으나, **교대 A/B
+5120 읽기씩**으로 다시 재면 **0.68 % 대 0.37 %** 로 줄어든다(런별로 13:0, 0:11, 2:15 처럼
+뒤집힘). 약한 경향은 있으나 버스트를 감안하면 결정적이지 않다 → **§3 의 "정렬 무관" 판정 유지.**
+KV 커넥터 페이로드를 chunk 정렬해도 해결되지 않는다.
+
+## 13.6 과거 "2.8 + UCX 무결 30/30" 판정에 대하여
+
+그 판정(Hub v4)은 `tests/test_manyread.py` — 30개 객체를 각각 **한 바이트를 반복한 값**으로
+채워 순차 읽기·md5 비교하는 테스트였다. 두 가지 이유로 결함 부재의 근거가 못 된다:
+
+1. **검정력**: 이번에 측정된 정상상태 비율(0.4~1.3 %/읽기)이면 30 읽기가 전부 통과할 확률이
+   67~89 %, 3회 반복 전부 통과도 30~70 % 다.
+2. **상수 채움의 맹점**: 이번 2.8 실측 실패 중에는 `own data from offset N` (같은 객체의 다른
+   오프셋 조각)이 섞여 있다. 객체 전체가 같은 바이트면 **그 유형은 원리적으로 검출 불가**다.
+
+**교훈: 무결성 검증 페이로드는 위치·객체를 식별하는 태그여야 한다**(`tests/dfs_integrity.c`의
+8바이트 태그). 상수/난수 한 덩어리로는 이 결함의 일부가 보이지 않는다.
+
+## 13.7 현재 환경 상태
+
+- cell1/cell2: **DAOS 2.8.0-rc3**(`/usr/bin`, RPM) 실행 중, 양 rank Joined, pool `gdspool`
+  416 GB(SCM 8 G/rank + NVMe 200 G/rank), 컨테이너 `ci_plain ci_quiet ci_a0 ci_a36 ci_m28`
+- client-5: `/opt/daos`(2.8 클라), agent unit 도 2.8, 재현기 `/root/dfs_integrity_28`
+- 2.9 설치본은 **그대로 보존**: `/opt/daos-gds`(서버), `/opt/daos-gds-gpu`, `/var/daos-stockfull`
+- **2.9.100 으로 되돌리려면**: drop-in 을 `/opt/daos-gds/bin/daos_server` 로 복원(백업 있음) →
+  §13.2 의 4~6 단계 반복(= 2.8 풀 파기, 테스트 데이터뿐) → client-5 agent unit 복원

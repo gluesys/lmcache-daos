@@ -144,6 +144,8 @@ tests/            게이트 테스트 + 마이크로벤치 (DAOS 필요)
 bench/            클라이언트측 측정 하네스 (vLLM+LMCache E2E)
 deploy/           ★ 환경 재구성 — 런처·Containerfile·설정·호스트 스냅샷
 gpudirect/        dfs_*_gpu() 스택 — DAOS/UCX/Mercury 패치와 3단 검증 도구
+doc/              그림(figures/)과 상류 조사 문서
+                    lmcache-mp-l2-assessment.md  LMCache MP 모드 L2 어댑터 평가
 ```
 
 **환경을 다시 세우려면 [`deploy/README.md`](deploy/README.md) 를 먼저 읽을 것.**

@@ -895,6 +895,207 @@ def fig_code():
             fontsize=6.6, color="#a8a8a8", va="bottom")
     return fig
 
+
+# ----------------------------------------------------------------- Figure 5
+def fig_mp():
+    """현재 in-process 커넥터 경로 vs LMCache MP 모드 L2 어댑터 경로 — 복사 계수."""
+    fig, ax = newax((15.2, 9.6))
+
+    ax.text(2.0, 97.8, "그림 5.  LMCache MP 모드 L2 어댑터로 옮기면 복사가 늘어나는가",
+            fontsize=12.6, color=INK, fontweight="bold", va="top")
+    ax.text(2.0, 94.6, "결론: 늘지 않는다 — SHM 전송 컨텍스트가 켜져 있고 어댑터가 호출자 버퍼에 "
+                       "직접 쓰는 한.  근거는 LMCache v0.5.2 소스.",
+            fontsize=8.4, color=GREY, va="top")
+
+    def cbadge(x, y, n, label, col=ACC):
+        ax.add_patch(Circle((x, y), 1.25, fc="white", ec=col, lw=1.2, zorder=6))
+        ax.text(x, y - 0.05, str(n), ha="center", va="center", fontsize=7.0,
+                color=col, fontweight="bold", zorder=7)
+        ax.text(x, y - 2.2, label, ha="center", va="top", fontsize=6.3, color=col)
+
+    # ================= A. 현재 경로
+    box(ax, 2.0, 58.0, 46.0, 33.0, fill="white", edge="#c9c6c0")
+    ax.text(3.6, 89.4, "A. 현재 — in-process RemoteConnector", fontsize=9.4,
+            color=INK, fontweight="bold", va="top")
+    ax.text(3.6, 86.4, "커넥터가 vLLM 워커 프로세스 안에서 직접 호출된다",
+            fontsize=6.8, color=GREY, va="top")
+
+    box(ax, 4.0, 62.0, 11.0, 12.0, title="DAOS", ts=8.6, tal="center",
+        ha_body="center", ls=6.4, fill=FILL2,
+        lines=[("container", "m"), ("kv2s16", "m"), ("", "k"), ("28 MiB 청크", "k")])
+
+    box(ax, 18.5, 60.5, 28.0, 22.5, fill="#fbfaf8", edge=ACC, lw=1.3, dash=(0, (4, 2)))
+    ax.text(19.9, 81.6, "vLLM 워커 프로세스", fontsize=7.6, color=ACC,
+            va="top", fontweight="bold")
+    box(ax, 20.0, 71.5, 25.0, 8.4, title="LMCache 엔진 + DaosConnector", ts=7.6,
+        ls=6.3, fill="white", edge="#b7cad9",
+        lines=[("local_cpu_backend.allocate() 로 목적지 생성", "k"),
+               ("dfs_sys_read 가 그 버퍼에 직접 write", "k")])
+    box(ax, 20.0, 66.6, 25.0, 4.0, title="MemoryObj  (LocalCPUBackend, CPU)",
+        ts=7.4, tal="center", fill=FILL)
+    box(ax, 20.0, 61.4, 25.0, 3.8, title="GPU KV cache", ts=7.6, tal="center",
+        fill=FILL2)
+
+    arrow(ax, (15.2, 68.0), (19.8, 74.0), col=ACC, lw=1.5, ms=8)
+    cbadge(16.4, 72.6, 1, "")
+    arrow(ax, (32.5, 66.5), (32.5, 65.3), col=ACC, lw=1.5, ms=8)
+    cbadge(37.2, 65.9, 2, "")
+    ax.text(38.8, 65.9, "c_ops H2D", fontsize=6.3, color=GREY, va="center")
+
+    ax.plot([3.6, 46.4], [59.9, 59.9], color="#d6d3ce", lw=0.8)
+    ax.text(3.6, 59.2, "복사 2회 = ① 호스트 착지(RDMA write) + ② H2D.  "
+                       "파이썬 레벨 복사는 0.", fontsize=6.6, color=INK, va="top")
+
+    # ================= B. MP 경로
+    box(ax, 51.0, 58.0, 47.0, 33.0, fill="white", edge=ACC, lw=1.3)
+    ax.text(52.6, 89.4, "B. MP 모드 — L2 어댑터 + SHM 전송 컨텍스트", fontsize=9.4,
+            color=INK, fontweight="bold", va="top")
+    ax.text(52.6, 86.4, "L1 풀이 두 프로세스가 함께 매핑하는 POSIX shm 이다",
+            fontsize=6.8, color=GREY, va="top")
+
+    box(ax, 52.6, 62.0, 10.0, 12.0, title="DAOS", ts=8.6, tal="center",
+        ha_body="center", ls=6.4, fill=FILL2,
+        lines=[("container", "m"), ("", "k"), ("(DAOS L2", "k"), ("어댑터)", "k")])
+
+    # 두 프로세스
+    box(ax, 65.5, 74.5, 15.0, 8.6, fill="#fbfaf8", edge="#bdbab5", lw=1.0,
+        dash=(0, (4, 2)), title="LMCache 서버", ts=7.4, ls=6.2,
+        lines=[("StoreController", "m"), ("PrefetchController", "m")])
+    box(ax, 82.0, 74.5, 14.5, 8.6, fill="#fbfaf8", edge=ACC, lw=1.2,
+        dash=(0, (4, 2)), title="vLLM 워커", ts=7.4, ls=6.2,
+        lines=[("shm 매핑 + cudaHostRegister", "k"), ("H2D 수행", "k"),
+               ("받는 것은 디스크립터뿐", "k")])
+    arrow(ax, (80.6, 76.4), (81.8, 76.4), col=GREY, lw=1.0, ms=7)
+
+    # L1 shm 밴드
+    box(ax, 65.5, 65.2, 31.0, 5.6, fill="#e6eef5", edge=ACC, lw=1.4,
+        title="L1 풀  =  POSIX shm  (lmcache_l1_pool_*)", ts=7.6, tal="center",
+        ha_body="center", ls=6.2,
+        lines=[("서버가 만들고 워커가 같은 세그먼트를 매핑 · cudaHostRegister 로 핀", "k")])
+    for x0 in (67.5, 94.0):
+        ax.plot([x0, x0], [74.4, 70.9], color=ACC, lw=1.0, ls=(0, (2, 2)), zorder=3)
+
+    box(ax, 65.5, 60.4, 31.0, 3.8, title="GPU KV cache", ts=7.6, tal="center",
+        fill=FILL2)
+
+    arrow(ax, (62.8, 68.0), (65.3, 68.0), col=ACC, lw=1.5, ms=8)
+    cbadge(64.0, 71.0, 1, "")
+    ax.text(79.0, 72.6, "submit_load_task(keys, objects)  →  objects = L1 슬롯",
+            fontsize=6.1, color=GREY, ha="center", va="center")
+    arrow(ax, (81.0, 65.1), (81.0, 64.3), col=ACC, lw=1.5, ms=8)
+    cbadge(85.5, 64.7, 2, "")
+
+    ax.plot([52.6, 96.4], [59.9, 59.9], color="#d6d3ce", lw=0.8)
+    ax.text(52.6, 59.2, "복사 2회 — 동일.  프로세스 경계는 shm 매핑으로 넘으므로 "
+                        "추가 복사가 없다.", fontsize=6.6, color=INK, va="top")
+
+    # ================= C. pickle 폴백
+    ty = box(ax, 2.0, 33.0, 30.0, 22.0, title="C. 함정 — pickle 폴백이면 복사 +2",
+             ts=9.0, fill="#fbf9f5", edge=WARN, lw=1.2)
+    yy = ty
+    for t, f in [("_compute_shm_pool_info() 가 빈 풀을 돌려주는 조건", "k"),
+                 ("  · shm_name 이 비었을 때", "k"),
+                 ("  · use_lazy 가 켜졌을 때", "m"),
+                 ("  · devdax_path 가 설정됐을 때", "m"),
+                 ("", "k"),
+                 ("→ 전송이 EngineDrivenContextPickle 로 떨어진다", "k"),
+                 ("   store   : 청크를 pickle 직렬화 후 COMMIT_STORE", "k"),
+                 ("   retrieve: 받은 바이트를 역직렬화", "k"),
+                 ("", "k"),
+                 ("복사 4회 (직렬화 버퍼 + 역직렬화 텐서 추가).", "k"),
+                 ("MP 모드에서 복사가 실제로 늘어나는 유일한 경로이고,", "k"),
+                 ("설정 실수로 조용히 빠질 수 있다 → 측정 전 체크 대상.", "k")]:
+        ax.text(3.6, yy, t, fontsize=6.4, color=(WARN if t.startswith("복사 4") else GREY),
+                va="top", family=_fam(t, f))
+        yy -= 6.4 * 0.145 + 0.5
+
+    # ================= D. 인터페이스 비교
+    ty = box(ax, 34.5, 33.0, 63.5, 22.0,
+             title="D. 두 확장점의 차이  (RemoteConnector = 우리가 구현한 것)", ts=9.0,
+             fill="white", edge="#c9c6c0")
+    rows = [
+        ("호출 위치", "vLLM 워커 프로세스 안", "별도 LMCache 서버 (컨트롤러 스레드 2개)"),
+        ("API 형태", "async def get / put / exists / list", "submit_* → query_* / pop_* (논블로킹)"),
+        ("완료 통지", "await", "eventfd 3개 (store / lookup / load)"),
+        ("버퍼 소유", "커넥터가 allocate() 해서 반환", "호출자가 준다 — 어댑터는 수명 관리 금지"),
+        ("오류 단위", "청크당 None", "store=태스크, lookup·load=키별 Bitmap"),
+        ("잠금", "없음", "lookup_and_lock / submit_unlock"),
+        ("용량·축출", "list() + remove_sync(), 정책 없음", "get_usage / list_l2_keys / L2EvictionPolicy"),
+        ("다중 백엔드", "하나", "--l2-adapter 반복 = 캐스케이드"),
+        ("키", "CacheEngineKey → sha256 (복원 불가)", "ObjectKey (model/rank/group/hash/salt)"),
+        ("out-of-tree", "plugin:// 스킴", "plugin_l2_adapter (동적 로드)"),
+    ]
+    yy = ty - 0.3
+    ax.text(36.0, yy, "항목", fontsize=6.5, color=ACC, va="top", fontweight="bold")
+    ax.text(48.0, yy, "RemoteConnector", fontsize=6.5, color=ACC, va="top",
+            fontweight="bold")
+    ax.text(72.5, yy, "L2AdapterInterface", fontsize=6.5, color=ACC, va="top",
+            fontweight="bold")
+    yy -= 1.9
+    for a, b, c in rows:
+        ax.text(36.0, yy, a, fontsize=6.3, color=INK, va="top")
+        ax.text(48.0, yy, b, fontsize=6.3, color=GREY, va="top", family=_fam(b, "m"))
+        ax.text(72.5, yy, c, fontsize=6.3, color=GREY, va="top", family=_fam(c, "m"))
+        yy -= 1.62
+
+    # ================= E. 미해결 항목 대응
+    ty = box(ax, 2.0, 3.0, 46.0, 28.0,
+             title="E. 우리 미해결 항목이 L2 인터페이스에서 어떻게 되는가", ts=9.0,
+             fill="white", edge=ACC, lw=1.2)
+    yy = ty - 0.2
+    for a, b in [("스트리밍 / read⊕H2D 오버랩", "submit + eventfd + 태스크별 조회로 표현 가능"),
+                 ("  (우리 stream_get 은 호출자가 없었다)", ""),
+                 ("용량 정책 부재", "get_usage · list_l2_keys · L2EvictionPolicy 훅"),
+                 ("list() 이름의 키 복원 불가", "ObjectKey 가 구조적이라 문제 자체가 없음"),
+                 ("청크별 오류 보고", "Bitmap 으로 키 단위 성공/실패"),
+                 ("_drop_put_ref 참조 카운트", "호출자가 버퍼를 주므로 소유권 다툼 소멸"),
+                 ("무복사 read (우리가 얻은 것)", "obj.byte_array 에 직접 write — 그대로 유지"),
+                 ("", ""),
+                 ("L1 공유의 부수 효과", "같은 노드의 다른 클라이언트·재시작 프로세스가"),
+                 ("", "L2 를 다시 읽지 않는다 (복사 감소 아니라 요청 감소)"),
+                 ("", ""),
+                 ("옮겨도 그대로인 것", ""),
+                 ("DAOS 동시 읽기 손상", "인터페이스와 무관 — DAOS 내부 결함"),
+                 ("진짜 batch RPC 부재", "여전히 청크당 객체 1개 → dkey/akey 필요"),
+                 ("DFS chunk 규칙", "그대로 적용 (파일크기 ÷ 랭크당 타깃수)"),
+                 ("파이썬 스레드풀", "어댑터도 blocking libdfs 를 스레드로 감싼다")]:
+        if a:
+            ax.text(3.6, yy, a, fontsize=6.4, color=INK, va="top")
+        if b:
+            ax.text(23.0, yy, b, fontsize=6.4, color=GREY, va="top")
+        yy -= 6.4 * 0.145 + 0.52
+
+    # ================= F. 조건과 비용
+    ty = box(ax, 51.0, 3.0, 47.0, 28.0, title="F. 조건 · 비용 · 판단", ts=9.0,
+             fill=FILL, edge="#c9c6c0")
+    yy = ty - 0.2
+    for t, c in [("성립 조건 3개", INK),
+                 ("1. SHM 전송 컨텍스트 활성 (C 의 함정을 피할 것)", GREY),
+                 ("2. byte-array 어댑터로 호출자 버퍼에 직접 write", GREY),
+                 ("3. GDS L1(--gds-l1-path) 과는 병용 불가 — 문서 명시.", GREY),
+                 ("   DAOS 에 cuFile 드라이버가 없으니 실질 제약은 아니다", GREY),
+                 ("", GREY),
+                 ("늘어나는 비용", INK),
+                 ("· RPC 왕복 (PREPARE/COMMIT) — 청크당이 아니라 요청당", GREY),
+                 ("  상수 항으로 보이나 미측정", WARN),
+                 ("· 별도 프로세스 운영 · 어댑터 재작성 (상류 800~1,300줄)", GREY),
+                 ("· 파이썬 RemoteConnector → L2 브리지는 없다.", GREY),
+                 ("  native_connector_l2_adapter 는 C++ pybind 전용", GREY),
+                 ("", GREY),
+                 ("판단", INK),
+                 ("Phase 5 방향으로는 RemoteConnector 개선보다 낫다.", GREY),
+                 ("단 DAOS 동시 읽기 손상이 해소되기 전에는 어느", WARN),
+                 ("인터페이스로 붙여도 결과가 같으므로 착수 이유가 없다.", WARN)]:
+        ax.text(52.6, yy, t, fontsize=6.4, color=c, va="top",
+                fontweight=("bold" if c == INK and t else "normal"))
+        yy -= 6.4 * 0.145 + 0.52
+
+    ax.text(2.0, 1.2, "근거: LMCache v0.5.2 sdist — transfer_context/shm.py · "
+                      "multiprocess/engine_context.py · distributed/l2_adapters/base.py · "
+                      "docs/source/mp/l2_storage/.  상세는 doc/lmcache-mp-l2-assessment.md",
+            fontsize=6.6, color="#a8a8a8", va="bottom")
+    return fig
+
 OUT = os.path.dirname(os.path.abspath(__file__))
 FIGS = {
     "arch": (fig_arch, "fig1_lmcache_daos_architecture"),
@@ -902,6 +1103,7 @@ FIGS = {
     "bed": (fig_bed, "fig2_lmcache_daos_testbed"),
     "why": (fig_why, "fig3_why_daos_for_kvcache"),
     "code": (fig_code, "fig4_mr6_code_structure"),
+    "mp": (fig_mp, "fig5_mp_l2_vs_connector"),
 }
 
 want = sys.argv[1:] or list(FIGS)
