@@ -360,7 +360,7 @@ def fig_bed():
         ("retrieve (단일 요청)", "19.4 GB/s"),
         ("집계 (concurrency 4)", "20.9 GB/s"),
         ("raw sustained read (chunk 4 MiB)", "34.5 GB/s"),
-        ("데이터 무결성 (28 MB x 30)", "30/30   (verbs 3-10/30)"),
+        ("UCX 판정 (28 MB x 30)", "30/30   (verbs 3-10/30)"),
         ("크로스노드 재사용 (client-7)", "149/149 hit · avg 444 ms"),
         ("GPUDirect (GDR) 상한", "21.3 GB/s  → +10%, 종료"),
         ("남은 최대 레버 — 스트리밍 청크 전달", "1.73x  (상류 변경 필요)"),
@@ -626,7 +626,7 @@ def fig_why():
         ("hit TTFT — 컨텍스트 127K", "2129 ms  (recompute 대비 11.8x)"),
         ("long-doc-qa 100 GB / 12 inflight", "avg 371 ms · 21.36 GB/s (11.7x)"),
         ("Hub v4 최종 TTFT 배수", "17.7x  (158 ms vs 2812 ms)"),
-        ("데이터 무결성 (28 MB x 30)", "30/30  (libfabric 3-10/30)"),
+        ("UCX 판정 (28 MB x 30)", "30/30  (libfabric 3-10/30)"),
     ], ls=7.2, col=INK)
 
     ty = box(ax, 49.0, 4.6, 49.0, 18.0, title="비교 범위와 한계  —  이 그림이 주장하지 않는 것",
@@ -641,6 +641,8 @@ def fig_why():
                  ("  스트리밍으로 33.7 GB/s 확보했으나 상류 API 대기", "k"),
                  ("· 위 배수는 노드 로컬 계층 대비이며, 워킹셋이 서버", "k"),
                  ("  메모리에 상주 가능한 구간의 값이 섞여 있다", "k"),
+                 ("· 30/30 은 libfabric 손상 판정용이며 무결성 증명이 아니다 —", "k"),
+                 ("  ~1% 손상률에서 30회는 67–89% 확률로 통과한다 (사후 확인)", "k"),
              ])
 
     ax.text(2.0, 2.0, "출처: 본 저장소 README (ExaCI5-4 CI, 메타데이터 스케일 시험) · "
@@ -694,7 +696,7 @@ def fig_code():
         ("  patches/          6개  DAOS · mercury · UCX", "k"),
         ("  apply-patches.sh · README(1,374줄) · PLAN", "k"),
         ("", "k"),
-        ("tests/   43개  게이트 · 마이크로벤치 · C 재현기", "k"),
+        ("tests/   55개  게이트 · 마이크로벤치 · C 재현기", "k"),
         ("bench/   17개  vLLM+LMCache E2E 하네스", "k"),
         ("deploy/ · doc/figures/   환경 재구성 · 그림", "k"),
     ]
@@ -868,25 +870,26 @@ def fig_code():
 
     # ---------------- (G) 현재 상태
     ty = box(ax, 51.5, 2.5, 46.5, 25.0,
-             title="G. 현재 상태 (2026-09-01) — E2E KV 손상 조사", ts=9.2,
+             title="G. 현재 상태 — DAOS 읽기 손상 조사 (2026-09-01 기준)", ts=9.2,
              fill="#fbf9f5", edge=WARN, lw=1.2)
     yy = ty
     for t, f, c in [
-            ("완전 스톡 DAOS 2.9.100 클라이언트(--build-deps=yes)도 34/3840 실패", "k", INK),
-            ("(0.885%, CI 0.634–1.235) ↔ 패치판 25/3840 (0.651%), 교차 실행.", "k", GREY),
-            ("→ 커넥터 · LMCache · GPU-direct 패치가 모두 배제됐고, 손상은", "k", INK),
-            ("   DAOS 내부의 것으로 확정됐다.", "k", INK),
+            ("완전 스톡 2.9.100 클라이언트(--build-deps=yes)도 34/3840 실패,", "k", INK),
+            ("서버를 2.8.0-rc3 으로 되돌려도 68/5120(1.33%) 로 같은 버그.", "k", INK),
+            ("→ 커넥터 · LMCache · GPU-direct 패치 · 2.9 신규성 모두 배제.", "k", INK),
+            ("   dc_array · vos_aggregate · vos_csum_recalc · src/bio 는", "k", GREY),
+            ("   두 버전 간 바이트 동일하고 전송 계층만 바뀌었다.", "k", GREY),
             ("", "k", GREY),
-            ("서명   태그 페이로드(tid, round, offset)로 재측정 — 읽기 버퍼의 DFS", "k", GREY),
-            ("       chunk 하나가 같은 offset·round 의 다른 객체 데이터를 담는다.", "k", GREY),
-            ("트리거 읽기 단독 0/4320, 쓰기 단독도 정상 → 읽기·쓰기가 섞일 때만.", "k", GREY),
-            ("유력   aggregation — reclaim off 0/737 ↔ on 6/921 (p≈0.008, 미확정).", "k", GREY),
-            ("재현기 tests/dfs_integrity.c — DAOS 클라이언트만 있으면 된다", "k", GREY),
-            ("       (LMCache · GPU · torch · 모델 전부 불필요).", "k", GREY),
-            ("", "k", GREY),
-            ("이 그림의 D · E 경로는 코드 구조로는 확정이지만, 위 손상이 해소되기", "k", WARN),
-            ("전까지 E2E 결과는 신뢰 구간과 함께 읽어야 한다. 상세는", "k", WARN),
-            ("gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md §12.", "m", WARN)]:
+            ("서명   읽기 버퍼의 4 MiB chunk 하나가 같은 offset 의 다른 객체", "k", GREY),
+            ("       데이터를 담는다. 다시 읽으면 위치가 바뀐다 → read 쪽.", "k", GREY),
+            ("트리거 읽기·쓰기가 섞일 때. read-only 동시성과 단일 객체 arm 은", "k", GREY),
+            ("       두 버전 모두 깨끗하다.", "k", GREY),
+            ("기각   aggregation (reclaim off 에서도 78/8960) · alignment", "k", GREY),
+            ("       (A/B 0.68% vs 0.37%) 둘 다 원인이 아니다.", "k", GREY),
+            ("주의   과거 '30/30 무결성' 은 부재의 증거가 아니었다 — 이 손상률", "k", WARN),
+            ("       에서 30회는 67–89% 확률로 그냥 통과한다.", "k", WARN),
+            ("D · E 는 코드 구조로는 확정이다. 최신 상태는 gpudirect/", "k", WARN),
+            ("DAOS-CONCURRENT-READ-CORRUPTION.md §12 · §13.", "m", WARN)]:
         ax.text(53.1, yy, t, fontsize=6.2, color=c, va="top", family=_fam(t, f))
         yy -= 6.2 * 0.145 + 0.45
 
@@ -1055,7 +1058,7 @@ def fig_mp():
                  ("", "L2 를 다시 읽지 않는다 (복사 감소 아니라 요청 감소)"),
                  ("", ""),
                  ("옮겨도 그대로인 것", ""),
-                 ("DAOS 동시 읽기 손상", "인터페이스와 무관 — DAOS 내부 결함"),
+                 ("DAOS 읽기 손상", "인터페이스와 무관 — DAOS 내부 결함"),
                  ("진짜 batch RPC 부재", "여전히 청크당 객체 1개 → dkey/akey 필요"),
                  ("DFS chunk 규칙", "그대로 적용 (파일크기 ÷ 랭크당 타깃수)"),
                  ("파이썬 스레드풀", "어댑터도 blocking libdfs 를 스레드로 감싼다")]:

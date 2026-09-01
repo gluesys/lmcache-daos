@@ -118,7 +118,7 @@ buffer provided by the caller."* (`base.py:304-327`). 상류 byte-array 어댑�
 
 **옮겨도 그대로인 것**:
 
-- **DAOS 동시 읽기 손상** — 인터페이스와 무관한 DAOS 내부 결함
+- **DAOS 읽기 데이터 손상** — 인터페이스와 무관한 DAOS 내부 결함. 동시성이 필수 조건도 아니다(단일 writer/reader 로도 재현)
   ([`gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md`](../gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md) §12).
 - **진짜 batch RPC 부재** — 여전히 청크당 객체 1개. 접으려면 dkey/akey 레이아웃이 필요하다.
 - **DFS chunk 규칙** — `chunk ≈ 파일크기 ÷ 랭크당 타깃수` 는 그대로 적용된다.
@@ -150,7 +150,7 @@ AWS SageMaker HyperPod 의 **node-local `ai-toolkit` 데몬**을 저장소로 �
 
 ## 9. 권고
 
-**지금 옮기지 않는다.** DAOS 동시 읽기 손상이 해소되기 전에는 어느 인터페이스로 붙여도
+**지금 옮기지 않는다.** DAOS 읽기 손상이 해소되기 전에는 어느 인터페이스로 붙여도
 E2E 결과가 같으므로 착수 이유가 없다.
 
 **Phase 5 방향으로는 `RemoteConnector` 개선보다 L2 어댑터가 낫다.** 우리가 상류에 RFC 로

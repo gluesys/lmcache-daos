@@ -58,8 +58,14 @@ DAOS DFS(`dfs_sys` API) 네임스페이스의 self-describing 파일로 저장�
 
 부수 산출물 — 커넥터의 강점이 아니라 이 작업이 찾아낸 **DAOS 측 수정 사항**이다:
 libfabric `verbs;ofi_rxm` 이 대용량 RDMA read 를 조용히 손상시킨다는 것(28 MB x 30 중
-3–10개만 정상, raw verbs 는 무결 → 30/30), 그리고 UCX 활성화의 실제 관문이 재빌드가
-아니라 패키징에서 빠진 `libna_plugin_ucx.so` 라는 것.
+3–10개만 정상, raw verbs 는 무결), 그리고 UCX 활성화의 실제 관문이 재빌드가 아니라
+패키징에서 빠진 `libna_plugin_ucx.so` 라는 것.
+
+⚠️ 이때 UCX 쪽 **"30/30 통과"는 무결성의 증거가 아니었다.** 이후 밝혀진 DAOS 읽기
+손상률(1% 내외)에서 30회 시행은 67–89% 확률로 그냥 통과한다
+([`gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md`](gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md)
+§13.6). libfabric 이 그보다 훨씬 심하게 깨진다는 판정에는 여전히 쓸 수 있지만,
+UCX 경로가 깨끗하다는 근거로는 쓸 수 없다.
 
 ### DAOS 를 KV 계층으로 골라서 얻는 것
 
