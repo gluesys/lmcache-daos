@@ -571,3 +571,77 @@ KV 커넥터 페이로드를 chunk 정렬해도 해결되지 않는다.
 - 2.9 설치본은 **그대로 보존**: `/opt/daos-gds`(서버), `/opt/daos-gds-gpu`, `/var/daos-stockfull`
 - **2.9.100 으로 되돌리려면**: drop-in 을 `/opt/daos-gds/bin/daos_server` 로 복원(백업 있음) →
   §13.2 의 4~6 단계 반복(= 2.8 풀 파기, 테스트 데이터뿐) → client-5 agent unit 복원
+
+---
+
+# 14. 상류 선행 보고 조사 (2026-09-01)
+
+## 14.1 어디를 봐야 하는가
+
+**`daos-stack/daos` 는 GitHub Issues 가 비활성**(`has_issues: false`)이다. GitHub 에 있는 건
+전부 PR 이고, 버그 보고는 **JIRA `daosio.atlassian.net`** 에 있다. 이 JIRA 는 **익명 읽기 가능**:
+
+```
+# 검색 (v2 /search 는 410 Gone, v3 를 쓸 것)
+https://daosio.atlassian.net/rest/api/3/search/jql?jql=project%3DDAOS%20AND%20summary~%22corruption%22&fields=key,summary,status,created
+# 개별 티켓
+https://daosio.atlassian.net/rest/api/2/issue/DAOS-18862?fields=summary,status,resolution,versions,description
+```
+
+## 14.2 결론 — 우리 서명과 일치하는 보고는 없다
+
+검색한 축: `summary~corruption`(40건), 2026년 이후 Bug+"data corruption"(28건),
+`"wrong data"/"stale data"/"incorrect data"`, `"another object"`, UCX·rcache·corruption,
+그리고 우리 로그 문자열 그대로(`csum_agg_verify`, `hg_bulk_deserialize`/`deserialize address`,
+`CoS cache`). 손상 티켓은 전부 **rebuild/reintegration/exclusion**, **EC aggregation**,
+**메모리 손상(double-linked list)**, 또는 테스트 하네스 문제였다. **장애·리빌드 없이 평상시
+읽기가 다른 객체의 chunk 를 조용히 돌려준다**는 보고는 없다.
+
+## 14.3 가장 가까운 이웃 — DAOS-18862 (Cannot Reproduce 로 종결)
+
+> **DAOS-18862** "release/2.8: Checksum mismatch at index 42/64" — 2026-04-21, affects 2.7,
+> **Resolved / Cannot Reproduce**, 원인 미규명.
+> 환경: **MD-on-SSD**, **UCX(dc_x)**, `release/2.8`(c22a7958), 2 TB 풀, HDF5 exerciser.
+> 클라이언트 읽기에서 `Checksum mismatch at index 42/64 59887 != 27441`.
+
+우리와 같은 축이 셋(MD-on-SSD · UCX · 2.8 계열 · 읽기 경로 체크섬 불일치)이고, 다른 축이 둘
+(EC_8P3GX vs 우리 RP_2G4, 체크섬 ON 이라 침묵이 아니라 오류로 표면화). **재현 불가로 닫혔는데
+우리는 재현기가 있다** → 상류 제출 시 이 티켓을 반드시 참조/재오픈 후보로 연결할 것.
+곁가지 힌트: 그 환경은 **`UCX_ENABLE_RCACHE` 를 서버·클라 양쪽에서 끈** 상태였다 — 보고자도
+UCX 등록 캐시를 의심했다는 뜻이다(우리는 아직 이 노브를 시험하지 않았다).
+
+## 14.4 열려 있는 신규 티켓 — DAOS-19569 (확인 필요)
+
+> **DAOS-19569** "IOM process did not correctly handle multiple IODs case" — 2026-08-31 생성,
+> affects **2.8 · 3.0 Community**, **Awaiting backport**, component **Erasure Code**.
+> 본문: "Some IOM detailed handling did not correctly handle multiple IODs case" +
+> **"This possibly cause data corruption in special cases."**
+
+28 MiB DFS 읽기는 dc_array 가 chunk 마다 IOD 로 쪼개므로 **정확히 multi-IOD 케이스**다. 단
+component 가 EC 이고 우리는 RP 이므로 경로가 EC 전용인지 확인해야 한다. 패치는 우리 로컬
+`origin/master`(2026-08-28 fetch)보다 최신이라 트리에 없다 → **fetch 후 diff 를 보고, 우리
+재현기로 전후 비교할 것. 다음 세션 1순위 후보.**
+
+## 14.5 참고로 관련되지만 조건이 다른 것들
+
+| 티켓 | 상태 | 왜 우리 것이 아닌가 |
+|---|---|---|
+| DAOS-18368 "Data corruption ... MDonSSD" | Resolved (2.6.5/2.8 수정) | reintegration 이 방아쇠, 우리는 리빌드 없음 |
+| DAOS-18524 "DER_CSUM -2021 + Data corruption found for recx" | Resolved | reintegration 중 |
+| DAOS-18869 "data corruption after two ranks failed (spdk)" | Open | rank 장애 필요 |
+| DAOS-16970 "Timeout and read corruption on target exclusion" | Open | target exclusion 필요 |
+| DAOS-3841 "fetch returning data at wrong offset" | Resolved (2019) | 우리 `own data from offset N` 유형과 결이 같으나 시기가 다름 |
+| DAOS-19451 / PR #18885 "enable checksum by default on non-v0 pools" | Open PR | 상류도 침묵 손상 위험을 의식해 기본값 전환 중(§12.6 과 맞물림) |
+| DAOS-17321 / PR #18940·#18942 ddb `csum_check` | Open PR | 오프라인 체크섬 검증 도구 추가 중 |
+
+## 14.6 우리 빌드에 없는 상류 수정 (로컬 `origin/master` 2026-08-28 기준)
+
+| 커밋 | 2.8-rc3 | 2.9.100 | 우리 증상과의 관계 |
+|---|---|---|---|
+| `1ff454966b` DAOS-19537 array: fix set_size at chunk boundaries | ✗ | ✗ | truncate/shrink 경로 — 우리는 축소를 안 하므로 무관 |
+| `4f919653da` DAOS-15847 object: restore iov_len for fetch on dup-only SGLs | ✗ | ✓ | fetch SGL 의 iov_len 만 어긋나는 버그(데이터 위치는 정상) |
+| `205e513c25` DAOS-18901 vos: Cap merged extent size | ✗ | ✓ | aggregation 병합 크기 제한 — 양쪽 다 손상되므로 결정적이지 않음 |
+| `c61ae699bb` DAOS-19036 dtx: handle DTX race issues | ✗ | ? | §12.7-2 의 DTX CoS 증상과 맞춰볼 가치 있음 |
+
+즉 **2.8-rc3 는 2.9.100 이 가진 fetch/aggregation 수정 두 건을 아직 안 갖고 있는데도 손상
+비율이 같은 자릿수**(§13.3)다. 이 조합은 "그 두 수정이 원인이 아니다"는 쪽 근거다.
