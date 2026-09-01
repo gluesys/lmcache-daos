@@ -648,12 +648,260 @@ def fig_why():
             fontsize=6.8, color="#a8a8a8", va="bottom")
     return fig
 
+
+# ----------------------------------------------------------------- Figure 4
+def fig_code():
+    """MR !6 구현 코드 구조 — 모듈·API 표면·경로별 시퀀스·동시성 모델."""
+    fig, ax = newax((16.0, 10.4))
+
+    ax.text(2.0, 98.0, "그림 4.  MR !6 구현 코드 구조",
+            fontsize=12.8, color=INK, fontweight="bold", va="top")
+    ax.text(2.0, 95.0, "브랜치 streaming-get-and-client6-assets · 105 files, +59,681 / -80.  "
+                       "구현 본체는 lmcache_daos/ 1,701 줄이고 나머지는 시험·재현·배포 자산이다.",
+            fontsize=8.4, color=GREY, va="top")
+
+    def flow(x, y, rows, ls=6.4, notex=None, rail=True):
+        """번호 붙은 시퀀스. rows = [(본문, 우측 주석 or None)]"""
+        dy = ls * 0.145 + 0.62
+        y0 = y
+        for i, (txt, note) in enumerate(rows, 1):
+            ax.text(x, y, "%d" % i, fontsize=ls - 0.4, color=ACC,
+                    va="top", ha="right", family=MF, fontweight="bold")
+            ax.text(x + 0.9, y, txt, fontsize=ls, color=INK, va="top",
+                    family=_fam(txt, "m"))
+            if note:
+                ax.text(notex, y, note, fontsize=ls - 0.5, color=WARN, va="top",
+                        family=_fam(note, "m"))
+            y -= dy
+        if rail:
+            ax.plot([x - 1.5, x - 1.5], [y0 + 0.9, y + dy - 0.3],
+                    color="#d6d3ce", lw=0.8, zorder=1)
+        return y
+
+    # ---------------- (A) 모듈 맵
+    ty = box(ax, 2.0, 58.0, 28.0, 34.0, title="A. MR !6 이 건드린 코드", ts=9.2,
+             fill="white", edge="#c9c6c0")
+    lines_a = [
+        ("lmcache_daos/            구현 본체", "k"),
+        ("  connector.py     619  M  DaosConnector", "m"),
+        ("  dfs_binding.py   476  M  DfsSys (ctypes)", "m"),
+        ("  daos_event.py    454  A  EQ 바인딩 ※미사용", "k"),
+        ("  streaming.py      87  A  stream_completions", "m"),
+        ("  serde.py          59  M  프레이밍", "k"),
+        ("shim/daos_evshim.c  58  A  sizeof(daos_event_t)", "m"),
+        ("", "k"),
+        ("gpudirect/            A   별도 데이터 평면", "k"),
+        ("  patches/          6개  DAOS · mercury · UCX", "k"),
+        ("  apply-patches.sh · README(1,374줄) · PLAN", "k"),
+        ("", "k"),
+        ("tests/   43개  게이트 · 마이크로벤치 · C 재현기", "k"),
+        ("bench/   17개  vLLM+LMCache E2E 하네스", "k"),
+        ("deploy/ · doc/figures/   환경 재구성 · 그림", "k"),
+    ]
+    yy = ty
+    for t, f in lines_a:
+        ax.text(3.5, yy, t, fontsize=6.5, color=GREY, va="top", family=_fam(t, f))
+        yy -= 6.5 * 0.145 + 0.52
+    ax.plot([3.5, 28.5], [yy + 0.2, yy + 0.2], color="#d6d3ce", lw=0.8)
+    ax.text(3.5, yy - 0.9, "커넥터는 CPU MemoryObj 를 반환하는 RemoteConnector\n"
+                           "계약 위에 있어 GPU-direct 가 아니다 — gpudirect/ 는\n"
+                           "GPU 버퍼에 직접 읽고 쓰는 별도 데이터 평면이다.",
+            fontsize=6.4, color=WARN, va="top", linespacing=1.5)
+
+    # ---------------- (B) API 표면
+    box(ax, 31.5, 58.0, 32.5, 34.0, title="B. DaosConnector — API 표면", ts=9.2,
+        fill="white", edge=ACC, lw=1.3)
+    yb = 87.4
+    for head_t, rows in [
+            ("LMCache 가 호출하는 RemoteConnector 계약",
+             [("async exists / exists_sync", None),
+              ("async get / async put", None),
+              ("async list / async close", None),
+              ("remove_sync", "원격 eviction 유일 경로")]),
+            ("opt-in 훅  (support_* 가 계약을 연다)",
+             [("\u2713 support_batched_get   -> batched_get", None),
+              ("\u2713 support_batched_put   -> batched_put", None),
+              ("\u00d7 support_batched_get_non_blocking", "구현은 보존"),
+              ("\u2713 support_stream_get    -> stream_get", "상류 API 없음"),
+              ("\u00b7 batched_contains", "상속, 측정근거 미구현")]),
+            ("내부",
+             [("_parse_daos_url  plugin://<pool>/<cont>[?sys=]", None),
+              ("_key_to_path     '/' + sha256(key)  (flat)", None),
+              ("_prep_write / _put_sync / _get_sync", None),
+              ("_release / _drop_put_ref / _run", None)])]:
+        ax.text(33.0, yb, head_t, fontsize=7.0, color=ACC, va="top",
+                fontweight="bold")
+        yb -= 1.9
+        for t, n in rows:
+            if t[0] in "\u2713\u00d7\u00b7":
+                ax.text(34.2, yb, t[0], fontsize=6.4,
+                        color=(ACC if t[0] == "\u2713" else GREY), va="top")
+                ax.text(35.6, yb, t[2:], fontsize=6.4, color=INK, va="top",
+                        family=_fam(t[2:], "m"))
+            else:
+                ax.text(34.2, yb, t, fontsize=6.4, color=INK, va="top",
+                        family=_fam(t, "m"))
+            if n:
+                ax.text(53.0, yb, n, fontsize=6.0, color=GREY, va="top")
+            yb -= 6.4 * 0.145 + 0.55
+        yb -= 0.9
+
+    # ---------------- (C) 동시성
+    ty = box(ax, 65.5, 58.0, 32.5, 34.0, title="C. 동시성 모델", ts=9.2,
+             fill="white", edge="#c9c6c0")
+    lines_c = [
+        ("LMCache asyncio loop", "k"),
+        ("  └ _run() = loop.run_in_executor(self._pool, fn, ...)", "m"),
+        ("ThreadPoolExecutor(max_workers=16,", "m"),
+        ("                   thread_name_prefix='daos-io')", "m"),
+        ("  └ 공유 DfsSys 핸들 1개  (mflags=RDWR, sflags=0)", "k"),
+        ("      = dfs_sys 디렉터리 캐시 + 락 모두 ON", "k"),
+        ("  └ libdfs 호출이 GIL 을 놓는다 → 진짜 병렬", "k"),
+    ]
+    yy = ty
+    for t, f in lines_c:
+        ax.text(67.0, yy, t, fontsize=6.5, color=GREY, va="top", family=_fam(t, f))
+        yy -= 6.5 * 0.145 + 0.52
+    yy -= 0.6
+    ax.text(67.0, yy, "sflags 선택 근거 (28 MiB · 16 threads · GB/s)",
+            fontsize=6.6, color=ACC, va="top", fontweight="bold")
+    yy -= 2.0
+    for t in ["NO_CACHE|NO_LOCK  perthread   32.54 / 34.78",
+              "0 (cache+lock)    perthread   33.64 / 33.13",
+              "0 (cache+lock)    shared      33.73 / 32.90"]:
+        ax.text(68.2, yy, t, fontsize=6.3, color=INK, va="top", family=MF)
+        yy -= 1.5
+    ax.text(68.2, yy, "→ 락은 대용량 read 에서 사실상 공짜. NO_LOCK 을 위해",
+            fontsize=6.3, color=GREY, va="top")
+    yy -= 1.5
+    ax.text(68.2, yy, "   두었던 per-thread 핸들 풀은 이제 불필요해졌다.",
+            fontsize=6.3, color=GREY, va="top")
+    yy -= 2.6
+    ax.text(67.0, yy, "streaming.stream_completions(loop, pool, fn, items, 16)",
+            fontsize=6.6, color=ACC, va="top", fontweight="bold", family=MF)
+    yy -= 2.0
+    for t in ["완료 순서로 (index, result) 를 yield — 인덱스 순서로",
+              "주면 느린 청크 하나가 뒤를 전부 막는다",
+              "슬롯은 yield 전에 선충전 → 소비자가 바쁜 동안에도 read 지속",
+              "예외는 배치가 아니라 청크 단위로 전달 (RFC 요구사항)"]:
+        ax.text(68.2, yy, "· " + t, fontsize=6.3, color=GREY, va="top")
+        yy -= 1.5
+
+    # ---------------- (D) read 경로
+    ty = box(ax, 2.0, 28.5, 46.5, 28.0,
+             title="D. read 경로 — _get_sync(path)      open 1회 · 복사 0회", ts=9.2,
+             fill="white", edge=ACC, lw=1.3)
+    y = flow(4.6, ty - 0.4, [
+        ("dfs_sys_open(RDONLY)", "ENOENT → None"),
+        ("read_obj(0, 8 + _HDR_CAP)   # prefix+meta 한 번에", "_HDR_CAP = 512"),
+        ("serde.parse_prefix(hdr[:8]) → meta_len, payload_len", "짧으면 → None"),
+        ("RemoteMetadata.deserialize(meta)", "실패 → None"),
+        ("local_cpu_backend.allocate(shapes, dtypes, fmt)", "None → miss"),
+        ("dest = (c_char*n).from_buffer(memory_obj 뷰)", "무복사 alias"),
+        ("read_obj_into(obj, off, payload_len, dest)", "C 호출이 GIL 해제"),
+        ("got != payload_len → _release() 후 None", "잘린 객체 = miss"),
+        ("dfs_sys_close(obj)   # finally", None),
+    ], ls=6.5, notex=34.0)
+    ax.plot([4.0, 47.0], [y + 0.4, y + 0.4], color="#d6d3ce", lw=0.8)
+    ax.text(4.0, y - 0.6, "bench_readpath_merge.py — 32 x 28 MiB, GB/s",
+            fontsize=6.4, color=ACC, va="top", fontweight="bold")
+    yy = y - 2.6
+    for t in ["                              1 thread   16 threads",
+              "main 방식 (open 4 · copy 2)       2.78        2.61",
+              "무복사, 검사 없음                14.37       33.55",
+              "무복사 + 위 검사 전부            12.31       32.75"]:
+        ax.text(5.0, yy, t, fontsize=6.3, color=INK, va="top", family=_fam(t, "m"))
+        yy -= 1.4
+    ax.text(5.0, yy - 0.2, "→ 안전 검사 비용 2%. main 방식은 GIL 보유 복사 2회 때문에 "
+                           "확장 자체가 안 된다.", fontsize=6.3, color=GREY, va="top")
+
+    # ---------------- (E) write 경로
+    ty = box(ax, 51.5, 28.5, 46.5, 28.0,
+             title="E. write 경로 — put() / _prep_write / _put_sync", ts=9.2,
+             fill="white", edge=ACC, lw=1.3)
+    y = flow(54.1, ty - 0.4, [
+        ("view = memoryview(byte_array).cast('B') ; n = len(view)", None),
+        ("RemoteMetadata(n, shapes, dtypes, fmt).serialize()", "~28 B"),
+        ("header = serde.prefix_pack(meta_len, n) + meta", "~36 B"),
+        ("src = (c_char*n).from_buffer_copy(view)", "기본: 복사"),
+        ("      from_buffer(view) = alias", "DAOS_UNSAFE_ALIAS_STORE=1"),
+        ("open_rdwr_create(path)", None),
+        ("write_obj_from(0, len(header), hdr)   # 작은 헤더", None),
+        ("write_obj_from(len(header), n, src)   # bulk", None),
+        ("dfs_sys_close(obj)   # finally", None),
+        ("_drop_put_ref(memory_obj)", "serializer 가 올린 ref 반납"),
+    ], ls=6.5, notex=82.0)
+    ax.plot([53.5, 96.5], [y + 0.4, y + 0.4], color="#d6d3ce", lw=0.8)
+    ax.text(53.5, y - 0.6, "왜 이 모양인가", fontsize=6.4, color=ACC, va="top",
+            fontweight="bold")
+    yy = y - 2.6
+    for t in ["3-copy(bytes→pack→string_buffer, ≈1 GB/s) → alias(+5178 → +65 ms @8K)",
+              "→ 지금은 복사가 기본. alias 는 그 자체로 불안전하다 — batched_put 은",
+              "   async submit 이라 LMCache 가 기다리지 않고 MemoryObj 를 재활용한다.",
+              "복사가 손상률을 낮춘다는 증거는 없다 (100% CI[83.9,100] ↔ 85% CI[64.0,94.8])."]:
+        ax.text(54.5, yy, t, fontsize=6.3, color=GREY, va="top")
+        yy -= 1.4
+
+    # ---------------- (F) 미사용·스위치
+    ty = box(ax, 2.0, 2.5, 46.5, 25.0, title="F. 미사용·보류 코드와 진단 스위치",
+             ts=9.2, fill=FILL, edge="#c9c6c0")
+    yy = ty
+    for t, f, c in [
+            ("daos_event.py (454줄) + shim/daos_evshim.c — DAOS event queue 바인딩", "k", INK),
+            ("· 핫패스에 연결하지 않는다. EQ 당 eqx_lock 이 submit 과 완료를 직렬화해", "k", GREY),
+            ("  큐를 어떻게 배치해도 7–12 GB/s, 블로킹 스레드풀은 34.3 GB/s.", "k", GREY),
+            ("· 완료 순서 전달에 EQ 가 필요 없다 — resolve 된 future 가 곧 완료다.", "k", GREY),
+            ("· ctypes 로 daos_event_t ABI 를 선언하므로 256 B canary + shim 으로", "k", GREY),
+            ("  sizeof 를 검증한다 (verify_abi / verify_abi_or_die).", "k", GREY),
+            ("", "k", GREY),
+            ("환경 스위치 (기본 전부 off)", "k", INK),
+            ("DAOS_BG_PROF=1             batched_get 벽시계 계측  [CONN-BG]", "m", GREY),
+            ("DAOS_UNSAFE_ALIAS_STORE=1  store 무복사 alias (버그 재현용)", "m", GREY),
+            ("DAOS_READ_VIA_BYTEARRAY=1  read 를 사설 bytearray 경유 (진단용)", "m", GREY),
+            ("", "k", GREY),
+            ("측정으로 범위를 좁힌 결과 — 안 만든 것에도 근거가 있다", "k", INK),
+            ("batched_contains  순차 8.8 ms ↔ fan-out 9.4 ms (0.9x) → 상속 유지", "k", GREY),
+            ("디렉터리 fanout   조회가 1k→80k 에서 평탄 → 불필요", "k", GREY)]:
+        ax.text(3.6, yy, t, fontsize=6.2, color=c, va="top", family=_fam(t, f),
+                fontweight=("bold" if c == INK and t else "normal"))
+        yy -= 6.2 * 0.145 + 0.45
+
+    # ---------------- (G) 현재 상태
+    ty = box(ax, 51.5, 2.5, 46.5, 25.0,
+             title="G. 현재 상태 (2026-09-01) — E2E KV 손상 조사", ts=9.2,
+             fill="#fbf9f5", edge=WARN, lw=1.2)
+    yy = ty
+    for t, f, c in [
+            ("완전 스톡 DAOS 2.9.100 클라이언트(--build-deps=yes)도 34/3840 실패", "k", INK),
+            ("(0.885%, CI 0.634–1.235) ↔ 패치판 25/3840 (0.651%), 교차 실행.", "k", GREY),
+            ("→ 커넥터 · LMCache · GPU-direct 패치가 모두 배제됐고, 손상은", "k", INK),
+            ("   DAOS 내부의 것으로 확정됐다.", "k", INK),
+            ("", "k", GREY),
+            ("서명   태그 페이로드(tid, round, offset)로 재측정 — 읽기 버퍼의 DFS", "k", GREY),
+            ("       chunk 하나가 같은 offset·round 의 다른 객체 데이터를 담는다.", "k", GREY),
+            ("트리거 읽기 단독 0/4320, 쓰기 단독도 정상 → 읽기·쓰기가 섞일 때만.", "k", GREY),
+            ("유력   aggregation — reclaim off 0/737 ↔ on 6/921 (p≈0.008, 미확정).", "k", GREY),
+            ("재현기 tests/dfs_integrity.c — DAOS 클라이언트만 있으면 된다", "k", GREY),
+            ("       (LMCache · GPU · torch · 모델 전부 불필요).", "k", GREY),
+            ("", "k", GREY),
+            ("이 그림의 D · E 경로는 코드 구조로는 확정이지만, 위 손상이 해소되기", "k", WARN),
+            ("전까지 E2E 결과는 신뢰 구간과 함께 읽어야 한다. 상세는", "k", WARN),
+            ("gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md §12.", "m", WARN)]:
+        ax.text(53.1, yy, t, fontsize=6.2, color=c, va="top", family=_fam(t, f))
+        yy -= 6.2 * 0.145 + 0.45
+
+    ax.text(2.0, 1.2, "출처: 저장소 코드 직접 확인 (lmcache_daos/ · shim/ · gpudirect/) · "
+                      "git diff origin/main...HEAD · 커밋 d0821c1",
+            fontsize=6.6, color="#a8a8a8", va="bottom")
+    return fig
+
 OUT = os.path.dirname(os.path.abspath(__file__))
 FIGS = {
     "arch": (fig_arch, "fig1_lmcache_daos_architecture"),
     "stack": (fig_stack, "fig1b_lmcache_daos_stack"),
     "bed": (fig_bed, "fig2_lmcache_daos_testbed"),
     "why": (fig_why, "fig3_why_daos_for_kvcache"),
+    "code": (fig_code, "fig4_mr6_code_structure"),
 }
 
 want = sys.argv[1:] or list(FIGS)
