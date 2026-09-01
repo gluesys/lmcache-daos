@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **판정** | **DAOS 자체 결함.** 우리 패치·커넥터·LMCache·GPU-direct prereq 전부 측정으로 배제됨 |
-| **영향 버전** | **2.8.0-rc3 와 2.9.100 동일** (둘 다 실측). 손상 신호를 만드는 코드는 두 버전 바이트 동일 |
+| **영향 버전** | **완전 upstream 2.9.100 스택(코어+prereq+클라 전부 스톡)에서 재현 확정(§18).** ExaStor 2.8-wsd·2.9-gds 빌드도 동일 |
 | **증상** | 읽기 버퍼의 **정확히 DFS chunk 하나**가 **다른 객체의 같은 오프셋 데이터**로 조용히 바뀜 |
 | **비율** | 28 MiB · 16 스레드 mixed 부하에서 읽기당 **0.3 ~ 1.5 %** (버스트로 몰려서 옴) |
 | **탐지 가능성** | 반환값·크기 정상 → 호출자는 알 수 없음. 컨테이너 checksum 을 켜면 **EIO 로** 표면화 |
@@ -21,7 +21,8 @@
 | # | 확정 사실 | 근거 |
 |---|---|---|
 | 1 | **DAOS 결함이다.** 코어·mercury·UCX 를 `--build-deps=yes` 로 전부 스톡 빌드한 클라이언트가 패치 클라와 **동률로 실패**: 34/3840(0.885 %, CI 0.634–1.235) vs 25/3840(0.651 %, CI 0.441–0.959), 런 단위 교대 A/B | §12.1 |
-| 2 | **2.8.0-rc3 도 동일하다.** 서버를 실제로 되돌려 측정: mixed 68/5120 = 1.33 %, 서명 동일. `dc_array.c`·`vos_aggregate.c`·`vos_csum_recalc.c`·`src/bio` 가 두 버전 **바이트 동일** | §13 |
+| 2 | **완전 upstream 스택에서 재현.** 스톡 2.9.100 서버(코어+mercury/UCX/SPDK prereq 전부 upstream, WS-D 0)+스톡 클라, ofi+tcp: DFS 86/5120, raw obj 59/1920, 서명 동일 | **§18** |
+| 2b | rc3 기반 ExaStor 2.8-wsd 서버도 동일(§13 — 단 upstream 이 아니라 wsd 브랜치였음, §13 정정 참조) | §13 |
 | 3 | **서명**: 정확히 DFS chunk 하나가 **같은 오프셋의 다른 객체 데이터**(가끔 같은 객체의 다른 오프셋, 드물게 이전 세대, 드물게 zeros). 구간 크기는 **컨테이너 chunk 크기를 따라감**(1 MiB 컨테이너 → 1 MiB) | §12.2 |
 | 4 | **저장된 바이트는 정상**이다. 같은 런에서 조용히 되읽으면 깨끗 ⇒ **읽기가 저장되지 않은 바이트를 돌려준다** | §12.2 |
 | 5 | **서버가 스스로 손상을 검출하고 있다.** 양 rank 가 `vos_csum_recalc.c:csum_agg_verify()` 에서 `DER_CSUM(-2021)`, 실패 창이 정확히 4 MiB. NVMe 는 Media/Read/Write Errors **0** 인데 DAOS Checksum Errors 2~6 ⇒ 하드웨어 아님 | §12.5 |
@@ -36,7 +37,8 @@
 | **VOS aggregation** | arm 당 5120 읽기 + 순서 교대. 1차 1.50 % vs 0.53 % 로 확정처럼 보였으나 순서를 뒤집으면 1.44 % vs 1.33 %. 끄고도 78/8960 = 0.87 % (§12.8) |
 | oclass·복제·컨테이너 신선도 | RP_2G1/G4/G8·SX(rd_fac 0)·S1 전부 재현, 갓 만든 컨테이너도 6/1920 (§12.4) |
 | payload chunk 정렬 | 교대 A/B 5120×2 에서 0.37 %(정렬) vs 0.68 %(straddling) — 완화책 아님 (§13.5) |
-| 2.9 신규 도입 / GPU-direct 백포트 | 2.8.0-rc3 에서 동률 재현 (§13.3) |
+| 2.9 신규 도입 / GPU-direct 백포트 | 2.8-wsd 에서 동률 재현 (§13.3) |
+| **ExaStor 패치 전체 (서버 포함: WS-D·zfs-cap·GDS cart)** | **완전 upstream 서버+클라에서 동일 재현 (§18)** — §17.1 서로소 논증의 잔여 구멍까지 봉합 |
 | 하드웨어 미디어 오류 | 전 장치 Media/Read/Write Errors 0 (§12.5) |
 | DAOS-15847·DAOS-18901 (상류 fetch/aggregation 수정) | 2.9.100 엔 있고 2.8-rc3 엔 없는데 비율이 같은 자릿수 (§14.6) |
 
@@ -46,7 +48,7 @@
 2. **DAOS-19569**(2026-08-31, affects 2.8·3.0, Awaiting backport): "multiple IODs" IOM 처리 오류, 본문에 *"possibly cause data corruption"*. 28 MiB 읽기는 정확히 multi-IOD 케이스다. component 가 EC 로 적혀 있어 RP 경로 해당 여부 확인 필요 (§14.4).
 3. **`UCX_ENABLE_RCACHE=n`** 미시험. DAOS-18862 보고자가 양쪽에서 끈 상태였다 = UCX 등록 캐시를 의심했다는 뜻 (§14.3).
 4. **§12.8b**(단일 스레드 덮어쓰기 세대만으로 재현)를 **건강한 풀에서** 결론내기. 열화된 풀에서 관측된 것이고, 2.8 에서도 포맷 직후엔 심했다가 치유됐다(§13.4).
-5. **완전 상류 vanilla 서버**는 여전히 미검증. 단 2.8 서버는 GPU-direct 패치가 없는 별개 빌드(`port/2.8-wsd`, TAG 2.8.0-rc3, rkey 심볼 0)이고 거기서도 재현되므로 §12.8d 의 우려는 대부분 해소됐다.
+5. ~~완전 상류 vanilla 서버 미검증~~ → **§18 에서 해소. 이제 상류 제출을 막는 것이 없다.**
 
 ### 0.4 이 조사에서 얻은 측정 규칙 (이걸 어기면 또 틀린다)
 
@@ -563,7 +565,13 @@ wire 포맷 차이 때문일 가능성은 배제했다: 패치 mercury 와 스�
 
 ---
 
-# 13. 2.8.0-rc3 에서도 동일하다 (2026-09-01, 서버 reformat 실측)
+# 13. "2.8.0-rc3" 서버에서도 동일하다 (2026-09-01, 서버 reformat 실측)
+
+> **⚠️ 정정(2026-09-01 심야, 사용자 지적):** 이 절에서 "2.8.0-rc3" 라고 부른 서버는 upstream
+> 이 아니라 **`port/2.8-wsd` = upstream rc3 + 66 커밋**(zfs-cap/WS-D staging, bio/vos 수정 포함)
+> 이다. TAG 파일이 2.8.0-rc3 인 것을 upstream 으로 오기했다. 실행 바이너리 검증: 8/23 빌드
+> RPM 의 `libbio.so` 에 WS-D 문자열 존재. 이 절이 실제로 증명한 것은 "**rc3 기반 ExaStor
+> 브랜치**도 동일 손상"이며, **완전 upstream 재현은 §18 이 확정**했다.
 
 질문: "2.8-rc3 에서도 동일할까?" — **동일하다.** 추론이 아니라 같은 하드웨어·토폴로지·provider
 에서 서버를 2.8.0-rc3 로 되돌려 측정했다(사용자 승인 후 gdspool 파기).
@@ -939,8 +947,8 @@ upstream `3604d406ef`(2.8.0-rc3)·`841487de8`(2.9.100).
 ⇒ 결함은 양쪽이 공유하는 것: **upstream 코어(bio/vos/vea/object), prereq(SPDK v26.01 — upstream
 자체 bump, mercury 2.4.1+패치 5종), 그리고 MD-on-SSD 구성.**
 
-주의: §12.1 의 "스톡" A/B 는 클라이언트만 스톡이었다(§12.8d 그대로). 서버까지 완전 upstream
-인 검증은 여전히 미실시 — 다만 위 서로소 논증이 그 필요성을 크게 줄인다.
+주의: §12.1 의 "스톡" A/B 는 클라이언트만 스톡이었다(§12.8d 그대로). ~~서버까지 완전 upstream
+인 검증은 여전히 미실시~~ → **§18 에서 실측 완료: 완전 upstream 서버에서도 동일 재현.**
 
 ## 17.2 mercury/cart bulk 코어도 배제된다 (기존 증거 재해석)
 
@@ -991,3 +999,62 @@ foreign** — 두 변종이 한 기전으로 설명되는 유일한 후보. 내�
   (§15.3)이 그 경로 없이도 손상됐으므로 단독 원인은 아니다.
 - VEA 내부(aging/reuse 창)와 SPDK blobstore 소스는 미감사 — S1/S2 판별 실험이 먼저다.
 - 2.8 서버에서 agg-내부-읽기 손상 재확인(§17.2 단서) 미실시.
+
+---
+
+# 18. ★★★ 완전 upstream 스택에서 재현 확정 (2026-09-01 심야) — 상류 버그로 종결
+
+사용자 지적("아까 upstream 2.8-rc3 에서 테스트 해본 거 아니었나?")이 §13 의 오기(升級)를
+드러냈고, 그 구멍을 측정으로 닫았다. **이번에는 진짜 전 스택 upstream 이다.**
+
+## 18.1 무엇이 스톡인가 (전부 검증)
+
+| 구성요소 | 내용 | 검증 |
+|---|---|---|
+| 서버 코어 | `/var/daos-stockfull` = upstream `841487de8`(v2.9.100-tb 계열) | `libbio.so` 에 WS-D 문자열 **0건**(wsd RPM 은 1건) |
+| 서버 prereq | mercury·UCX·SPDK·ofi 전부 `--build-deps=yes` 스톡 빌드(§12.1 의 그 빌드) | rkey 심볼 0, UCX CUDA 매크로 없음 |
+| 클라이언트 | 같은 `/var/daos-stockfull` (agent·libdaos·재현기 링크) | §12.1 검증 재사용 |
+| provider | `ofi+tcp` (RDMA 없음) | — |
+| 컨테이너 | RP_2G4·chunk 4 MiB·rd_fac:1 (기존과 동일) | — |
+
+## 18.2 결과 — 동일 서명, 동일 자릿수
+
+| | 결과 |
+|---|---|
+| DFS 16×40 ×8 | **86/5120 = 1.68 %** (62·0·0·0·0·0·7·17 — 버스트 패턴 그대로) |
+| raw obj ×3 | **59/1920** (6·7·46) |
+| 서명 | 동일: chunk 하나가 **같은 라운드 다른 객체** 데이터 (`object t9's data (round 0, offset 4194264)` 등), retry STILL WRONG 다수 |
+
+## 18.3 판정
+
+> **ExaStor 패치는 서버·클라이언트·prereq 어디에도 원인이 없다. 이것은 순수 upstream DAOS
+> (2.9.100 계열, MD-on-SSD, provider 불문)의 서버측 fetch 데이터패스 결함이다.**
+
+§17.1 의 서로소 논증에 남아 있던 잔여 가설("서로 다른 두 커스텀 패치가 우연히 같은 서명을
+만든다")까지 소멸. §17.4 의 용의자 순위(S1 SPDK v26.01 blobstore read, S2 VEA)는 그대로
+유효하며, 이제 전부 **upstream 코드** 안에 있다.
+
+상류 제출 관점에서 현재 클러스터 상태가 이상적이다: **재현기·서버·클라 전부 upstream 소스로
+빌드된 상태에서 재현 중** — "귀사 코드만으로 재현된다"를 스크린샷 수준으로 보여줄 수 있다.
+
+## 18.4 스톡 서버 배포 함정 (재현용 레시피)
+
+1. scons 설치본에는 SPDK 스크립트가 없다 → `daos_server` auto-prepare 가
+   "Could not find the SPDK setup.sh script" 로 실패. **빌드 트리에서
+   `external/release/spdk/{scripts,include/spdk}` 를 `<prefix>/share/daos/spdk/` 로 복사**
+   (setup.sh 는 `../include/spdk/pci_ids.h` 를 요구한다).
+2. `daos_server_helper` 는 **root:daos_server + setuid(4750)** 필요(RPM 과 동일하게).
+3. client-5 는 SELinux Enforcing — `/var` 아래 바이너리(var_t)를 systemd 가 실행 거부(203/EXEC).
+   `chcon -R -t bin_t <prefix>/bin` + lib 는 lib_t.
+4. helper 버전 불일치 주의: 셸 PATH 에 /usr/bin 이 앞서면 2.8 helper 를 집는다("version
+   mismatch server 2.9.100 / helper 2.8.0"). systemd drop-in 의 PATH 를 prefix 우선으로.
+5. cell1 wedge 레시피(§15.7)는 스톡 서버에서도 동일하게 유효했다.
+
+## 18.5 현재 환경
+
+- cell1/cell2: **완전 스톡 2.9.100 서버**(`/var/daos-stockfull`), provider `ofi+tcp`,
+  pool `gdspool`(SCM 8G+NVMe 200G/rank), 컨테이너 `ci_m28`·`ci_obj`. 양 rank Joined.
+- client-5: 스톡 agent(systemd, SELinux 라벨 수정됨), `/root/dfs_integrity_stock`·
+  `/root/obj_integrity_stock`(둘 다 stockfull 링크). 결과: `/root/stocksrv/`.
+- ExaStor 빌드로 복귀: drop-in 을 `/usr/bin/daos_server`(2.8-wsd RPM) 또는
+  `/opt/daos-gds/bin`(2.9-gds) 로 + 재포맷.
