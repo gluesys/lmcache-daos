@@ -1761,3 +1761,60 @@ DAOS 는 정지 상태이고 0000:02:00.0 은 SPDK(vfio)에 바인딩돼 blobsto
 blobstore 를 새로 만들었다(**디바이스 내용 파기됨 — DAOS 재사용 시 재포맷 필요**).
 DAOS arm 복귀: `/root/daos_server.yml.nvme2dev` 유지 상태이므로 서버 기동 → 재포맷 → pool·컨테이너
 재생성. 재현기: cell1 `/tmp/spdk_blob_tagio`(+`/tmp/blob_nvme.json`), `/tmp/spdk_nvme_tagio`.
+
+---
+
+# 30. `nvme_rw()` blob I/O 계측 — 요청은 정상, 데이터만 틀리다 (2026-09-02)
+
+§29.4-1 실행. stock 트리 `nvme_rw()` 에 발행 파라미터 로깅을 추가
+(`BLOBIO_DEBUG=1` gate, `BLOBIO R/W blob= ch= payload= io_off= io_cnt=`).
+FILLHASH(§19)와 같은 엔진 로그에 남으므로 손상 시점과 직접 대조된다.
+
+## 30.1 수집
+
+한 런(16×15, 클라 24/240 손상)에서: **4 MiB blob read 887건**, FILLHASH 2건.
+손상 직전 6건의 4 MiB 읽기:
+
+```
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203020200000 io_off=12994487 io_cnt=1024
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203020200000 io_off=13038519 io_cnt=1024
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203015400000 io_off=13035447 io_cnt=1024
+...
+FILLHASH ... exp_tid=4 ... foreign=524288, first bad at 0 val t3 r7 off 8388608
+```
+
+## 30.2 관측 — 그리고 배제
+
+1. **DMA 버퍼 재사용은 원인이 아니다.** 같은 payload 주소가 서로 다른 io_off 에 재사용되는
+   패턴이 **887건 중 882건**(정상 풀 동작). 손상은 24건뿐이므로 재사용 자체와 상관없다.
+   최대 61개의 서로 다른 io_off 가 한 payload 주소를 공유한다 — 정상.
+2. **모든 요청이 같은 blob·같은 채널**(`blob=0x...c60`, `ch=0x...eba0`). 즉 DAOS 는 타깃
+   xstream 의 단일 blob/채널로 읽고 있고, **요청 파라미터에 다른 blob 이 섞이지 않는다.**
+3. **손상 데이터는 "다른 객체의 다른 오프셋"**: FILLHASH 는 t4 의 버퍼에 `t3 r7 off 8388608`
+   데이터가 들어왔다고 말한다. 클라이언트 기록도 같은 형태(`t11` chunk0 ← `t0 r0 off 0`,
+   `t12` ← `t0 r1 off 4194304`).
+
+## 30.3 판정 — 남은 두 갈래
+
+DAOS 는 **정상적인 blob 오프셋으로 요청**하는데 **다른 데이터가 채워진다**. 요청 파라미터
+오류(§29.3 의 1순위 가설)는 **기각**된다. 남은 것:
+
+| 갈래 | 내용 | 다음 확인 |
+|---|---|---|
+| **A. blob→LBA 매핑** | DAOS 요청 io_off 는 맞지만 그 blob 의 cluster 매핑이 다른 객체 데이터를 가리킴(= blob 할당/확장 시점의 문제) | 손상 chunk 의 io_off 를 `spdk_blob_get_clusters`/ddb 로 LBA 로 환산해 다른 blob 과 겹치는지 |
+| **B. 완료 매칭** | 요청은 맞고 데이터도 맞게 읽혔으나 **완료 콜백이 다른 요청의 버퍼에 귀속**(rw_completion ↔ biod 연결) | 요청마다 고유 태그를 심어 완료 시 대조(다음 계측) |
+
+§29 에서 **동일 shape 의 blobstore 단독 시험이 깨끗**했음을 감안하면 B(완료/버퍼 귀속)가 더
+유력하다 — blobstore 자체는 요청↔완료를 정확히 처리했기 때문이다. DAOS 측에서 그 매칭을
+어긋나게 하는 것은 `bio_desc`(biod) 재사용·`bd_inflights` 회계·`drain_inflight_ios()` 의
+동시성이다.
+
+## 30.4 다음 계측 (원인 확정용)
+
+`rw_completion()` 에 **완료된 요청의 (blob, io_off, payload)** 를 로깅하고 발행 로그와
+1:1 대조한다. 발행/완료 쌍이 어긋나면 **B 확정**(DAOS 의 요청-완료 귀속 버그). 일치하면
+**A**로 넘어가 blob cluster 매핑을 덤프한다.
+
+현재 계측 상태: cell1/cell2 `/var/daos-stockfull` = upstream + FILLHASH + BLOBIO 로깅.
+소스는 cell1 `/var/daosbuild/daos-stock`(원본 백업 `/tmp/bio_buffer.c.pre-bloblog`,
+`/tmp/srv_obj.c.orig`). 로그 폭증 주의 — 4 MiB 읽기당 1줄.
