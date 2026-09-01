@@ -1058,3 +1058,66 @@ foreign** — 두 변종이 한 기전으로 설명되는 유일한 후보. 내�
   `/root/obj_integrity_stock`(둘 다 stockfull 링크). 결과: `/root/stocksrv/`.
 - ExaStor 빌드로 복귀: drop-in 을 `/usr/bin/daos_server`(2.8-wsd RPM) 또는
   `/opt/daos-gds/bin`(2.9-gds) 로 + 재포맷.
+
+---
+
+# 19. ★★★ 서버 계측 확정 — 손상은 NVMe→DMA 채움에서 발생 (2026-09-01 심야)
+
+계획서 §5.2 의 서버측 해시 지점을 **하나로 압축**해 계측했다. 완전 upstream 스택(§18)에
+디버그 패치를 얹어 fetch 버퍼를 **bulk 전송 직전**에 감사했다.
+
+## 19.1 계측 (upstream `841487de8` + 디버그, dev 박스 소스 반영)
+
+- `src/object/srv_obj.c`: `obj_local_rw()` 의 `bio_iod_prep()` 성공 직후, fetch 이면
+  `fillhash_check_sgl()` 로 각 iod 의 bio SGL 을 감사. env `FILLHASH_DEBUG=1` gate.
+- **핵심 설계 교정**: 처음엔 bio 계층(`bio_buffer.c`)에서 버퍼 자기일관성만 봤는데,
+  **chunk 전체가 통째로 다른 객체로 치환되면 자기일관(전 워드 동일 tid·단조 offset)이라
+  검출 못 함**. → OID 를 아는 object 계층으로 옮기고, obj_integrity 가 객체를
+  `oid.lo = 0xC0FFEE00 + tid` 로 만드는 것(set_oid 는 lo 보존)을 이용해 **기대 tid 대조**로
+  전환. bio 계측은 원복.
+- 빌드: `/var/daos-stockfull` 증분(`scons --build-deps=no`), `libobj.so` 재링크·양 cell 배포.
+
+## 19.2 결과 — 채움 직후 버퍼가 이미 틀렸다
+
+client 65/640 손상과 **같은 시각**, 양 rank 엔진 로그:
+
+```
+srv_obj.c:307 fillhash_check_sgl() FILLHASH <oid> iod0 iov0 exp_tid=7 len=4194304:
+    foreign=524288 zero=0 offbad=0, first bad at 0 val t14 r0 off 4194304
+    (buffer wrong BEFORE bulk send)
+```
+
+- **cell1 107건 + cell2 147건**, 전부 `foreign=524288` = **4 MiB 워드 전량**이 남의 데이터.
+  즉 fetch 한 chunk 버퍼가 **통째로 다른 객체의 chunk 로 채워졌다**(exp t7 → t14 의 off
+  4194304 데이터, 객체도 offset 도 다름).
+- `zero=0` — 이 라운드엔 zeros 변종 없음(foreign 변종만).
+- 위치: `bio_iod_prep()` 반환 직후 = **NVMe→DMA 채움 완료 시점**. mercury·cart·bulk·RDMA·
+  클라이언트 수신 경로는 **아직 실행되지도 않았다.**
+
+## 19.3 판정 — 분기 트리 종료
+
+> **손상은 서버의 fetch 채움 경로에서 발생한다: VOS extent 주소해석 → VEA → SPDK blobstore
+> read → NVMe. bulk/전송/클라이언트는 전부 무죄(코드가 아직 안 돎).**
+
+§17.4 의 남은 용의자 S1(SPDK v26.01 blobstore read)·S2(VEA 이중할당)만 남고, "채움 후
+clobber"(S4)는 계측으로 제거. §19.2 의 "chunk 전체 = 다른 객체" 형상은 S1(잘못된 cluster
+매핑)·S2(extent 겹침) 둘 다와 부합. 다음 판별:
+- **SPDK v26.01 → v25.x 다운그레이드 A/B**(prereq 만 교체 재빌드): clean 이면 S1 확정.
+- VEA alloc/free 겹침 assert 디버그 빌드: 걸리면 S2 확정.
+
+## 19.4 NVMe 물리 교차 점유는 아님 (사용자 질의 확인)
+
+`dmg storage query list-devices`: **8 NVMe ↔ target 0–7 이 1:1**, 공유 없음. 따라서 "다른
+객체 데이터"는 **두 SSD 가 서로 새는 것이 아니라 한 target 내부**(같은 SSD 의 blob 공간에
+여러 객체 chunk 공존)에서 cluster 오매핑/extent 겹침으로 발생. → S1/S2 와 일치. 소스라우팅은
+양 cell 에 적용 유지 확인(정책라우팅 100/101, arp_ignore/announce, rp_filter=2) — fetch 채움
+결함과는 무관(서버 내부라 네트워크 이전 문제).
+
+## 19.5 환경/자산
+
+- 디버그 서버 실행중: `/var/daos-stockfull`(upstream + fillhash 패치), `FILLHASH_DEBUG=1`
+  양 cell yml. provider ofi+tcp, pool gdspool, 컨테이너 ci_m28·ci_obj.
+- 디버그 패치 소스: dev 박스 `~/src/Flexa/daos` (branch `port/2.8-wsd` 워킹트리 —
+  srv_obj.c 에 fillhash_check_sgl/enabled, **커밋 안 함**. cell1 `/var/daosbuild/daos-stock`
+  에 동일 패치 적용본). 원복하려면 `/tmp/srv_obj.c.orig` 복원 후 재빌드.
+- 결과 로그: client-5 `/root/fh2/`, 서버 `/var/log/daos/daos_engine.0.log`.

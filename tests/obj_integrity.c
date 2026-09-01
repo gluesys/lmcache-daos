@@ -21,10 +21,10 @@
  *   -t N     threads     (default 16)
  *   -r N     rounds      (default 40)
  *   -T N     tid base (multi-process arm)
+ *   -o CLASS object class (default RP_2G4; use RP_2G1 on 2-target pools)
  *   -m MODE  burst | loop
- *   -p POOL -c CONT      (container may be plain or POSIX; objects are
- *                         created with oclass hint OC_RP_2G4 semantics via
- *                         daos_oclass_name2id)
+ *   -p POOL -c CONT      (container may be plain or POSIX; object class is
+ *                         resolved with daos_oclass_name2id)
  *
  * Build:
  *   gcc -O2 -pthread -o obj_integrity obj_integrity.c \
@@ -238,7 +238,7 @@ int main(int argc, char **argv)
 {
 	int opt, rc, ret = 0;
 
-	while ((opt = getopt(argc, argv, "p:c:s:k:t:r:T:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "p:c:s:k:t:r:T:o:m:h")) != -1) {
 		switch (opt) {
 		case 'p': g_pool = optarg; break;
 		case 'c': g_cont = optarg; break;
@@ -247,10 +247,12 @@ int main(int argc, char **argv)
 		case 't': g_threads = atoi(optarg); break;
 		case 'r': g_rounds = atoi(optarg); break;
 		case 'T': g_tid_base = atoi(optarg); break;
+		case 'o': g_oclass = optarg; break;
 		case 'm': g_burst = strcmp(optarg, "burst") == 0; break;
 		default:
 			fprintf(stderr, "usage: %s [-p pool] [-c cont] [-s MiB]"
 				" [-k chunkMiB] [-t n] [-r n] [-T base]"
+				" [-o oclass]"
 				" [-m burst|loop]\n", argv[0]);
 			return 2;
 		}
