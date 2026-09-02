@@ -2630,3 +2630,81 @@ DAOS 는 한 장치를 WAL·meta·data 역할로 쪼개 쓰는데(§41.1 의 RES
 2. 물리 내용 직접 확인(§41.4-2) — 여전히 유효한 최종 확정 수단.
 3. 그래도 안 갈리면 재현기를 `daos_server` 가 만든 blobstore 옵션(클러스터 크기,
    md 페이지 수, 역할)과 **동일하게** 맞춘다.
+
+---
+
+# 43. SPDK 버전 축 — 범프 직전(v24.09)도 손상된다. 배제 (2026-09-02)
+
+## 43.1 문제 제기가 옳았다 — 우리가 쓰던 SPDK 는 갓 올라간 것이었다
+
+`daos-stock` 이 고정한 SPDK 와 실제 빌드는 **v26.01 로 일치**한다. 그러나 그 핀 자체가 새것이다:
+
+```
+c872e2dd8  DAOS-18943 build: Upgrade SPDK dependency to v26.01 (#18172)   2026-05-22
+8f8b9578c  DAOS-17207 build: upgrade to SPDK 24.09 (#16774)              ← 그 전 핀
+```
+
+우리 트리 HEAD 는 2026-06-26, **범프 5주 후**다. 범프 커밋은 스스로 "significant changes and
+new features … required multiple compatibility fixes across the build system and codebase" 라고
+적고 있다(`spdk_pci_device_get_socket_id()` → `get_numa_id()`, SPDK 패치 제거,
+ISA-L Crypto 2.25→2.26 동반 상향).
+
+게다가 §13·§18 의 "2.8 에서도 재현된다"는 결론은 **교란돼 있었다** — `daos-gds`(2.8-wsd)
+트리도 `spdk=v26.01` 을 고정한다. 즉 시험한 것은 "2.8 코드 + 갓 범프된 SPDK" 였고,
+2.8 릴리스가 쓰는 v24.09 는 그때까지 **한 번도 시험하지 않았다.**
+
+## 43.2 범프 직전 커밋을 그대로 빌드했다
+
+핀만 되돌리면 API 호환 수정 때문에 빌드가 깨진다. 그래서 범프 직전 커밋
+`6cc78c444`(= `c872e2dd8^`, `spdk=v24.09`)를 worktree 로 떼어 **격리된 PREFIX**
+(`/var/daos-prebump`)로 전체 빌드했다.
+
+| | |
+|---|---|
+| 범프 직전 빌드의 SPDK | **24.9.0** |
+| 스톡 빌드의 SPDK | 26.1.0 |
+| DAOS 버전 | 양쪽 2.9.100 |
+
+빌드 중 걸린 것들: SPDK 24.09 는 `pip` 을 요구한다(v26.01 이 `uv` 로 바꾼 그 부분) — `pip3`
+심링크로 해결. 실패한 부분 빌드가 남으면 scons 가 "spdk already has a build directory" 로
+재빌드를 건너뛴다 — prebump 경로만 지우고 재개. `systemd-run` 에 `HOME` 이 없어 Go
+컨트롤 플레인 빌드가 실패 — `--setenv=HOME=/root`. 기동 시 `/usr/bin/daos_server_helper`
+(RPM 2.8.0)를 집어 버전 불일치 — 스톡과 같은 방식으로 drop-in 에 `Environment=PATH=` 를
+앞세워 해결.
+
+## 43.3 결과 — 24.09 도 똑같이 손상된다
+
+포맷 직후 첫 런(§34 조건)으로 4 회:
+
+| 런 | SPDK 24.09 |
+|---|---|
+| 1 | **FAIL 38/160** |
+| 2 | FAIL 10/160 |
+| 3 | FAIL 11/160 |
+| 4 | FAIL 17/160 |
+| **합계** | **76 / 640 = 11.9 %** |
+
+서명도 동일하다 — 청크 정렬, 4 MiB 통째로 남의 객체 데이터, `retry=STILL WRONG`:
+
+```
+CORRUPT t7 r7 first bad word at 20971520 (chunk-aligned): t9 r7 off 20971520
+CORRUPT t4 r8 first bad word at 8388608  (chunk-aligned): t1 r8 off 0
+CORRUPT t8 r9 first bad word at 4194304  (chunk-aligned): t3 r9 off 4194304
+```
+
+v26.01 arm 의 첫-런 비율은 §34·§35 누적 13.7 % 였다. **11.9 % 대 13.7 % — 차이가 없다.**
+
+## 43.4 판정
+
+**SPDK 버전 축은 배제된다.** v26.01 범프는 이 결함을 만들지 않았다. 결함은 **v24.09 시절부터
+존재**하며, 따라서:
+
+- 2.8 릴리스 계열(v24.09 고정) 사용자도 **영향을 받는다.** 이건 새 회귀가 아니다.
+- §13·§18 의 교란은 해소됐다 — 결론("업스트림도 재현")은 이제 **올바른 SPDK 로도** 성립한다.
+- 업스트림 보고 시 "최신 SPDK 범프 때문"이라는 손쉬운 기각을 미리 막을 수 있다.
+
+## 43.5 남은 것
+§42.6 의 1 순위였던 **`bdev_roles`/역할 배치 재검**이 그대로 다음이다.
+그리고 §42.5 의 지적 — **§34 이전에 "무관"으로 판정한 구성 축 전체**가 검정력 0 이었을
+가능성 — 이 여전히 가장 값싼 재검 묶음이다. 이번 절은 그 목록에서 SPDK 버전 하나를,
+이번엔 신호가 있는 조건에서 제대로 지웠다.
