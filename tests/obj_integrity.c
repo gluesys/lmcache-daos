@@ -53,6 +53,15 @@ static size_t g_chunk  = 4ul << 20;
 static int    g_threads = 16;
 static int    g_rounds  = 40;
 static int    g_tid_base = 0;
+/*
+ * -A <round>: audit only.  Skip the workload entirely and re-read every
+ * object serially, single threaded, expecting the tag of <round>.  Run as a
+ * separate process after a corrupting run, this answers whether a chunk that
+ * came back as another object's data is still wrong once all concurrency is
+ * gone -- i.e. whether the logical-to-physical mapping is persistently wrong,
+ * or the corruption only exists inside the concurrent window.
+ */
+static int    g_audit = -1;
 static bool   g_burst  = true;
 static const char *g_pool = "gdspool";
 static const char *g_cont = "ci_obj";
@@ -238,7 +247,7 @@ int main(int argc, char **argv)
 {
 	int opt, rc, ret = 0;
 
-	while ((opt = getopt(argc, argv, "p:c:s:k:t:r:T:o:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "p:c:s:k:t:r:T:o:m:A:h")) != -1) {
 		switch (opt) {
 		case 'p': g_pool = optarg; break;
 		case 'c': g_cont = optarg; break;
@@ -249,11 +258,12 @@ int main(int argc, char **argv)
 		case 'T': g_tid_base = atoi(optarg); break;
 		case 'o': g_oclass = optarg; break;
 		case 'm': g_burst = strcmp(optarg, "burst") == 0; break;
+		case 'A': g_audit = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: %s [-p pool] [-c cont] [-s MiB]"
 				" [-k chunkMiB] [-t n] [-r n] [-T base]"
 				" [-o oclass]"
-				" [-m burst|loop]\n", argv[0]);
+				" [-m burst|loop] [-A round]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -295,6 +305,64 @@ int main(int argc, char **argv)
 		if (rc) { fprintf(stderr, "generate_oid: %d\n", rc); return 2; }
 	}
 
+	if (g_audit >= 0) {
+		unsigned char *dst = NULL;
+		char detail[256];
+		size_t nchunks = g_objsz / g_chunk;
+
+		if (posix_memalign((void **)&dst, PAGE, g_objsz)) return 2;
+		printf("AUDIT: quiescent serial re-read, expecting round %d\n",
+		       g_audit);
+		for (int i = 0; i < g_threads; i++) {
+			daos_handle_t oh;
+			bool ok = true;
+
+			rc = daos_obj_open(g_coh, args[i].oid, DAOS_OO_RO, &oh,
+					   NULL);
+			if (rc) {
+				printf("  AUDIT t%-2d obj_open rc=%d\n",
+				       args[i].tid, rc);
+				ret = 2;
+				continue;
+			}
+			memset(dst, 0xA5, g_objsz);
+			for (size_t c = 0; c < nchunks && ok; c++)
+				if (chunk_io(oh, false, c, dst + c * g_chunk,
+					     g_chunk))
+					ok = false;
+			daos_obj_close(oh, NULL);
+			if (!ok) {
+				printf("  AUDIT t%-2d fetch failed\n",
+				       args[i].tid);
+				ret = 2;
+				continue;
+			}
+			g_reads++;
+			{
+				bool clean = true;
+				uint64_t *w = (uint64_t *)dst;
+
+				for (size_t k = 0; k < g_objsz / 8; k++)
+					if (w[k] != tag_of(args[i].tid, g_audit,
+							   k * 8)) {
+						clean = false;
+						break;
+					}
+				if (clean)
+					continue;
+			}
+			diagnose(dst, g_objsz, args[i].tid, g_audit, detail,
+				 sizeof(detail));
+			g_bad++;
+			printf("  AUDIT t%-2d STILL WRONG | %s\n",
+			       args[i].tid, detail);
+		}
+		free(dst);
+		printf("%s: %ld/%ld objects still wrong when quiescent\n",
+		       g_bad ? "AUDIT-FAIL" : "AUDIT-PASS", g_bad, g_reads);
+		goto done;
+	}
+
 	for (int i = 0; i < g_threads; i++)
 		pthread_create(&th[i], NULL, worker, &args[i]);
 	for (int i = 0; i < g_threads; i++)
@@ -309,6 +377,8 @@ int main(int argc, char **argv)
 
 	printf("%s: %ld/%ld reads corrupt (raw object API)\n",
 	       g_bad ? "FAIL" : "PASS", g_bad, g_reads);
+
+done:
 	if (g_bad && ret == 0) ret = 1;
 
 	daos_cont_close(g_coh, NULL);
