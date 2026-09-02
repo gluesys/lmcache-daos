@@ -3621,3 +3621,80 @@ PASCARI 는 4 KiB LBA(`flbas=0x2`), Samsung 은 512 B(`flbas=0`)였다. 벤더�
 2. **업스트림 DAOS 티켓 + Phison 문의** — 양쪽 다 근거가 확정됐다.
 3. 참고: cell1·cell2 의 데이터 드라이브는 현재 **512 B 포맷**으로 남아 있다.
    4 KiB 로 되돌리려면 `nvme format /dev/nvmeXn1 --lbaf=2`.
+
+---
+
+# 56. DAOS 에 NVMe 모델/제조사 support 항목이 있는가 — 없다 (2026-09-03)
+
+"DAOS 이슈에 NVMe 모델/제조사 support 항목이 있는지" 확인했다. 이는 업스트림 보고 시
+**"그 드라이브는 지원 목록에 없다"로 기각당할 수 있는지**를 결정한다.
+
+## 56.1 공개 support matrix — 검증된 NVMe 목록이 없다
+
+`docs.daos.io` 의 Support Matrix(v2.8)에는 **검증·지원 NVMe 모델이나 벤더 목록이 전혀 없다.**
+화이트리스트도 하드웨어 인증 목록도 없다. 관련 문장은 다음이 전부다:
+
+- "DAOS servers use NVMe disks for bulk storage, accessed in user space through the **SPDK** toolkit."
+  → 요구조건은 **"SPDK 가 지원하는 장치"** 뿐이다.
+- "It is strongly recommended that all DAOS engines in a DAOS system have identical NVMe
+  storage configurations."
+- 영구 메모리 구성: "all NVMe disks managed by a single DAOS engine must have identical
+  capacity (and it is **strongly recommended to use identical drive models**)."
+- "NVMe storage can be emulated by files … **This is not a supported configuration in a
+  production environment.**"
+
+⇒ **모델·벤더 단위의 지원 판정 개념이 DAOS 에 존재하지 않는다.**
+따라서 "PASCARI 는 미지원 하드웨어"라는 기각 논리는 성립할 수 없다.
+
+벤더별 특별 취급은 하나뿐이다 — **SMART 통계가 Intel 장치에만 벤더별로 표시**된다.
+
+## 56.2 그러나 문서가 요구하는 두 가지가 있고, 우리는 둘 다 충족한다
+
+`docs/admin/predeployment_check.md` 에서:
+
+1. **4 K 블록 포맷 권장** — "DAOS server performs NVMe I/O in 4K granularity so in order to
+   avoid alignment issues it is beneficial to format the SSDs … with a 4K block size."
+   우리의 손상 구성은 원래 4 KiB(`flbas=0x2`)였다 — **권장을 따른 상태에서 손상된다.**
+   §55.3 에서 512 B 로 바꿔 시험한 뒤(67.3 %) **4 KiB 로 되돌려 놓았다**
+   (cell1·cell2 4 대 전부 `flbas=0x2` 확인). 보고 구성이 문서 권장과 일치해야 하기 때문이다.
+2. **VFIO 필수, UIO 미지원** — "the use of VFIO on these distributions is a requirement
+   since UIO is not supported."
+   cell1/cell2 는 `vfio-pci` 다(§54.3). 그리고 §54.4 에서 깨끗한 Samsung 쪽도
+   **VFIO 로 맞춰** 재측정했으므로, 양쪽 모두 문서가 요구하는 구성에서 비교됐다.
+   (초기 Samsung 런은 UIO 였다 — 문서상 미지원 구성이었으므로 그 자체로는 근거가 약했고,
+   IOMMU 를 켜 VFIO 로 다시 돌린 것이 옳았다.)
+
+## 56.3 이슈 트래커 — 벤더별 손상 보고 없음
+
+- `daos-stack/daos` GitHub 은 사실상 **PR 트래커**다. `nvme corruption` 검색 결과 11 건이
+  모두 PR 이었다(테스트·복구·csum 관련). 버그는 **JIRA(`daosio.atlassian.net`)** 로 관리된다.
+- JIRA REST 는 비인증 접근이 막혀 있고(HTTP 410), 공개 검색으로도
+  **특정 NVMe 벤더/모델의 데이터 손상 이슈는 찾지 못했다.**
+- SPDK 쪽에서 관련된 것은 §54.2 의 `spdk/spdk#1738`(UIO 사용 시 데이터 불일치) 하나이고,
+  우리 증상과는 방향이 반대다.
+
+## 56.4 보고에 쓸 수 있는 근거 — DAOS 자신의 설계 목표
+
+DAOS VOS 설계 문서의 문장:
+
+> "The VOS layer must validate the integrity of all persisted object data to
+> **eliminate the possibility of silent data corruption**"
+
+체크섬이 **기본 off** 인 상태에서 우리가 관측한 것은 이 목표의 직접적 위반이다
+(§49 에서 체크섬을 켜면 `DER_CSUM` + RAS 이벤트로 탐지됨을 확인했다).
+즉 보고는 "특정 하드웨어에서 안 된다"가 아니라
+**"기본 구성에서 silent data corruption 이 발생하고, 설계 목표는 그것을 배제한다고 명시한다"**
+로 프레이밍할 수 있다.
+
+## 56.5 정리
+
+| 질문 | 답 |
+|---|---|
+| DAOS 에 NVMe 모델/벤더 지원 목록이 있는가 | **없다** |
+| 하드웨어 요구조건은 무엇인가 | "SPDK 가 지원", 엔진 내 동일 용량(동일 모델 권장), 에뮬레이션은 프로덕션 미지원 |
+| 벤더별 특별 취급 | Intel SMART 통계 표시뿐 |
+| 문서가 요구하는 구성 중 우리가 어긴 것 | **없음** (4 K 포맷·VFIO 둘 다 충족) |
+| 트래커에 유사 벤더 이슈 | **없음** |
+
+⇒ **"미지원 하드웨어"라는 회피 경로가 없다.** 업스트림 티켓을 낼 때 이 점을 명시하는 것이
+기각을 막는 데 유효하다.
