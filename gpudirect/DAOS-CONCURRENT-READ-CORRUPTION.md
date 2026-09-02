@@ -1857,3 +1857,66 @@ cluster 할당/매핑이 어긋나 있다. 이는 §29 의 blobstore 단독 시�
    io_off 를 blk_off 로 환산해 **다른 객체의 예약과 겹치는지** 직접 확인. 겹치면 **확정**.
 2. `ddb` 로 손상 후 VOS 트리를 덤프해 두 객체의 extent 가 같은 blk 를 가리키는지 확인(정적 증거).
 3. 확정되면 상류 이슈는 **VEA 할당자 버그**로, 재현기 4종(§28·§29 음성 대조 포함) 첨부.
+
+---
+
+# 31. VEA 계측 — 할당자도 결백. 모든 계층이 "정상"인데 데이터만 틀리다 (2026-09-02)
+
+§30.5 가 남긴 마지막 갈래(VEA 가 겹치는 extent 를 내준다)를 계측했다.
+`vea_reserve()`/`vea_free()` 에 로깅 + **라이브 예약 테이블 기반 겹침 즉시 판정**
+(`VEALOG_DEBUG=1`, `tests` 외부: cell1 `/var/daosbuild/daos-stock/src/vea/vea_api.c`,
+원본 `/tmp/vea_api.c.pre-log`).
+
+## 31.1 결과 (손상 25/192 유도 런)
+
+| 지표 | 값 |
+|---|---|
+| `VEALOG OVERLAP` (겹치는 예약) | **0** |
+| `VEALOG RESERVE` | 1344 (**전부 `cnt=1024`=4 MiB, offset 전부 고유**) |
+| `VEALOG FREE` | **0** (런 중 재사용 없음) |
+| 4 MiB blob read 발행 | 731 |
+| FILLHASH(채움 직후 손상) | 18 |
+| **읽기 io_off 가 자기 예약 범위 안에 있는 비율** | **731 / 731 (100 %)** |
+
+VEA blk 와 blob io unit 이 모두 4096 B 라 직접 비교했다. **모든 읽기가 유효한 예약 안이고,
+어떤 두 예약도 겹치지 않는다.**
+
+## 31.2 판정 — 갈래 A 도 기각, 모순 상태에 도달
+
+§30 과 합치면 지금까지 확인된 것은:
+
+| 단계 | 상태 |
+|---|---|
+| VEA 예약 | 겹침 없음, 전부 고유 (§31.1) |
+| DAOS 가 요청하는 blob 오프셋 | 자기 예약 안, 정상 (§31.1) |
+| blob I/O 요청 파라미터(blob·채널·범위) | 정상 (§30.2) |
+| SPDK blobstore/bdev/드라이버 | 무결 (§27·§28·§29) |
+| 완료 콜백 귀속 | 1:1 정상 (§30.5) |
+| **채움 직후 버퍼 내용** | **다른 객체 데이터 (§19·§31.1)** |
+
+즉 **"올바른 blob 의 올바른 오프셋을, 겹치지 않는 영역에서, 올바르게 완료된 요청으로 읽었는데
+다른 객체의 데이터가 들어 있다."** 남은 가능성은 좁고 구체적이다:
+
+1. **쓰기 측 오배치** — 손상은 read 가 아니라 **write** 에서 발생했을 수 있다. 지금까지의 계측은
+   전부 read 경로였다. 객체 A 의 데이터가 객체 B 의 blk 에 기록됐다면, B 를 정확히 읽어도 A 의
+   데이터가 나온다. **§19 의 "at-rest 는 대체로 정상"과 상충하는 듯하지만, at-rest 검증은
+   손상 이후 재기록된 상태를 본 것일 수 있다.**
+2. **VOS extent → blob offset 변환** — VEA 예약은 정상이나 `vos_io` 가 biov 에 채워 넣는
+   `ba_off` 가 다른 객체의 예약을 가리킬 수 있다(예약 자체는 고유해도 **매핑 단계**에서 뒤바뀜).
+3. SPDK blobstore 의 **cluster 매핑**(blob 오프셋→LBA)이 두 blob 에서 겹침 — §29 의 단독
+   시험은 blob 을 한 번만 확장했으므로 이 경로를 충분히 흔들지 못했을 수 있다.
+
+## 31.3 다음 (가장 값싼 순)
+
+1. **쓰기 경로 FILLHASH** — `bio_iod_post()`(update 완료) 직전에 DMA 버퍼를 감사해, 기록되는
+   내용이 그 객체 것인지 확인. 손상이 쓰기 측이면 여기서 잡힌다. **1순위**: read 측 계측이
+   전부 "정상"인 지금, 가장 큰 미탐색 영역이다.
+2. **`ba_off` 로깅** — `nvme_rw()` 에서 `rg->brr_off`(=blob offset)와 그 IOD 의 객체(OID)를
+   함께 남겨, **같은 blob offset 을 서로 다른 OID 가 읽는지** 직접 확인. 겹치면 §31.2-2 확정.
+3. `spdk_blob_get_clusters()` 로 손상 시점 두 blob 의 cluster 맵 덤프(§31.2-3).
+
+## 31.4 현재 계측 상태
+cell1/cell2 `/var/daos-stockfull` = upstream + FILLHASH(srv_obj) + BLOBIO(bio_buffer) +
+VEALOG(vea_api). 원본 백업: `/tmp/srv_obj.c.orig`, `/tmp/bio_buffer.c.pre-bloblog`,
+`/tmp/bio_buffer.c.pre-compl`, `/tmp/vea_api.c.pre-log`.
+로그량 주의: VEALOG 는 예약당 1줄, BLOBIO 는 I/O 당 1줄.
