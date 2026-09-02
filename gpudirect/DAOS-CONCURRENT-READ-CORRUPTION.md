@@ -1818,3 +1818,42 @@ DAOS 는 **정상적인 blob 오프셋으로 요청**하는데 **다른 데이�
 현재 계측 상태: cell1/cell2 `/var/daos-stockfull` = upstream + FILLHASH + BLOBIO 로깅.
 소스는 cell1 `/var/daosbuild/daos-stock`(원본 백업 `/tmp/bio_buffer.c.pre-bloblog`,
 `/tmp/srv_obj.c.orig`). 로그 폭증 주의 — 4 MiB 읽기당 1줄.
+
+## 30.5 완료 계측 결과 — 갈래 B(완료 귀속)도 기각
+
+`rw_completion()` 에도 로깅 추가(`BLOBIO DONE biod= err= inflights_left= type=`).
+발행 측에는 thread-local 시퀀스 번호를 붙였다. (빌드 함정: `rw_completion()` 이 헬퍼
+정의보다 앞서므로 **파일 스코프 전방 선언 필수** — 함수 본문 안에 넣으면
+`invalid storage class` 로 실패한다.)
+
+손상 50/192 를 유도한 런에서:
+
+| 지표 | 값 |
+|---|---|
+| 4 MiB read 발행 | 817 |
+| 완료 콜백 | 3616 (대부분 WAL/체크포인트의 `io_cnt=1` 소형 I/O) |
+| `inflights_left=0` 비율 | 4807/4823 |
+| 한 `biod` 주소당 발행/완료 | 24 / 176 — **주소 재사용** |
+
+시간순 추적 결과 **발행과 완료가 정확히 1:1 로 교대**한다(`W` → `DONE inflights_left=0`).
+`biod` 주소가 176회 등장하는 것은 **구조체 풀의 순차 재사용**이지 귀속 오류가 아니다.
+
+⇒ **§30.3 의 갈래 B(완료가 다른 요청의 버퍼에 귀속) 기각.** 요청도 정상, 완료 매칭도 정상,
+그런데 버퍼 안의 데이터만 다른 객체 것이다.
+
+### 남은 것은 갈래 A — blob→LBA 매핑
+
+DAOS 가 올바른 blob 오프셋으로 요청하고 완료도 올바르게 매칭되는데 내용이 다른 객체의 것이라면,
+**그 blob 오프셋이 물리적으로 다른 객체의 데이터를 가리키고 있다**는 뜻이다. 즉 blob 의
+cluster 할당/매핑이 어긋나 있다. 이는 §29 의 blobstore 단독 시험이 깨끗했던 것과도 모순되지
+않는다 — 그 시험은 **blob 을 새로 만들어 한 번만 쓴** 반면, DAOS 는 **VOS 가 blob 안에서
+공간을 할당·재사용**(VEA)하기 때문이다.
+
+⇒ **최종 용의자: VEA(=DAOS 의 blob 내부 공간 할당자)가 서로 다른 객체에 겹치는 extent 를
+내주는 것.** §17.4 의 S2 가설로 되돌아왔고, 이제 다른 모든 갈래가 배제되어 단독으로 남았다.
+
+### 다음 (원인 확정)
+1. `vea_reserve()`/`vea_free()` 에 (blk_off, blk_cnt, 소유 객체) 로깅 → 손상 chunk 의
+   io_off 를 blk_off 로 환산해 **다른 객체의 예약과 겹치는지** 직접 확인. 겹치면 **확정**.
+2. `ddb` 로 손상 후 VOS 트리를 덤프해 두 객체의 extent 가 같은 blk 를 가리키는지 확인(정적 증거).
+3. 확정되면 상류 이슈는 **VEA 할당자 버그**로, 재현기 4종(§28·§29 음성 대조 포함) 첨부.
