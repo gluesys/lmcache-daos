@@ -20,6 +20,20 @@
  * all workers hammering concurrently, and the same self-describing payload
  * (region<<48)|(round<<40)|offset so a wrong region names its own origin.
  *
+ * §41.4 additions, after the DAOS side was measured clean at every layer:
+ *   -Y MiB   blob capacity, so a blob spans MANY clusters and each round writes
+ *            at a DIFFERENT non-zero offset.  The original version sized blobs
+ *            to a single I/O and always wrote at offset 0, which never
+ *            exercises the cluster-map offset translation that the observed
+ *            adjacent-chunk slide (§40.2) points at.
+ *   -K n     WAL-like blobs taking continuous SMALL writes at rotating offsets
+ *            while the 4 MiB traffic runs.  MD-on-SSD drives WAL, meta and data
+ *            blobs concurrently on one blobstore; uniform 4 MiB I/O does not.
+ *   -X       share a single io_channel across all blobs, the way DAOS shares
+ *            one channel per xstream, instead of one channel per blob.
+ * The payload tag carries the blob byte offset, so data that slid in from
+ * another offset of the same blob is named as precisely as a foreign blob.
+ *
  * Runs on SPDK's app framework (single reactor, asynchronous state machine),
  * because blobstore calls must be issued from an SPDK thread.
  *
@@ -42,11 +56,17 @@
 #include "spdk/thread.h"
 
 #define MAX_WORKERS 32
+#define MAX_WAL     8
+#define MAX_BLOBS   (MAX_WORKERS + MAX_WAL)
 
 static char    *g_bdev_name = "Nvme0n1";
 static int      g_workers   = 8;
 static int      g_rounds    = 20;
 static uint64_t g_io_size   = 4ul << 20;   /* one DAOS DFS chunk */
+static uint64_t g_cap       = 128ul << 20; /* blob capacity: many clusters */
+static int      g_wal       = 1;           /* WAL-like small-write blobs */
+static uint64_t g_small     = 8ul << 10;   /* their I/O size */
+static int      g_share_ch;                /* one channel for every blob */
 
 struct worker {
 	int                      id;
@@ -57,14 +77,22 @@ struct worker {
 	uint8_t                 *rbuf;
 	int                      round;
 	uint64_t                 io_pages;    /* io size in blobstore pages */
+	uint64_t                 cap_pages;   /* blob capacity in pages */
+	uint64_t                 off_pages;   /* where this round writes */
+	bool                     is_wal;
+	long                     ios;
 	bool                     done;
 };
 
 struct ctx {
 	struct spdk_blob_store *bs;
 	uint64_t                page_size;
-	struct worker           w[MAX_WORKERS];
+	struct worker           w[MAX_BLOBS];
+	struct spdk_io_channel *shared_ch;
+	int                     nblobs;
 	int                     pending;
+	int                     wal_active;
+	bool                    data_done;
 	long                    reads;
 	long                    bad;
 	int                     rc;
@@ -80,23 +108,26 @@ static inline uint64_t tag_of(int region, int round, uint64_t off)
 	       (off & 0x000000ffffffffffULL);
 }
 
-static void fill_tagged(void *buf, int region, int round, uint64_t n)
+/* base is the blob byte offset this buffer is going to, so a slide from
+ * another offset of the same blob is as identifiable as a foreign blob. */
+static void fill_tagged(void *buf, int region, int round, uint64_t base,
+			uint64_t n)
 {
 	uint64_t *w = buf;
 
 	for (uint64_t i = 0; i < n / 8; i++)
-		w[i] = tag_of(region, round, i * 8);
+		w[i] = tag_of(region, round, base + i * 8);
 }
 
 static void diagnose(const void *got, uint64_t n, int region, int round,
-		     char *out, size_t outsz)
+		     uint64_t base, char *out, size_t outsz)
 {
 	const uint64_t *w = got;
 	uint64_t n_ok = 0, n_zero = 0, n_reg = 0, n_round = 0, n_off = 0, n_junk = 0;
 	uint64_t first = UINT64_MAX, fv = 0;
 
 	for (uint64_t i = 0; i < n / 8; i++) {
-		if (w[i] == tag_of(region, round, i * 8)) { n_ok++; continue; }
+		if (w[i] == tag_of(region, round, base + i * 8)) { n_ok++; continue; }
 		if (first == UINT64_MAX) { first = i * 8; fv = w[i]; }
 		if (w[i] == 0) { n_zero++; continue; }
 
@@ -104,10 +135,10 @@ static void diagnose(const void *got, uint64_t n, int region, int round,
 		int      rd = (int)((w[i] >> 40) & 0xff);
 		uint64_t o  = w[i] & 0x000000ffffffffffULL;
 
-		if (r != region && r < g_workers)    n_reg++;
-		else if (r == region && rd != round) n_round++;
-		else if (r == region && o != i * 8)  n_off++;
-		else                                 n_junk++;
+		if (r != region && r < g_ctx.nblobs)        n_reg++;
+		else if (r == region && rd != round)        n_round++;
+		else if (r == region && o != base + i * 8)  n_off++;
+		else                                        n_junk++;
 	}
 	snprintf(out, outsz,
 		 "first bad at %lu: region=%d round=%d off=%lu | ok=%lu zero=%lu "
@@ -141,10 +172,10 @@ static void close_next(void *arg, int bserrno)
 	if (bserrno)
 		SPDK_ERRLOG("blob close failed: %s\n", spdk_strerror(-bserrno));
 
-	while (idx < g_workers) {
+	while (idx < g_ctx.nblobs) {
 		struct worker *w = &g_ctx.w[idx++];
 
-		if (w->ch) {
+		if (w->ch && w->ch != g_ctx.shared_ch) {
 			spdk_bs_free_io_channel(w->ch);
 			w->ch = NULL;
 		}
@@ -158,15 +189,36 @@ static void close_next(void *arg, int bserrno)
 			return;
 		}
 	}
+	if (g_ctx.shared_ch) {
+		spdk_bs_free_io_channel(g_ctx.shared_ch);
+		g_ctx.shared_ch = NULL;
+	}
 	spdk_bs_unload(g_ctx.bs, unload_complete, NULL);
 }
 
 static void teardown(void)
 {
-	printf("%s: %ld/%ld reads corrupt (SPDK blobstore, no DAOS)\n",
-	       g_ctx.bad ? "FAIL" : "PASS", g_ctx.bad, g_ctx.reads);
+	long wal_ios = 0;
+
+	for (int i = g_workers; i < g_ctx.nblobs; i++)
+		wal_ios += g_ctx.w[i].ios;
+	printf("%s: %ld/%ld reads corrupt (SPDK blobstore, no DAOS) | "
+	       "wal-blobs=%d small ios=%ld\n",
+	       g_ctx.bad ? "FAIL" : "PASS", g_ctx.bad, g_ctx.reads,
+	       g_ctx.nblobs - g_workers, wal_ios);
 	fflush(stdout);
 	close_next(NULL, 0);
+}
+
+/*
+ * The data workers finished; let the WAL blobs drain their in-flight write and
+ * stop.  Teardown waits for them, otherwise spdk_bs_unload() would race a
+ * live I/O.
+ */
+static void maybe_teardown(void)
+{
+	if (g_ctx.pending == 0 && g_ctx.wal_active == 0)
+		teardown();
 }
 
 static void worker_step(struct worker *w);
@@ -180,16 +232,22 @@ static void read_done(void *arg, int bserrno)
 		SPDK_ERRLOG("blob %d read failed: %s\n", w->id, spdk_strerror(-bserrno));
 		g_ctx.rc = 2;
 		w->done = true;
-		if (--g_ctx.pending == 0)
-			teardown();
+		g_ctx.pending--;
+		if (g_ctx.pending == 0)
+			g_ctx.data_done = true;
+		maybe_teardown();
 		return;
 	}
 
 	g_ctx.reads++;
 	if (memcmp(w->rbuf, w->wbuf, g_io_size) != 0) {
+		uint64_t base = w->off_pages * g_ctx.page_size;
+
 		g_ctx.bad++;
-		diagnose(w->rbuf, g_io_size, w->id, w->round, detail, sizeof(detail));
-		printf("  CORRUPT blob%-2d r%-2d %s\n", w->id, w->round, detail);
+		diagnose(w->rbuf, g_io_size, w->id, w->round, base, detail,
+			 sizeof(detail));
+		printf("  CORRUPT blob%-2d r%-2d at blob offset %luMiB | %s\n",
+		       w->id, w->round, (unsigned long)(base >> 20), detail);
 		fflush(stdout);
 	}
 
@@ -205,25 +263,85 @@ static void write_done(void *arg, int bserrno)
 		SPDK_ERRLOG("blob %d write failed: %s\n", w->id, spdk_strerror(-bserrno));
 		g_ctx.rc = 2;
 		w->done = true;
-		if (--g_ctx.pending == 0)
-			teardown();
+		g_ctx.pending--;
+		if (g_ctx.pending == 0)
+			g_ctx.data_done = true;
+		maybe_teardown();
 		return;
 	}
 	/* Poison the destination so a no-op read cannot pass. */
 	memset(w->rbuf, 0xA5, g_io_size);
-	spdk_blob_io_read(w->blob, w->ch, w->rbuf, 0, w->io_pages, read_done, w);
+	spdk_blob_io_read(w->blob, w->ch, w->rbuf, w->off_pages, w->io_pages,
+			  read_done, w);
+}
+
+/*
+ * WAL-like traffic: small writes, rotating offsets, issued back to back for as
+ * long as the 4 MiB workers are running.  This is the condition §28 and §29
+ * lacked -- MD-on-SSD keeps WAL and data blobs busy on the same blobstore.
+ */
+static void wal_step(struct worker *w);
+
+static void wal_write_done(void *arg, int bserrno)
+{
+	struct worker *w = arg;
+
+	if (bserrno) {
+		SPDK_ERRLOG("wal blob %d write failed: %s\n", w->id,
+			    spdk_strerror(-bserrno));
+		g_ctx.rc = 2;
+		g_ctx.wal_active--;
+		maybe_teardown();
+		return;
+	}
+	w->ios++;
+	wal_step(w);
+}
+
+static void wal_step(struct worker *w)
+{
+	uint64_t slots, slot;
+
+	if (g_ctx.data_done) {
+		w->done = true;
+		g_ctx.wal_active--;
+		maybe_teardown();
+		return;
+	}
+	slots = w->cap_pages / w->io_pages;
+	slot = (uint64_t)(w->ios * 3 + w->id) % slots;
+	w->off_pages = slot * w->io_pages;
+	fill_tagged(w->wbuf, w->id, (int)(w->ios & 0xff),
+		    w->off_pages * g_ctx.page_size, g_small);
+	spdk_blob_io_write(w->blob, w->ch, w->wbuf, w->off_pages, w->io_pages,
+			   wal_write_done, w);
 }
 
 static void worker_step(struct worker *w)
 {
+	uint64_t slots, slot;
+
 	if (w->round >= g_rounds) {
 		w->done = true;
-		if (--g_ctx.pending == 0)
-			teardown();
+		g_ctx.pending--;
+		if (g_ctx.pending == 0)
+			g_ctx.data_done = true;
+		maybe_teardown();
 		return;
 	}
-	fill_tagged(w->wbuf, w->id, w->round, g_io_size);
-	spdk_blob_io_write(w->blob, w->ch, w->wbuf, 0, w->io_pages, write_done, w);
+	/*
+	 * Rotate the destination so consecutive rounds land on different
+	 * clusters, and different workers are writing different offsets at the
+	 * same time.  Writing offset 0 every round -- what this program did
+	 * before -- never touches the offset translation.
+	 */
+	slots = w->cap_pages / w->io_pages;
+	slot = (uint64_t)(w->round * 3 + w->id) % slots;
+	w->off_pages = slot * w->io_pages;
+	fill_tagged(w->wbuf, w->id, w->round, w->off_pages * g_ctx.page_size,
+		    g_io_size);
+	spdk_blob_io_write(w->blob, w->ch, w->wbuf, w->off_pages, w->io_pages,
+			   write_done, w);
 }
 
 static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
@@ -235,22 +353,34 @@ static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
 		spdk_app_stop(-1);
 		return;
 	}
+	uint64_t sz = w->is_wal ? g_small : g_io_size;
+
 	w->blob = blob;
-	w->ch = spdk_bs_alloc_io_channel(g_ctx.bs);
-	w->wbuf = spdk_zmalloc(g_io_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY,
+	if (g_share_ch) {
+		if (g_ctx.shared_ch == NULL)
+			g_ctx.shared_ch = spdk_bs_alloc_io_channel(g_ctx.bs);
+		w->ch = g_ctx.shared_ch;
+	} else {
+		w->ch = spdk_bs_alloc_io_channel(g_ctx.bs);
+	}
+	w->wbuf = spdk_zmalloc(sz, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY,
 			       SPDK_MALLOC_DMA);
-	w->rbuf = spdk_zmalloc(g_io_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY,
+	w->rbuf = spdk_zmalloc(sz, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY,
 			       SPDK_MALLOC_DMA);
 	if (!w->ch || !w->wbuf || !w->rbuf) {
 		SPDK_ERRLOG("alloc failed for worker %d\n", w->id);
 		spdk_app_stop(-1);
 		return;
 	}
-	w->io_pages = g_io_size / g_ctx.page_size;
+	w->io_pages = sz / g_ctx.page_size;
+	w->cap_pages = g_cap / g_ctx.page_size;
 
 	if (--g_ctx.pending == 0) {
-		/* All blobs open: release every worker at once. */
+		/* All blobs open: release the WAL traffic, then the workers. */
 		g_ctx.pending = g_workers;
+		g_ctx.wal_active = g_ctx.nblobs - g_workers;
+		for (int i = g_workers; i < g_ctx.nblobs; i++)
+			wal_step(&g_ctx.w[i]);
 		for (int i = 0; i < g_workers; i++)
 			worker_step(&g_ctx.w[i]);
 	}
@@ -293,25 +423,32 @@ static void bs_init_complete(void *arg, struct spdk_blob_store *bs, int bserrno)
 	}
 	g_ctx.bs = bs;
 	g_ctx.page_size = spdk_bs_get_page_size(bs);
-	clusters_needed = g_io_size / spdk_bs_get_cluster_size(bs) + 1;
+	/* capacity, not one I/O: the blob must span many clusters */
+	clusters_needed = g_cap / spdk_bs_get_cluster_size(bs) + 1;
+	g_ctx.nblobs = g_workers + g_wal;
 
 	printf("blobstore: page=%lu cluster=%lu free_clusters=%lu | "
-	       "workers=%d rounds=%d io=%luMiB\n",
+	       "workers=%d rounds=%d io=%luMiB cap=%luMiB wal_blobs=%d "
+	       "wal_io=%luKiB channel=%s\n",
 	       (unsigned long)g_ctx.page_size,
 	       (unsigned long)spdk_bs_get_cluster_size(bs),
 	       (unsigned long)spdk_bs_free_cluster_count(bs),
-	       g_workers, g_rounds, (unsigned long)(g_io_size >> 20));
+	       g_workers, g_rounds, (unsigned long)(g_io_size >> 20),
+	       (unsigned long)(g_cap >> 20), g_wal,
+	       (unsigned long)(g_small >> 10),
+	       g_share_ch ? "shared" : "per-blob");
 
 	/*
-	 * Create the blobs with an explicit size so each one owns enough
-	 * clusters for a full 4 MiB I/O -- the point is to exercise the
-	 * cluster mapping that class:nvme and class:file disagree on.
+	 * Every blob gets the full capacity so writes rotate across clusters.
+	 * Blobs [0, g_workers) take 4 MiB tagged I/O and verify; the rest are
+	 * WAL-like and take continuous small writes on the same blobstore.
 	 */
-	g_ctx.pending = g_workers;
-	for (int i = 0; i < g_workers; i++) {
+	g_ctx.pending = g_ctx.nblobs;
+	for (int i = 0; i < g_ctx.nblobs; i++) {
 		struct spdk_blob_opts opts;
 
 		g_ctx.w[i].id = i;
+		g_ctx.w[i].is_wal = (i >= g_workers);
 		spdk_blob_opts_init(&opts, sizeof(opts));
 		opts.num_clusters = clusters_needed;
 		spdk_bs_create_blob_ext(bs, &opts, blob_create_complete, &g_ctx.w[i]);
@@ -344,9 +481,13 @@ static void app_start(void *arg)
 static void usage(void)
 {
 	printf(" -b <bdev>   bdev name to build the blobstore on (default Nvme0n1)\n");
-	printf(" -w <n>      workers/blobs (default 8)\n");
+	printf(" -w <n>      workers/blobs taking 4 MiB tagged I/O (default 8)\n");
 	printf(" -N <n>      rounds per worker (default 20)\n");
 	printf(" -S <MiB>    I/O size (default 4)\n");
+	printf(" -Y <MiB>    blob capacity, so writes rotate over clusters (default 128)\n");
+	printf(" -K <n>      WAL-like blobs taking continuous small writes (default 1)\n");
+	printf(" -k <KiB>    size of those small writes (default 8)\n");
+	printf(" -X          share one io_channel across all blobs\n");
 }
 
 static int parse_arg(int ch, char *arg)
@@ -356,6 +497,10 @@ static int parse_arg(int ch, char *arg)
 	case 'w': g_workers = spdk_strtol(arg, 10); break;
 	case 'N': g_rounds = spdk_strtol(arg, 10); break;
 	case 'S': g_io_size = (uint64_t)spdk_strtol(arg, 10) << 20; break;
+	case 'Y': g_cap = (uint64_t)spdk_strtol(arg, 10) << 20; break;
+	case 'K': g_wal = spdk_strtol(arg, 10); break;
+	case 'k': g_small = (uint64_t)spdk_strtol(arg, 10) << 10; break;
+	case 'X': g_share_ch = 1; break;
 	default: return -EINVAL;
 	}
 	return 0;
@@ -368,12 +513,16 @@ int main(int argc, char **argv)
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "spdk_blob_tagio";
-	rc = spdk_app_parse_args(argc, argv, &opts, "b:w:N:S:", NULL,
+	rc = spdk_app_parse_args(argc, argv, &opts, "b:w:N:S:Y:K:k:X", NULL,
 				 parse_arg, usage);
 	if (rc != SPDK_APP_PARSE_ARGS_SUCCESS)
 		return rc;
 	if (g_workers > MAX_WORKERS)
 		g_workers = MAX_WORKERS;
+	if (g_wal > MAX_WAL)
+		g_wal = MAX_WAL;
+	if (g_cap < g_io_size)
+		g_cap = g_io_size;
 
 	rc = spdk_app_start(&opts, app_start, NULL);
 	spdk_app_fini();
