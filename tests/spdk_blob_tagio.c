@@ -54,6 +54,7 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/thread.h"
+#include "spdk/cpuset.h"
 
 #define MAX_WORKERS 32
 #define MAX_WAL     8
@@ -67,6 +68,16 @@ static uint64_t g_cap       = 128ul << 20; /* blob capacity: many clusters */
 static int      g_wal       = 1;           /* WAL-like small-write blobs */
 static uint64_t g_small     = 8ul << 10;   /* their I/O size */
 static int      g_share_ch;                /* one channel for every blob */
+/*
+ * -M: give every blob its own spdk_thread on its own reactor core, so the I/O
+ * is issued from N OS threads instead of one.  Without this the app framework
+ * runs a single reactor and every "concurrent" write is serialised by that one
+ * thread -- which is why §42 stayed clean.  DAOS drives one blob and one
+ * io_channel per target from a separate xstream, and target count is the axis
+ * that amplifies corruption 10x (§46), so this is the shape to mirror.
+ * Requires a multi-core mask, e.g. -m 0xff.
+ */
+static int      g_mt;
 
 struct worker {
 	int                      id;
@@ -82,6 +93,8 @@ struct worker {
 	bool                     is_wal;
 	long                     ios;
 	bool                     done;
+	struct spdk_thread      *thread;      /* -M: this blob's own thread */
+	int                      core;        /* -M: reactor it landed on */
 };
 
 struct ctx {
@@ -89,6 +102,7 @@ struct ctx {
 	uint64_t                page_size;
 	struct worker           w[MAX_BLOBS];
 	struct spdk_io_channel *shared_ch;
+	struct spdk_thread     *main_thread;
 	int                     nblobs;
 	int                     pending;
 	int                     wal_active;
@@ -202,6 +216,13 @@ static void teardown(void)
 
 	for (int i = g_workers; i < g_ctx.nblobs; i++)
 		wal_ios += g_ctx.w[i].ios;
+	if (g_mt) {
+		/* guard: without distinct cores here the run was not threaded */
+		printf("blob->core:");
+		for (int i = 0; i < g_ctx.nblobs; i++)
+			printf(" %d:%d", i, g_ctx.w[i].core);
+		printf("\n");
+	}
 	printf("%s: %ld/%ld reads corrupt (SPDK blobstore, no DAOS) | "
 	       "wal-blobs=%d small ios=%ld\n",
 	       g_ctx.bad ? "FAIL" : "PASS", g_ctx.bad, g_ctx.reads,
@@ -221,6 +242,41 @@ static void maybe_teardown(void)
 		teardown();
 }
 
+/* bookkeeping for a finished blob; always runs on the main thread */
+static void worker_retire_on_main(void *arg)
+{
+	struct worker *w = arg;
+
+	w->done = true;
+	if (w->is_wal) {
+		g_ctx.wal_active--;
+	} else {
+		g_ctx.pending--;
+		if (g_ctx.pending == 0)
+			g_ctx.data_done = true;
+	}
+	maybe_teardown();
+}
+
+/*
+ * Called on whichever thread was driving this blob.  An io_channel belongs to
+ * the thread that allocated it, so it has to be released here; the counters
+ * belong to the main thread, so they are handed over by message.
+ */
+static void worker_retire(struct worker *w)
+{
+	if (g_mt) {
+		if (w->ch) {
+			spdk_bs_free_io_channel(w->ch);
+			w->ch = NULL;
+		}
+		spdk_thread_send_msg(g_ctx.main_thread, worker_retire_on_main, w);
+		spdk_thread_exit(spdk_get_thread());
+		return;
+	}
+	worker_retire_on_main(w);
+}
+
 static void worker_step(struct worker *w);
 
 static void read_done(void *arg, int bserrno)
@@ -231,11 +287,7 @@ static void read_done(void *arg, int bserrno)
 	if (bserrno) {
 		SPDK_ERRLOG("blob %d read failed: %s\n", w->id, spdk_strerror(-bserrno));
 		g_ctx.rc = 2;
-		w->done = true;
-		g_ctx.pending--;
-		if (g_ctx.pending == 0)
-			g_ctx.data_done = true;
-		maybe_teardown();
+		worker_retire(w);
 		return;
 	}
 
@@ -262,11 +314,7 @@ static void write_done(void *arg, int bserrno)
 	if (bserrno) {
 		SPDK_ERRLOG("blob %d write failed: %s\n", w->id, spdk_strerror(-bserrno));
 		g_ctx.rc = 2;
-		w->done = true;
-		g_ctx.pending--;
-		if (g_ctx.pending == 0)
-			g_ctx.data_done = true;
-		maybe_teardown();
+		worker_retire(w);
 		return;
 	}
 	/* Poison the destination so a no-op read cannot pass. */
@@ -290,8 +338,7 @@ static void wal_write_done(void *arg, int bserrno)
 		SPDK_ERRLOG("wal blob %d write failed: %s\n", w->id,
 			    spdk_strerror(-bserrno));
 		g_ctx.rc = 2;
-		g_ctx.wal_active--;
-		maybe_teardown();
+		worker_retire(w);
 		return;
 	}
 	w->ios++;
@@ -303,9 +350,7 @@ static void wal_step(struct worker *w)
 	uint64_t slots, slot;
 
 	if (g_ctx.data_done) {
-		w->done = true;
-		g_ctx.wal_active--;
-		maybe_teardown();
+		worker_retire(w);
 		return;
 	}
 	slots = w->cap_pages / w->io_pages;
@@ -322,11 +367,7 @@ static void worker_step(struct worker *w)
 	uint64_t slots, slot;
 
 	if (w->round >= g_rounds) {
-		w->done = true;
-		g_ctx.pending--;
-		if (g_ctx.pending == 0)
-			g_ctx.data_done = true;
-		maybe_teardown();
+		worker_retire(w);
 		return;
 	}
 	/*
@@ -344,6 +385,65 @@ static void worker_step(struct worker *w)
 			   write_done, w);
 }
 
+/*
+ * -M: runs on the blob's own thread.  An io_channel must be allocated by the
+ * thread that will use it, so it happens here rather than at open time, and
+ * from this point every I/O and every completion for this blob is on this
+ * thread -- N OS threads issuing into one bdev, which is what DAOS does with
+ * one xstream per target.
+ */
+static void worker_thread_start(void *arg)
+{
+	struct worker *w = arg;
+
+	w->core = spdk_env_get_current_core();
+	w->ch = spdk_bs_alloc_io_channel(g_ctx.bs);
+	if (w->ch == NULL) {
+		SPDK_ERRLOG("blob %d: no io_channel on its own thread\n", w->id);
+		g_ctx.rc = 2;
+		worker_retire(w);
+		return;
+	}
+	if (w->is_wal)
+		wal_step(w);
+	else
+		worker_step(w);
+}
+
+static void start_threads(void)
+{
+	uint32_t cores[MAX_BLOBS];
+	uint32_t c, ncore = 0;
+
+	SPDK_ENV_FOREACH_CORE(c) {
+		if (ncore < MAX_BLOBS)
+			cores[ncore++] = c;
+	}
+	printf("multi-thread mode: %d blobs over %u reactor cores\n",
+	       g_ctx.nblobs, ncore);
+	if (ncore < 2)
+		printf("  WARNING: only one core in the mask, this is NOT a "
+		       "multi-threaded run -- pass -m 0xff\n");
+	fflush(stdout);
+
+	for (int i = 0; i < g_ctx.nblobs; i++) {
+		struct worker   *w = &g_ctx.w[i];
+		struct spdk_cpuset mask;
+		char             name[32];
+
+		spdk_cpuset_zero(&mask);
+		spdk_cpuset_set_cpu(&mask, cores[i % ncore], true);
+		snprintf(name, sizeof(name), "blob%d", i);
+		w->thread = spdk_thread_create(name, &mask);
+		if (w->thread == NULL) {
+			SPDK_ERRLOG("could not create thread for blob %d\n", i);
+			spdk_app_stop(-1);
+			return;
+		}
+		spdk_thread_send_msg(w->thread, worker_thread_start, w);
+	}
+}
+
 static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
 {
 	struct worker *w = arg;
@@ -356,7 +456,9 @@ static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
 	uint64_t sz = w->is_wal ? g_small : g_io_size;
 
 	w->blob = blob;
-	if (g_share_ch) {
+	if (g_mt) {
+		w->ch = NULL;	/* allocated on the blob's own thread instead */
+	} else if (g_share_ch) {
 		if (g_ctx.shared_ch == NULL)
 			g_ctx.shared_ch = spdk_bs_alloc_io_channel(g_ctx.bs);
 		w->ch = g_ctx.shared_ch;
@@ -367,7 +469,7 @@ static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
 			       SPDK_MALLOC_DMA);
 	w->rbuf = spdk_zmalloc(sz, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY,
 			       SPDK_MALLOC_DMA);
-	if (!w->ch || !w->wbuf || !w->rbuf) {
+	if ((!g_mt && !w->ch) || !w->wbuf || !w->rbuf) {
 		SPDK_ERRLOG("alloc failed for worker %d\n", w->id);
 		spdk_app_stop(-1);
 		return;
@@ -379,6 +481,10 @@ static void blob_open_complete(void *arg, struct spdk_blob *blob, int bserrno)
 		/* All blobs open: release the WAL traffic, then the workers. */
 		g_ctx.pending = g_workers;
 		g_ctx.wal_active = g_ctx.nblobs - g_workers;
+		if (g_mt) {
+			start_threads();
+			return;
+		}
 		for (int i = g_workers; i < g_ctx.nblobs; i++)
 			wal_step(&g_ctx.w[i]);
 		for (int i = 0; i < g_workers; i++)
@@ -467,6 +573,7 @@ static void app_start(void *arg)
 	int rc;
 
 	(void)arg;
+	g_ctx.main_thread = spdk_get_thread();
 	rc = spdk_bdev_create_bs_dev_ext(g_bdev_name, base_bdev_event_cb, NULL,
 					 &bs_dev);
 	if (rc) {
@@ -488,6 +595,8 @@ static void usage(void)
 	printf(" -K <n>      WAL-like blobs taking continuous small writes (default 1)\n");
 	printf(" -k <KiB>    size of those small writes (default 8)\n");
 	printf(" -X          share one io_channel across all blobs\n");
+	printf(" -M          one spdk_thread per blob (needs -m 0xff); mirrors\n");
+	printf("             DAOS driving one blob per target from its own xstream\n");
 }
 
 static int parse_arg(int ch, char *arg)
@@ -501,6 +610,7 @@ static int parse_arg(int ch, char *arg)
 	case 'K': g_wal = spdk_strtol(arg, 10); break;
 	case 'k': g_small = (uint64_t)spdk_strtol(arg, 10) << 10; break;
 	case 'X': g_share_ch = 1; break;
+	case 'M': g_mt = 1; break;
 	default: return -EINVAL;
 	}
 	return 0;
@@ -513,7 +623,7 @@ int main(int argc, char **argv)
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "spdk_blob_tagio";
-	rc = spdk_app_parse_args(argc, argv, &opts, "b:w:N:S:Y:K:k:X", NULL,
+	rc = spdk_app_parse_args(argc, argv, &opts, "b:w:N:S:Y:K:k:XM", NULL,
 				 parse_arg, usage);
 	if (rc != SPDK_APP_PARSE_ARGS_SUCCESS)
 		return rc;
