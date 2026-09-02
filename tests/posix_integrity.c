@@ -39,6 +39,13 @@ static int         g_threads = 16;
 static int         g_rounds  = 10;
 static int         g_audit   = -1;
 static int         g_direct;
+/*
+ * -L n repeats the whole round set n times.  Needed because the round is only
+ * 8 bits of the tag, so rounds cannot exceed 255, yet a 4 KiB file has to write
+ * far more iterations than a 28 MiB one to move a comparable number of bytes --
+ * which is itself the answer to "why does a text file look fine".
+ */
+static int         g_loops   = 1;
 
 static pthread_barrier_t g_barrier;
 static pthread_mutex_t   g_log = PTHREAD_MUTEX_INITIALIZER;
@@ -150,6 +157,7 @@ static void *worker(void *p)
 	fd = open_file(a->tid, true);
 	if (fd < 0) { a->rc = errno; return NULL; }
 
+	for (int l = 0; l < g_loops; l++)
 	for (int r = 0; r < g_rounds; r++) {
 		fill_tagged(src, a->tid, r, g_objsz);
 		for (size_t c = 0; c < nchunks; c++)
@@ -243,18 +251,22 @@ int main(int argc, char **argv)
 {
 	int opt, ret = 0;
 
-	while ((opt = getopt(argc, argv, "d:s:k:t:r:A:Oh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:k:S:K:t:r:L:A:Oh")) != -1) {
 		switch (opt) {
 		case 'd': g_dir = optarg; break;
 		case 's': g_objsz = (size_t)strtoul(optarg, NULL, 0) << 20; break;
 		case 'k': g_chunk = (size_t)strtoul(optarg, NULL, 0) << 20; break;
+		case 'S': g_objsz = (size_t)strtoul(optarg, NULL, 0) << 10; break;
+		case 'K': g_chunk = (size_t)strtoul(optarg, NULL, 0) << 10; break;
+		case 'L': g_loops = atoi(optarg); break;
 		case 't': g_threads = atoi(optarg); break;
 		case 'r': g_rounds = atoi(optarg); break;
 		case 'A': g_audit = atoi(optarg); break;
 		case 'O': g_direct = 1; break;
 		default:
 			fprintf(stderr, "usage: %s -d <dir> [-s MiB] [-k chunkMiB]"
-				" [-t n] [-r n] [-A round] [-O]\n", argv[0]);
+				" [-S KiB] [-K KiB] [-t n] [-r n] [-L loops]"
+				" [-A round] [-O]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -263,10 +275,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "bad geometry\n");
 		return 2;
 	}
-	printf("dir=%s file=%zuMiB chunk=%zuMiB threads=%d rounds=%d%s"
-	       "  (plain POSIX pwrite/pread)\n",
-	       g_dir, g_objsz >> 20, g_chunk >> 20, g_threads, g_rounds,
-	       g_direct ? " O_DIRECT" : "");
+	printf("dir=%s file=%zuKiB chunk=%zuKiB threads=%d rounds=%d loops=%d%s"
+	       "  written=%.1fMiB/thread  (plain POSIX pwrite/pread)\n",
+	       g_dir, g_objsz >> 10, g_chunk >> 10, g_threads, g_rounds, g_loops,
+	       g_direct ? " O_DIRECT" : "",
+	       (double)g_objsz * g_rounds * g_loops / (1024 * 1024));
 
 	if (g_audit >= 0)
 		return audit();
