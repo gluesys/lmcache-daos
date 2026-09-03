@@ -33,6 +33,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
@@ -45,6 +46,18 @@
 
 #include <daos.h>
 #include <daos_obj_class.h>
+
+/*
+ * Object layout (rank/target per shard).  The prototype lives in the
+ * internal header daos/object.h, which the install tree does not ship,
+ * so it is declared here.  ABI matches libdaos 2.8/2.9.
+ */
+struct daos_shard_loc { uint32_t sd_rank; uint32_t sd_tgt_idx; };
+struct daos_obj_shard { uint32_t os_replica_nr; struct daos_shard_loc os_shard_loc[0]; };
+struct daos_obj_layout { uint32_t ol_ver; uint32_t ol_class; uint32_t ol_nr;
+			 struct daos_obj_shard *ol_shards[0]; };
+int daos_obj_layout_get(daos_handle_t coh, daos_obj_id_t oid, struct daos_obj_layout **layout);
+int daos_obj_layout_free(struct daos_obj_layout *layout);
 
 #define PAGE 4096
 
@@ -304,6 +317,26 @@ int main(int argc, char **argv)
 		rc = daos_obj_generate_oid(g_coh, &args[i].oid, 0, cid, 0, 0);
 		if (rc) { fprintf(stderr, "generate_oid: %d\n", rc); return 2; }
 	}
+
+	/* Where does each object live?  Needed to attribute foreign data. */
+	for (int i = 0; i < g_threads; i++) {
+		struct daos_obj_layout *lay = NULL;
+
+		rc = daos_obj_layout_get(g_coh, args[i].oid, &lay);
+		printf("LAYOUT t%-2d oid=%" PRIx64 ".%" PRIx64, args[i].tid,
+		       args[i].oid.hi, args[i].oid.lo);
+		if (rc || lay == NULL) { printf(" layout_get rc=%d\n", rc); continue; }
+		printf(" ver=%u class=%u grps=%u", lay->ol_ver, lay->ol_class, lay->ol_nr);
+		for (uint32_t g = 0; g < lay->ol_nr; g++) {
+			struct daos_obj_shard *sh = lay->ol_shards[g];
+			for (uint32_t r = 0; sh && r < sh->os_replica_nr; r++)
+				printf(" rank=%u tgt=%u", sh->os_shard_loc[r].sd_rank,
+				       sh->os_shard_loc[r].sd_tgt_idx);
+		}
+		printf("\n");
+		daos_obj_layout_free(lay);
+	}
+	fflush(stdout);
 
 	if (g_audit >= 0) {
 		unsigned char *dst = NULL;
