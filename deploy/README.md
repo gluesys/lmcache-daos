@@ -274,3 +274,29 @@ vLLM      --enforce-eager --no-enable-prefix-caching, prompt_token_ids 로 전�
   기본 경로를 보고 있었다(빈 목록). graphroot 를 그쪽으로 잡고 stale `db.sql` 을 치우면 `kvsup:052` 가 보인다.
   이미지 실행에는 `--security-opt label=disable` 이 필수다(SELinux Enforcing, 없으면 libc "cannot change
   memory protections").
+
+### 10.1 성능 구성 복원 (같은 날, 저녁)
+
+이미지를 `kvsup-ucx-lmc:local` 로 재빌드(§5, client-5 에서 약 25 분)하고 서버를 `ucx+rc_v` 로 전환했다.
+드라이브는 **양 노드가 같은 BDF 로 같은 드라이브를 보므로** NUMA 3(NIC 과 동일) 그룹 `02~09` 를 반씩 나눴다:
+cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 GiB`. 예전 성능 구성(백업 2.9 yml)은
+양 노드가 `02~09` 여덟 대를 **전부** 썼으므로 §8 의 수치는 공유 드라이브 위에서 측정된 것이었다.
+
+```
+서버      ucx+rc_v, 2 랭크 × targets 8, 풀 attr1(SCM 40G + NVMe 6T / rank, ntarget 16)
+컨테이너  attr1/kvlmc5  POSIX, S16, chunk 4 MiB, rd_fac:0
+클라이언트 client-5, kvsup-ucx-lmc:local (c_ops 적재 확인), /root/daoslibs-stock, agent domain mlx5_0:1
+런처      deploy/launchers/run_vllm_perf_c5.sh  (client-5 의 /root/run_vllm_perf.sh)
+```
+
+| Qwen3-14B / 32K | 게이트 | miss(recompute) | hit(DAOS) | 배율 |
+|---|---|---|---|---|
+| ~4K tok | PASS 6/6 | 482–702 ms | **103–127 ms** | 4.2–6.8× |
+| ~8K tok | | 1662–1799 ms | **151–221 ms** | 7.5–11.7× |
+| ~16K tok | | 3635–3928 ms | **251–444 ms** | 8.2–15.6× |
+
+§8 의 client-6 기준(8K hit 151 ms, 3.8×)과 같은 자릿수이며, 이번에는 **드라이브가 분리된 상태**에서 나온
+값이다. 16K 단일 요청 기준 retrieve 약 6–10 GB/s. 서버 로그 `DER_CSUM`·`DER_IO` 0 건.
+
+함정 하나 추가: `scm_size` 를 바꿔도 **이미 마운트된 `/mnt/daos0` tmpfs 크기는 그대로**라 `pool create` 가 크기와
+무관하게 `DER_NOSPACE` 를 낸다. 서버 정지 후 `umount /mnt/daos0` 를 하고 재포맷해야 한다.
