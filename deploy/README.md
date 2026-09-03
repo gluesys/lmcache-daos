@@ -243,3 +243,34 @@ LMCache   chunk_size 256 · enable_async_loading: True · max_local_cpu_size >= 
           소스 빌드(c_ops 활성)
 vLLM      --enforce-eager --no-enable-prefix-caching, prompt_token_ids 로 전달
 ```
+
+## 10. 2026-09-03 재실측 — 공유 드라이브 오구성 해소 후 (client-5)
+
+`gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md` §62 의 조치(cell1 `02:00.0`, cell2 `03:00.0` 로 물리 드라이브 분리)
+뒤 DAOS 백엔드를 다시 검증했다. 구성은 성능 구성이 아니라 **가용한 것으로 맞춘 검증 구성**이다:
+
+```
+서버      stockfull 2.9.100, ofi+tcp, 2 랭크 × targets 4, 풀 attr1(SCM 3G + NVMe 200G/rank)
+컨테이너  attr1/kvlmc5  POSIX, RP_2G4, chunk 4 MiB, rd_fac:1
+클라이언트 client-5 (H100 NVL), 이미지 localhost/kvsup:052 (c_ops 미적재 = Python 폴백), /root/daoslibs-stock 번들
+          런처 /root/run_vllm_daos_14b.sh (repo 커넥터 fdefdc5, LMCACHE chunk 256, async loading)
+```
+
+| 모델 / MML | 정합성 게이트 | 프롬프트 | miss(recompute) | hit(DAOS) | 배율 |
+|---|---|---|---|---|---|
+| Qwen3-1.7B / 8K | PASS 6/6 | ~4K tok | 250–450 ms | 372–374 ms | 0.7–1.2× |
+| **Qwen3-14B / 32K** | **PASS 6/6** | ~4K tok | 730–813 ms | 513–544 ms | **1.5×** |
+| | | ~8K tok | 1789–1936 ms | 938–954 ms | **2.0×** |
+| | | ~16K tok | 4230–4264 ms | 1939–1963 ms | **2.2×** |
+
+- 손상은 없다: 게이트 12/12 일치, 양 서버 로그에 `DER_CSUM`·`DER_IO` 0 건, 풀에 KV 14 GB 적재.
+- 8K 에서 §8 의 client-6 수치(3.8×, hit 151 ms)에 못 미치는 이유는 세 가지 모두 전송·클라이언트 쪽이다:
+  `ofi+tcp`(UCX 아님), `c_ops` 미적재(retrieve 6× 손실), 그리고 스트리밍 GET 미적용 경로. 16K 기준 hit 는
+  약 1.3 GB/s 로 tcp 상한 부근이다. 성능 구성으로 되돌리려면 `kvsup-ucx-lmc` 재빌드(§5)와 서버 provider
+  `ucx+rc_v` 전환이 필요하다.
+- LMCache 0.5.2 가 hit 마다 `Ref count of MemoryObj … negative … Double free` WARNING 을 다수 남긴다
+  (1.7B·14B 모두, 커넥터 버전 무관). 정합성에는 영향이 없었으나 미해결이다.
+- client-5 함정: podman 이미지는 `/home/containers/storage` 에 있는데 `/etc/containers/storage.conf` 가 없어
+  기본 경로를 보고 있었다(빈 목록). graphroot 를 그쪽으로 잡고 stale `db.sql` 을 치우면 `kvsup:052` 가 보인다.
+  이미지 실행에는 `--security-opt label=disable` 이 필수다(SELinux Enforcing, 없으면 libc "cannot change
+  memory protections").
