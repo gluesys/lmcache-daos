@@ -111,6 +111,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         workers: int = 8,
         max_capacity_gb: float = 0.0,
         verify_size: bool = True,
+        status_interval_s: float = 0.0,
     ):
         self.pool = pool
         self.container = container
@@ -119,6 +120,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         self.workers = workers
         self.max_capacity_gb = max_capacity_gb
         self.verify_size = verify_size
+        self.status_interval_s = status_interval_s
 
     @classmethod
     def from_dict(cls, d: dict) -> "DaosL2AdapterConfig":
@@ -143,6 +145,9 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         verify_size = d.get("verify_size", True)
         if not isinstance(verify_size, bool):
             raise ValueError("daos: 'verify_size' must be a boolean")
+        status_interval = d.get("status_interval_s", 0)
+        if not isinstance(status_interval, (int, float)) or status_interval < 0:
+            raise ValueError("daos: 'status_interval_s' must be >= 0")
         cfg = cls(
             pool=pool,
             container=container,
@@ -151,6 +156,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             workers=workers,
             max_capacity_gb=float(cap),
             verify_size=verify_size,
+            status_interval_s=float(status_interval),
         )
         # Optional common sub-configs handled by the base class parsers.
         cfg.eviction_config = cls._parse_eviction_config(d)
@@ -172,6 +178,9 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "eviction; 0 = unbounded (optional)\n"
             "- verify_size (bool): treat size mismatches as misses "
             "(optional, default true)\n"
+            "- status_interval_s (number): log report_status() this often "
+            "while active; 0 disables (optional). The MP server's own "
+            "--enable-extra-logging needs observability, which the image lacks\n"
             "- eviction / persist_enabled / serde: common L2 options"
         )
 
@@ -193,6 +202,7 @@ class DaosL2Adapter(L2AdapterInterface):
         self._dfs = factory()
         if self._root != "/":
             self._dfs.mkdir_p(self._root)
+        self._warm_up()
 
         # Two pools on purpose. A task thread fans its keys out to the I/O
         # pool and waits for them; if both ran on one pool, N concurrent
@@ -222,13 +232,55 @@ class DaosL2Adapter(L2AdapterInterface):
             "store_failed_keys": 0, "lookup_tasks": 0, "lookup_hits": 0,
             "lookup_misses": 0, "load_tasks": 0, "load_ok": 0,
             "load_failed": 0, "deleted": 0, "errors": 0,
+            "load_bytes": 0, "load_seconds": 0.0,
+            "store_bytes": 0, "store_seconds": 0.0,
         }
+        self._closing = False
+        self._status_thread = None
+        if config.status_interval_s > 0:
+            self._status_thread = threading.Thread(
+                target=self._status_loop, args=(config.status_interval_s,),
+                name="daos-l2-status", daemon=True,
+            )
+            self._status_thread.start()
         logger.info(
             "DaosL2Adapter: pool=%s container=%s root=%s workers=%d "
             "capacity=%d verify_size=%s",
             config.pool, config.container, self._root, config.workers,
             self._max_capacity_bytes, self._verify_size,
         )
+
+    def _warm_up(self) -> None:
+        """Pay the first-I/O cost at start-up instead of on a user request.
+
+        On client-5 the first DAOS I/O of a fresh process intermittently took
+        14-17 s (3 of ~9 restarts; no server-side or client WARN logged, so
+        the cause is still open -- transport endpoint set-up is the suspect).
+        A write + read of a small probe object under ``root`` moves whatever
+        that is to adapter construction, where the MP server is not yet
+        serving requests.
+        """
+        path = f"{self._root}/.daos-l2-probe"
+        t0 = time.monotonic()
+        try:
+            n = 4096
+            src = (ctypes.c_char * n).from_buffer(bytearray(b"\x5a" * n))
+            h = self._dfs.open_rdwr_create(path)
+            try:
+                self._dfs.write_obj_from(h, 0, n, src)
+            finally:
+                self._dfs.close_obj(h)
+            dst = (ctypes.c_char * n).from_buffer(bytearray(n))
+            h = self._dfs.open_rdonly(path)
+            try:
+                got = self._dfs.read_obj_into(h, 0, n, dst)
+            finally:
+                self._dfs.close_obj(h)
+            logger.info("DaosL2Adapter warm-up: probe %s %d/%d bytes in %.1f ms",
+                        path, got, n, (time.monotonic() - t0) * 1e3)
+        except Exception as e:  # pragma: no cover - best effort
+            logger.warning("DaosL2Adapter warm-up failed (%s) after %.1f ms",
+                           e, (time.monotonic() - t0) * 1e3)
 
     # -- event fds ----------------------------------------------------------
     def get_store_event_fd(self) -> int:
@@ -298,6 +350,7 @@ class DaosL2Adapter(L2AdapterInterface):
             return -1
 
     def _execute_store(self, keys, objects, tid: L2TaskId) -> None:
+        t0 = time.monotonic()
         success = True
         total = 0
         stored_keys: List[ObjectKey] = []
@@ -322,6 +375,8 @@ class DaosL2Adapter(L2AdapterInterface):
             self._completed_store[tid] = L2StoreResult(success, total)
             self._stats["store_tasks"] += 1
             self._stats["store_keys"] += len(keys)
+            self._stats["store_bytes"] += total
+            self._stats["store_seconds"] += time.monotonic() - t0
         if stored_keys:
             self._notify_keys_stored(stored_keys, sizes)
         self._finish()
@@ -418,6 +473,8 @@ class DaosL2Adapter(L2AdapterInterface):
             return False
 
     def _execute_load(self, keys, objects, tid: L2TaskId) -> None:
+        t0 = time.monotonic()
+        nbytes = 0
         bitmap = Bitmap(len(keys))
         hit_keys: List[ObjectKey] = []
         try:
@@ -427,14 +484,24 @@ class DaosL2Adapter(L2AdapterInterface):
                     bitmap.set(i)
                     hit_keys.append(key)
                     self._stats["load_ok"] += 1
+                    nbytes += len(objects[i].byte_array)
                 else:
                     self._stats["load_failed"] += 1
         except Exception:
             logger.exception("daos load task %d failed", tid)
             self._stats["errors"] += 1
+        el = time.monotonic() - t0
         with self._lock:
             self._completed_load[tid] = bitmap
             self._stats["load_tasks"] += 1
+            self._stats["load_bytes"] += nbytes
+            self._stats["load_seconds"] += el
+        if nbytes:
+            logger.info(
+                "daos l2 load task %d: %d/%d keys, %.1f MiB in %.1f ms (%.2f GB/s)",
+                tid, len(hit_keys), len(keys), nbytes / 2**20, el * 1e3,
+                nbytes / el / 1e9 if el > 0 else 0.0,
+            )
         if hit_keys:
             self._notify_keys_accessed(hit_keys)
         self._finish()
@@ -485,7 +552,18 @@ class DaosL2Adapter(L2AdapterInterface):
             )
         return st
 
+    def _status_loop(self, interval: float) -> None:
+        last = None
+        while not self._closing:
+            time.sleep(interval)
+            st = self.report_status()
+            sig = (st["store_tasks"], st["lookup_tasks"], st["load_tasks"], st["deleted"])
+            if sig != last:
+                last = sig
+                logger.info("daos l2 status: %s", st)
+
     def close(self) -> None:
+        self._closing = True
         # Let in-flight tasks drain (they hold MemoryObj buffers the caller
         # still owns), then release the pool and the DFS mount.
         deadline = time.monotonic() + 30.0

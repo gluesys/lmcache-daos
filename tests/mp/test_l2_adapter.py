@@ -127,6 +127,9 @@ def make():
     )
     dfs = FakeDfs()
     ad = DaosL2Adapter(cfg, dfs_factory=lambda: dfs)
+    # The constructor writes a warm-up probe; keep the object counts below
+    # about the keys the tests store.
+    assert dfs.files.pop("/mp/.daos-l2-probe", None) is not None
     return ad, dfs
 
 

@@ -1,17 +1,14 @@
 #!/bin/bash
-# client-5 launcher for LMCache MP mode: one container, two processes.
-#   1. lmcache_daos.mp.server  -- ZMQ cache server owning L1 (pinned CPU) and
-#      the DAOS L2 adapter (type "daos", registered by our entry point)
-#   2. vllm serve              -- LMCacheMPConnector talks to it over ZMQ
-# LMCACHE_CONFIG_FILE is not used in MP mode; the server flags are the config.
-# DaosMPConnector (lmcache_daos/mp/vllm_connector.py) re-exports LMCache's own MP
-# connector under an unregistered name: vLLM 0.18 resolves 'LMCacheMPConnector'
-# to its bundled, stale copy before honouring kv_connector_module_path.
+# Two vLLM instances sharing ONE LMCache MP server (L1 pinned + DAOS L2).
+# Demonstrates the MP-mode property the in-process connector cannot have:
+# KV stored by instance A (port 8001) is served to instance B (port 8002)
+# from the shared L1 without touching DAOS, and from DAOS after a restart.
 MML=${MML:-32768}
 L1_GB=${L1_GB:-100}
 MP_PORT=${MP_PORT:-5555}
 POOL=${POOL:-attr1}; CONT=${CONT:-kvlmc5}; ROOT=${ROOT:-/mp}
 WORKERS=${WORKERS:-8}; GPU_WORKERS=${GPU_WORKERS:-4}; CPU_WORKERS=${CPU_WORKERS:-8}; STATUS_S=${STATUS_S:-0}
+GPU_UTIL=${GPU_UTIL:-0.42}
 MODEL=${MODEL:-/hf/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18}
 
 podman rm -f vllm-daos >/dev/null 2>&1; sleep 15
@@ -30,10 +27,13 @@ for i in \$(seq 1 180); do
   sleep 1
 done
 echo "[launcher] mp server port open after \$i s"
-exec numactl --interleave=all vllm serve $MODEL \
-  --served-model-name qwen3 --max-model-len $MML --gpu-memory-utilization 0.90 \
-  --enforce-eager --no-enable-prefix-caching --port 8001 \
-  --kv-transfer-config '{"kv_connector":"DaosMPConnector","kv_connector_module_path":"lmcache_daos.mp.vllm_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":$MP_PORT}}'
+KVCFG='{"kv_connector":"DaosMPConnector","kv_connector_module_path":"lmcache_daos.mp.vllm_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":$MP_PORT}}'
+COMMON="--served-model-name qwen3 --max-model-len $MML --gpu-memory-utilization $GPU_UTIL --enforce-eager --no-enable-prefix-caching"
+vllm serve $MODEL \$COMMON --port 8001 --kv-transfer-config "\$KVCFG" > >(sed -u 's/^/[vllm-A] /') 2>&1 &
+A=\$!
+for i in \$(seq 1 200); do curl -s -m 2 localhost:8001/v1/models | grep -q qwen3 && break; kill -0 \$A 2>/dev/null || { echo "[launcher] vllm A died"; exit 1; }; sleep 3; done
+echo "[launcher] vllm A ready"
+exec vllm serve $MODEL \$COMMON --port 8002 --kv-transfer-config "\$KVCFG" > >(sed -u 's/^/[vllm-B] /') 2>&1
 EOF
 
 podman run -d --name vllm-daos --net host --security-opt label=disable --device nvidia.com/gpu=all --ipc host \

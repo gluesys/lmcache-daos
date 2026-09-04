@@ -155,3 +155,53 @@ vllm serve … --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_ro
 2. `report_status` 를 볼 경로(HTTP 프런트 또는 주기 로그).
 3. 두 vLLM 인스턴스가 한 MP 서버를 공유하는 시나리오.
 4. LMCache `Double free` 경고가 MP 경로에도 나는지 확인.
+
+## 7. Phase 3 결과 (2026-09-04 저녁)
+
+### 7.1 어댑터 읽기 대역폭은 DAOS 상한에 있다 — `workers` 는 무관
+
+`bench_persist.py` 로 저장 → 재시작 → 콜드 hit, 태그 3 개 × 크기 2 종, `workers` ∈ {8, 16, 32}.
+어댑터가 태스크마다 남기는 `daos l2 load task: N keys, MiB, ms, GB/s` 로그 기준:
+
+| 배치 | 크기 | workers 8 | 16 | 32 |
+|---|---|---|---|---|
+| 8K 프롬프트 (41 키) | 1.64 GiB | 50~55 ms, 31~35 GB/s | 49~52 ms, 33~35 GB/s | 46~52 ms, 33~37 GB/s |
+| 16K 프롬프트 (88 키) | 3.52 GiB | 104~119 ms, 31~36 GB/s | 101~105 ms, 35~37 GB/s | 100~103 ms, 36~37 GB/s |
+| 콜드 hit TTFT 8K / 16K | | 150~151 / 248~267 ms | 150~151 / 245~331 ms | 148~160 / 242~250 ms |
+
+DAOS→pinned L1 이 **33~37 GB/s** 로, in-process 커넥터가 raw read 로 재던 상한(34 GB/s)과 같다. 기본 8 로 둔다.
+프로세스 기동 후 **첫** load 태스크만 15~16 GB/s(연결 워밍업)이고 두 번째부터 상한이다.
+
+### 7.2 겹침(§2.5) 은 어댑터 수준에서 불가 — 서버가 요청당 load 태스크 하나를 낸다
+
+`prefetch_controller.py` Step 7: 요청의 L2 키 전부를 **어댑터당 하나의 `submit_load_task`** 로 제출하고 그
+task_id 의 비트맵을 기다린 뒤 L1→GPU 를 시작한다. 완료 통지가 task_id 단위라 어댑터가 내부를 아무리 쪼개도
+서버는 배치 전체가 끝나야 움직인다. 실측도 그렇다: 콜드 hit − warm(L1) hit ≈ DAOS load 시간
+(8K: 150−90 ≈ 50 ms, 16K: 250−130 ≈ 105 ms) 로 **직렬**이다. 겹침은 LMCache 서버(프리페치 컨트롤러가
+키를 여러 태스크로 나누고 도착분부터 전송)에서만 가능하다 → 상류 제안 후보. 어댑터 쪽 레버는 대역폭만이고 그건 이미 상한이다.
+
+### 7.3 두 vLLM 인스턴스가 한 MP 서버를 공유 (`launchers/run_vllm_mp2_c5.sh`)
+
+Qwen3-14B 두 인스턴스(8001/8002, GPU util 0.42 씩) + MP 서버 하나. A 에 저장한 프롬프트를 B 가 처음 봤을 때:
+
+| | A 저장 miss | **B 첫 요청** | B 자체 recompute |
+|---|---|---|---|
+| 8K | 935 ms | **125 ms** (`41 L1, 0 L2`) | 786 ms |
+| 16K | 1930 ms | **140 ms** (`88 L1, 0 L2`) | ~1.9 s |
+
+재시작 뒤 B 가 A 가 저장한 KV 를 **DAOS 에서** 264 ms(16K)로 받았고, B 에서 게이트 PASS 4/4. in-process 커넥터로는
+불가능한 성질(인스턴스 간 L1 공유)이 실측으로 확인됐다.
+
+### 7.4 미해결 — 프로세스 기동 후 첫 DAOS I/O 가 간헐적으로 14~17 초
+
+재시작 약 9 회 중 3 회, 첫 DAOS 작업(store 든 load 든)이 14.4 / 15.3 / 17.1 초 걸렸다(예: `load task 3: 1640 MiB in
+14412.6 ms`). 그 뒤 작업은 정상. 서버(cell1/cell2) 로그에 같은 시각 ERR/WARN 없음, `D_LOG_MASK=WARN` 클라이언트 로그를
+켠 3 회 재시도에서는 재현되지 않아 원인 미확정(전송 엔드포인트 설정/재시도 의심). **완화**: 어댑터 생성 시
+4 KiB 프로브 객체 `<root>/.daos-l2-probe` 를 쓰고 읽어 첫 I/O 비용을 기동 시점으로 옮겼다(정상 시 23 ms).
+스톨이 이 프로브에서 나면 서버 기동이 15 초 늦어지는 것으로 끝나고 사용자 요청은 맞지 않는다.
+
+### 7.5 기타
+- MP 경로에서는 LMCache 의 `MemoryObj ref count negative / Double free` 경고가 **0 건**이다(in-process 는 수백 건).
+- `report_status` 는 서버의 `--enable-extra-logging` 이 observability(이미지에 없는 prometheus exporter)를 요구해 못 쓰고,
+  어댑터 옵션 `status_interval_s` 로 활동이 있을 때만 주기 로그를 낸다.
+- 런처에 `D_LOG_MASK`/`D_LOG_FILE`(기본 WARN, `/tmp/daos_client.log`)을 넘긴다.

@@ -304,5 +304,8 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 ## 11. LMCache MP 모드 (2026-09-04, 브랜치 `mp-mode`)
 
 별도 프로세스의 LMCache 캐시 서버(L1 pinned + DAOS L2 어댑터) + vLLM `DaosMPConnector`. 설계·결과는
-`doc/MP-MODE-PLAN.md`, 런처는 `launchers/run_vllm_mp_c5.sh`. 콜드 L1 기준 DAOS hit TTFT 는 8K 163 ms,
-16K 275 ms 로 in-process 와 같거나 빠르고, 반복 hit 는 L1 에서 50~135 ms. 게이트 PASS.
+`doc/MP-MODE-PLAN.md`, 런처는 `launchers/run_vllm_mp_c5.sh`. 콜드 L1 기준 DAOS hit TTFT 는 8K 150 ms,
+16K 245~265 ms 로 in-process 와 같거나 빠르고(어댑터 읽기 33~37 GB/s = DAOS 상한), 반복 hit 는 L1 에서
+50~135 ms. 게이트 PASS. 두 vLLM 인스턴스가 한 MP 서버를 공유하면(`launchers/run_vllm_mp2_c5.sh`) 다른
+인스턴스가 저장한 8K/16K KV 를 첫 요청에서 125/140 ms 로 받는다. 미해결: 프로세스 기동 후 첫 DAOS I/O 가 간헐적으로
+14~17 초(어댑터 기동 시 프로브로 완화, §7.4).
