@@ -308,4 +308,5 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 16K 245~265 ms 로 in-process 와 같거나 빠르고(어댑터 읽기 33~37 GB/s = DAOS 상한), 반복 hit 는 L1 에서
 50~135 ms. 게이트 PASS. 두 vLLM 인스턴스가 한 MP 서버를 공유하면(`launchers/run_vllm_mp2_c5.sh`) 다른
 인스턴스가 저장한 8K/16K KV 를 첫 요청에서 125/140 ms 로 받는다. 미해결: 프로세스 기동 후 첫 DAOS I/O 가 간헐적으로
-14~17 초(어댑터 기동 시 프로브로 완화, §7.4).
+14~17 초(어댑터 기동 시 프로브로 완화, §7.4). L1 < working set 의 p95 꼬리는 대역폭 포화 큐잉이며
+(12 inflight p95 456 → 6 inflight 152 ms, 처리량 동일 30 GB/s) 레버는 서버당 동시 요청 수(§7.6).

@@ -205,3 +205,49 @@ Qwen3-14B 두 인스턴스(8001/8002, GPU util 0.42 씩) + MP 서버 하나. A �
 - `report_status` 는 서버의 `--enable-extra-logging` 이 observability(이미지에 없는 prometheus exporter)를 요구해 못 쓰고,
   어댑터 옵션 `status_interval_s` 로 활동이 있을 때만 주기 로그를 낸다.
 - 런처에 `D_LOG_MASK`/`D_LOG_FILE`(기본 WARN, `/tmp/daos_client.log`)을 넘긴다.
+
+## 7.6 L1=20 GB 의 p95 꼬리 — 원인은 포화 큐잉, 레버는 동시성 (2026-09-05)
+
+Part B(100 GB working set, 12 inflight)에서 L1=20 GB 일 때 p95 가 avg 의 2~3 배(909 ms 관측)였다.
+`longdocqa.py DUMP=1` 로 요청별 지연을 시작 순서로 찍어 보면 **>400 ms 요청이 매 런 같은 위치(79~90, 127~138)에
+12 개씩 뭉쳐** 나온다. 설정을 바꿔도 위치가 그대로다.
+
+### 배제한 것 (전부 같은 하네스, 질의만, 런마다 재시작)
+
+| 가설 | 시험 | 결과 |
+|---|---|---|
+| 서버 프리페치 동시 한도(기본 8 < 12) | `--l2-prefetch-max-in-flight 16` | 변화 없음 |
+| L1 eviction 시점 | watermark 0.5·0.6 / ratio 0.3, `--l2-store-policy skip_l1`, eviction tick 1 s → 0.05 s(`DAOS_MP_EVICT_TICK_S`) | 변화 없음. `reserve_write` OUT_OF_MEMORY **0 건**(`DAOS_MP_TRACE=1`). L1=100 에서도 같은 위치의 웨이브 |
+| L1 lazy pinned 확장 | `--no-l1-use-lazy` | 변화 없음(확장 로그 0) |
+| 어댑터 태스크 슬롯 8 개 | `task_workers` 32 | 변화 없음 |
+| 어댑터 I/O 스레드 | `workers` 16 / GPU 워커 8·12 / CPU 워커 16 | 변화 없음 |
+| 클라이언트 GC / 서버 GC | `NOGC=1` / `DAOS_MP_GC=freeze` | 변화 없음 |
+| lookup 이 bulk 읽기 뒤에 줄 섬 | 메타데이터 전용 풀 | **avg 290→270 ms, 집계 26→29 GB/s** 개선. p95 는 그대로 |
+| L2 단계의 FIFO 계단(태스크 25→230 ms) | `load_schedule: fair`(태스크 간 키 라운드로빈) | L2 단계는 균등화(80~120 ms)됐지만 **요청 p95 불변** → 꼬리는 L2 단계 밖 |
+| `--l2-prefetch-policy retain` | | **훨씬 악화**(7.9 GB/s) — L1 < working set 에서 금지 |
+
+서버 로그로 단계별 시간을 재면 어댑터 load 는 34~130 ms, 프리페치 완료→GPU 전송 지연 p95 21 ms 로 모두 짧다.
+꼬리 요청의 초과 시간은 어느 한 단계가 아니라 **한 웨이브를 통째로 기다린 것**이다.
+
+### 확정 — 대역폭 포화에서의 배치 큐잉
+
+12 inflight × 640 MB 를 DAOS 상한 ~30 GB/s 로 나누면 웨이브 하나가 ~230 ms 다. p50(235) 은 웨이브 하나,
+p95(≈460) 는 웨이브 도중 도착해 다음 웨이브까지 기다린 요청이다. Little 의 법칙상 12 inflight 의 평균은
+12 × 0.64 GB / 30 GB/s ≈ 256 ms 아래로 내려갈 수 없고(실측 avg 271), 스케줄링은 분포 모양만 바꿀 수 있다.
+
+| inflight | avg | p50 | p95 | p95/p50 | 집계 |
+|---|---|---|---|---|---|
+| **6** | **132 ms** | 125 | **152** | **1.22** | **30.0 GB/s** |
+| 12 | 271 | 235 | 456 | 1.94 | 29.0 |
+| 24 | 609 | 465 | 1231 | 2.56 | 25.1 |
+
+**inflight 6 은 같은 처리량(30 GB/s)을 내면서 p95 가 152 ms 다.** 12 는 처리량을 더 얻지 못하고 큐만 늘린다.
+서버 쪽에서 `--l2-prefetch-max-in-flight 4·6` 으로 admission 을 제한해도 대기가 큐로 옮겨갈 뿐 p95 는 그대로다
+(465~475) — 대기 위치가 어디든 12 개가 들어오면 12 개 분의 시간이 걸린다.
+
+### 권고
+1. **MP 서버(= DAOS 대역폭 단위)당 동시 KV 요청 수를 대역폭에 맞춘다.** 기준: `inflight ≈ 목표 TTFT × BW / KV_per_req`
+   → 30 GB/s, 640 MB, 150 ms 이면 ~6~7. vLLM 쪽 `--max-num-seqs` 또는 앞단 admission 으로 건다.
+2. 처리량을 더 원하면 랭크(대역폭)를 늘린다 — 12 inflight 에서도 집계는 이미 상한이다.
+3. L1 hit 비율이 진짜 레버다(L1 상주 시 avg 202 / p95 236). L1 < working set 이면 `retain` 은 켜지 말 것.
+4. 어댑터: 메타데이터 풀(기본 on)은 유지. `load_schedule: fair` 는 기본 fifo 로 둔다(끝단 이득 없음).

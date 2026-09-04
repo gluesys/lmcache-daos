@@ -33,6 +33,47 @@ def main(argv=None) -> None:
         gc.collect()
         gc.freeze()
         gc.set_threshold(100000, 50, 100)
+    # Experimental knobs (measurement aids; see doc/MP-MODE-PLAN.md 7.6):
+    #  DAOS_MP_EVICT_TICK_S -- the L1/L2 eviction controllers poll with a
+    #      hard-coded time.sleep(1); when L1 is smaller than one second of L2
+    #      inflow, reserve_write hits OUT_OF_MEMORY and requests wait for the
+    #      next tick. This shortens the tick for that module only.
+    #  DAOS_MP_TRACE=1 -- log L1 reserve_write OUT_OF_MEMORY occurrences.
+    tick = os.environ.get("DAOS_MP_EVICT_TICK_S", "")
+    if tick:
+        import time as _time
+        from lmcache.v1.distributed.storage_controllers import eviction_controller as _ec
+
+        class _FastTick:
+            sleep = staticmethod(lambda x, _t=float(tick): _time.sleep(min(x, _t)))
+
+            def __getattr__(self, name):
+                return getattr(_time, name)
+
+        _ec.time = _FastTick()
+    if os.environ.get("DAOS_MP_TRACE", "") == "1":
+        import time as _time
+        from lmcache.logging import init_logger
+        from lmcache.v1.distributed import l1_manager as _l1
+
+        _log = init_logger("lmcache_daos.mp.trace")
+        _orig_rw = _l1.L1Manager.reserve_write
+        _state = {"oom": 0, "last": 0.0}
+
+        def _rw(self, keys, *a, **kw):
+            t0 = _time.monotonic()
+            ret = _orig_rw(self, keys, *a, **kw)
+            oom = sum(1 for v in ret.values() if "OUT_OF_MEMORY" in str(v[0]))
+            if oom:
+                _state["oom"] += oom
+                now = _time.monotonic()
+                if now - _state["last"] > 0.2:
+                    _state["last"] = now
+                    _log.info("TRACE reserve_write OOM: %d/%d keys (cumulative %d) took %.1f ms",
+                              oom, len(keys), _state["oom"], (now - t0) * 1e3)
+            return ret
+
+        _l1.L1Manager.reserve_write = _rw
     args = mp_server.parse_args()
     mp_config = mp_server.parse_args_to_mp_server_config(args)
     storage_manager_config = mp_server.parse_args_to_config(args)
