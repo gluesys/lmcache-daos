@@ -120,10 +120,10 @@ def wait_result(fn, tid, fd):
     return res
 
 
-def make():
+def make(schedule="fifo"):
     cfg = DaosL2AdapterConfig.from_dict(
         {"type": "daos", "pool": "p", "container": "c", "root": "/mp",
-         "workers": 4, "max_capacity_gb": 1}
+         "workers": 4, "max_capacity_gb": 1, "load_schedule": schedule}
     )
     dfs = FakeDfs()
     ad = DaosL2Adapter(cfg, dfs_factory=lambda: dfs)
@@ -220,6 +220,31 @@ def test_concurrent_tasks_complete_once_each():
     assert set(seen) == set(tids)
     assert all(r.is_successful() and r.bytes_transferred() == n for r in seen.values())
     assert ad.report_status()["inflight_tasks"] == 0
+    ad.close()
+
+
+def test_fair_schedule_loads_concurrent_tasks():
+    ad, _ = make("fair")
+    n = 8192
+    keys = [key(40 + i) for i in range(6)]
+    tid = ad.submit_store_task(keys, [FakeObj(n, bytes([i]) * n) for i in range(6)])
+    wait_fd(ad.get_store_event_fd()); ad.pop_completed_store_tasks()
+    # three concurrent load tasks of two keys each, all must complete once
+    dsts = [[FakeObj(n), FakeObj(n)] for _ in range(3)]
+    tids = [ad.submit_load_task(keys[2*j:2*j+2], dsts[j]) for j in range(3)]
+    got = {}
+    fd = ad.get_load_event_fd()
+    while len(got) < 3:
+        wait_fd(fd)
+        for t in tids:
+            if t not in got:
+                bm = ad.query_load_result(t)
+                if bm is not None:
+                    got[t] = bm
+    for j, t in enumerate(tids):
+        assert got[t].test(0) and got[t].test(1)
+        assert bytes(dsts[j][0].buf) == bytes([2*j]) * n
+        assert bytes(dsts[j][1].buf) == bytes([2*j+1]) * n
     ad.close()
 
 

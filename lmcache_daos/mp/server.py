@@ -14,6 +14,7 @@ Every other option is LMCache's own (``--help`` lists them).
 
 from __future__ import annotations
 
+import os
 import sys
 
 
@@ -23,6 +24,15 @@ def main(argv=None) -> None:
 
     if argv is not None:
         sys.argv = [sys.argv[0]] + list(argv)
+    # Optional GC tuning for the cache-server process. A gen-2 collection in
+    # a process that keeps thousands of MemoryObj/ObjectKey instances alive
+    # stalls every in-flight request at once; DAOS_MP_GC=freeze freezes the
+    # start-up heap and raises the gen-0 threshold so collections are rare.
+    if os.environ.get("DAOS_MP_GC", "") == "freeze":
+        import gc
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100000, 50, 100)
     args = mp_server.parse_args()
     mp_config = mp_server.parse_args_to_mp_server_config(args)
     storage_manager_config = mp_server.parse_args_to_config(args)

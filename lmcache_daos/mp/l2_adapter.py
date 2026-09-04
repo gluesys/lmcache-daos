@@ -94,6 +94,86 @@ def _expected_bytes(layout: Optional[MemoryLayoutDesc]) -> Optional[int]:
         return None
 
 
+class _FairDispatcher:
+    """Round-robin key scheduler across concurrent load tasks.
+
+    ``pool.map`` per task is FIFO by task: with 12 requests in flight on a
+    saturated 34 GB/s link the first task finishes in ~25 ms and the last in
+    ~230 ms, so TTFT p95 is ~2x p50 (measured: 235 / 465 ms). Interleaving
+    the keys of all active tasks one-by-one makes the tasks progress
+    together (processor sharing): p95 drops toward the wave time at the cost
+    of a higher p50. Total throughput is unchanged -- the link is the limit.
+    """
+
+    def __init__(self, pool: concurrent.futures.ThreadPoolExecutor, slots: int):
+        self._pool = pool
+        self._slots = threading.Semaphore(slots)
+        self._cv = threading.Condition()
+        self._queues: Dict[int, Any] = {}   # token -> deque of (idx, item, fn, state)
+        self._order: List[int] = []
+        self._rr = 0
+        self._next = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, name="daos-l2-fair", daemon=True)
+        self._thread.start()
+
+    def run(self, fn, items) -> list:
+        """Schedule ``fn`` over ``items`` fairly against other callers; block
+        until all complete; return results in input order."""
+        import collections
+        n = len(items)
+        state = {"results": [None] * n, "left": n, "done": threading.Event()}
+        if n == 0:
+            return []
+        with self._cv:
+            token = self._next
+            self._next += 1
+            self._queues[token] = collections.deque(
+                (i, it, fn, state) for i, it in enumerate(items))
+            self._order.append(token)
+            self._cv.notify()
+        state["done"].wait()
+        return state["results"]
+
+    def _loop(self) -> None:
+        while not self._stop:
+            with self._cv:
+                while not self._order and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                # next non-empty queue in round-robin order
+                self._rr %= len(self._order)
+                token = self._order[self._rr]
+                q = self._queues[token]
+                idx, item, fn, state = q.popleft()
+                if q:
+                    self._rr += 1
+                else:
+                    del self._queues[token]
+                    self._order.pop(self._rr)
+            self._slots.acquire()          # wait for an I/O slot
+            self._pool.submit(self._one, fn, item, idx, state)
+
+    def _one(self, fn, item, idx, state) -> None:
+        try:
+            state["results"][idx] = fn(item)
+        except Exception as e:  # pragma: no cover
+            logger.warning("fair dispatcher item failed: %s", e)
+            state["results"][idx] = False
+        finally:
+            self._slots.release()
+            with self._cv:
+                state["left"] -= 1
+                if state["left"] == 0:
+                    state["done"].set()
+
+    def close(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+
+
 class DaosL2AdapterConfig(L2AdapterConfigBase):
     """``--l2-adapter`` JSON for the DAOS adapter::
 
@@ -112,6 +192,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         max_capacity_gb: float = 0.0,
         verify_size: bool = True,
         status_interval_s: float = 0.0,
+        task_workers: int = 32,
+        load_schedule: str = "fifo",
     ):
         self.pool = pool
         self.container = container
@@ -121,6 +203,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         self.max_capacity_gb = max_capacity_gb
         self.verify_size = verify_size
         self.status_interval_s = status_interval_s
+        self.task_workers = task_workers
+        self.load_schedule = load_schedule
 
     @classmethod
     def from_dict(cls, d: dict) -> "DaosL2AdapterConfig":
@@ -148,6 +232,12 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         status_interval = d.get("status_interval_s", 0)
         if not isinstance(status_interval, (int, float)) or status_interval < 0:
             raise ValueError("daos: 'status_interval_s' must be >= 0")
+        task_workers = d.get("task_workers", 32)
+        if not isinstance(task_workers, int) or task_workers <= 0:
+            raise ValueError("daos: 'task_workers' must be a positive integer")
+        load_schedule = d.get("load_schedule", "fifo")
+        if load_schedule not in ("fifo", "fair"):
+            raise ValueError("daos: 'load_schedule' must be 'fifo' or 'fair'")
         cfg = cls(
             pool=pool,
             container=container,
@@ -157,6 +247,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             max_capacity_gb=float(cap),
             verify_size=verify_size,
             status_interval_s=float(status_interval),
+            task_workers=task_workers,
+            load_schedule=load_schedule,
         )
         # Optional common sub-configs handled by the base class parsers.
         cfg.eviction_config = cls._parse_eviction_config(d)
@@ -174,6 +266,12 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "- root (str): DFS directory holding the objects "
             "(optional, default '/mp')\n"
             "- workers (int): I/O threads (optional, default 8)\n"
+            "- load_schedule ('fifo'|'fair'): how concurrent load tasks share the I/O "
+            "threads. fifo (default) minimises mean latency; fair interleaves keys "
+            "across tasks so TTFT p95 approaches p50 under saturation\n"
+            "- task_workers (int): concurrent tasks admitted (optional, default 32). "
+            "Must exceed the number of requests the server keeps in flight, or "
+            "the excess requests queue a whole task time behind the others\n"
             "- max_capacity_gb (number): declared capacity for global "
             "eviction; 0 = unbounded (optional)\n"
             "- verify_size (bool): treat size mismatches as misses "
@@ -202,19 +300,34 @@ class DaosL2Adapter(L2AdapterInterface):
         self._dfs = factory()
         if self._root != "/":
             self._dfs.mkdir_p(self._root)
-        self._warm_up()
 
         # Two pools on purpose. A task thread fans its keys out to the I/O
         # pool and waits for them; if both ran on one pool, N concurrent
         # tasks would occupy all N workers and wait forever for sub-work that
         # can never be scheduled (classic executor self-deadlock).
+        #
+        # The task pool must be *wider* than the server's request
+        # concurrency: a task that cannot get a thread is not even submitted
+        # to the I/O pool and pays a whole task duration extra. Measured on
+        # client-5 (12 inflight, 8 task threads): a burst of 12 requests at
+        # ~2x latency every run -- the p95 tail. Task threads are cheap
+        # (they block on futures), so default to 32.
         self._tasks = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(2, min(config.workers, 8)),
+            max_workers=config.task_workers,
             thread_name_prefix="daos-l2-task",
         )
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=config.workers, thread_name_prefix="daos-l2-io"
         )
+        # Metadata ops (stat for lookup, remove for delete) get their own
+        # small pool: a 16-key lookup queued behind 640 MiB of bulk reads on
+        # the I/O pool inflated request latency by a whole load time.
+        self._meta = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(4, config.workers), thread_name_prefix="daos-l2-meta"
+        )
+        self._fair = (_FairDispatcher(self._pool, config.workers)
+                      if config.load_schedule == "fair" else None)
+        self._warm_up()
 
         self._store_efd = create_event_notifier()
         self._lookup_efd = create_event_notifier()
@@ -232,7 +345,7 @@ class DaosL2Adapter(L2AdapterInterface):
             "store_failed_keys": 0, "lookup_tasks": 0, "lookup_hits": 0,
             "lookup_misses": 0, "load_tasks": 0, "load_ok": 0,
             "load_failed": 0, "deleted": 0, "errors": 0,
-            "load_bytes": 0, "load_seconds": 0.0,
+            "load_bytes": 0, "load_seconds": 0.0, "lookup_seconds": 0.0,
             "store_bytes": 0, "store_seconds": 0.0,
         }
         self._closing = False
@@ -245,9 +358,9 @@ class DaosL2Adapter(L2AdapterInterface):
             self._status_thread.start()
         logger.info(
             "DaosL2Adapter: pool=%s container=%s root=%s workers=%d "
-            "capacity=%d verify_size=%s",
+            "capacity=%d verify_size=%s schedule=%s",
             config.pool, config.container, self._root, config.workers,
-            self._max_capacity_bytes, self._verify_size,
+            self._max_capacity_bytes, self._verify_size, config.load_schedule,
         )
 
     def _warm_up(self) -> None:
@@ -263,21 +376,29 @@ class DaosL2Adapter(L2AdapterInterface):
         path = f"{self._root}/.daos-l2-probe"
         t0 = time.monotonic()
         try:
-            n = 4096
+            n = 4 << 20  # one DFS chunk: exercises the bulk path, not just RPC
             src = (ctypes.c_char * n).from_buffer(bytearray(b"\x5a" * n))
             h = self._dfs.open_rdwr_create(path)
             try:
                 self._dfs.write_obj_from(h, 0, n, src)
             finally:
                 self._dfs.close_obj(h)
-            dst = (ctypes.c_char * n).from_buffer(bytearray(n))
-            h = self._dfs.open_rdonly(path)
-            try:
-                got = self._dfs.read_obj_into(h, 0, n, dst)
-            finally:
-                self._dfs.close_obj(h)
-            logger.info("DaosL2Adapter warm-up: probe %s %d/%d bytes in %.1f ms",
-                        path, got, n, (time.monotonic() - t0) * 1e3)
+
+            def _read(_):
+                dst = (ctypes.c_char * n).from_buffer(bytearray(n))
+                hh = self._dfs.open_rdonly(path)
+                try:
+                    return self._dfs.read_obj_into(hh, 0, n, dst)
+                finally:
+                    self._dfs.close_obj(hh)
+
+            # one read per I/O thread, concurrently: the first bulk transfer
+            # on a fresh process runs at ~half speed (endpoint set-up); do it
+            # here rather than on the first user request
+            got = list(self._pool.map(_read, range(self._config.workers)))
+            logger.info("DaosL2Adapter warm-up: probe %s, %d parallel reads of %d bytes "
+                        "(%s ok) in %.1f ms", path, len(got), n,
+                        sum(1 for g in got if g == n), (time.monotonic() - t0) * 1e3)
         except Exception as e:  # pragma: no cover - best effort
             logger.warning("DaosL2Adapter warm-up failed (%s) after %.1f ms",
                            e, (time.monotonic() - t0) * 1e3)
@@ -413,9 +534,10 @@ class DaosL2Adapter(L2AdapterInterface):
         return True
 
     def _execute_lookup(self, keys, expected, tid: L2TaskId) -> None:
+        t0 = time.monotonic()
         bitmap = Bitmap(len(keys))
         try:
-            hits = self._map(self._lookup_one, [(k, expected) for k in keys])
+            hits = list(self._meta.map(self._lookup_one, [(k, expected) for k in keys]))
             with self._lock:
                 for i, (key, hit) in enumerate(zip(keys, hits)):
                     if hit:
@@ -427,9 +549,13 @@ class DaosL2Adapter(L2AdapterInterface):
         except Exception:
             logger.exception("daos lookup task %d failed", tid)
             self._stats["errors"] += 1
+        el = time.monotonic() - t0
         with self._lock:
             self._completed_lookup[tid] = bitmap
             self._stats["lookup_tasks"] += 1
+            self._stats["lookup_seconds"] += el
+        if el > 0.05:
+            logger.info("daos l2 lookup task %d: %d keys in %.1f ms", tid, len(keys), el * 1e3)
         self._finish()
         self._lookup_efd.notify()
 
@@ -478,7 +604,9 @@ class DaosL2Adapter(L2AdapterInterface):
         bitmap = Bitmap(len(keys))
         hit_keys: List[ObjectKey] = []
         try:
-            oks = self._map(self._load_one, list(zip(keys, objects)))
+            items = list(zip(keys, objects))
+            oks = (self._fair.run(self._load_one, items) if self._fair
+                   else self._map(self._load_one, items))
             for i, (key, ok) in enumerate(zip(keys, oks)):
                 if ok:
                     bitmap.set(i)
@@ -572,8 +700,11 @@ class DaosL2Adapter(L2AdapterInterface):
                 if self._inflight == 0:
                     break
             time.sleep(0.05)
+        if self._fair:
+            self._fair.close()
         self._tasks.shutdown(wait=True)
         self._pool.shutdown(wait=True)
+        self._meta.shutdown(wait=True)
         try:
             self._dfs.close()
         except Exception:  # pragma: no cover
