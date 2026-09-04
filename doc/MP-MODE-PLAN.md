@@ -112,3 +112,46 @@ vllm serve … --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_ro
 4. ObjectKey 의 `object_group_id`/`kv_rank`: TP=1·단일 그룹이면 각각 하나. hybrid 모델은 범위 밖.
 5. LMCache 0.5.2 의 `Double free` 경고가 MP 경로에도 있는지(관찰만).
 6. 컨테이너 안 두 프로세스 관리: 런처가 MP 서버 준비(`/health` 또는 포트)를 확인한 뒤 vLLM 기동.
+
+## 6. 결과 (2026-09-04, Phase 0~2 완료)
+
+구현: `lmcache_daos/mp/l2_adapter.py`(어댑터 + `type: "daos"` 등록), `lmcache_daos/mp/server.py`(엔트리),
+`lmcache_daos/mp/vllm_connector.py`(vLLM 측 셈), `dfs_binding.py` 에 `stat_size`/`mkdir_p` 추가,
+`tests/mp/test_l2_adapter.py`(모의 DfsSys, 4 케이스 PASS), `deploy/launchers/run_vllm_mp_c5.sh`,
+`bench/bench_persist.py`(콜드 L1 측정), 게이트에 `HIT_PATTERN`.
+
+### 6.1 구현 중 확인된 것 (§5 의 미확인 항목 해소)
+
+| 항목 | 결과 |
+|---|---|
+| 외부 어댑터 등록 | 서버 인자 파싱 전에 import 필요 → `python -m lmcache_daos.mp.server` 엔트리. `--help` 의 타입 목록에 `daos` 가 나옴 |
+| `byte_array` | pinned L1 객체의 쓰기 가능한 memoryview. `(c_char*n).from_buffer()` 로 zero-copy 읽기·쓰기 동작 |
+| 스레드풀 | 태스크 풀과 I/O 풀을 **분리**해야 한다. 한 풀에서 태스크가 하위 I/O 를 기다리면 워커 수만큼의 동시 태스크에서 자기교착(단위 테스트에서 재현) |
+| ObjectKey | `cache_salt` 에도 `/` 금지. model_name 은 vLLM 이 넘긴 **모델 경로 전체**(`/hf/hub/…/snapshots/<hash>`)라 `/`→`_` 접기가 실제로 필요 |
+| 저장 단위 | 청크 256 토큰 × 160 KiB = **40 MiB/객체**. `/mp` 에 564 객체 적재 확인 |
+| L2 쓰기 정책 | 기본 정책에서 store 가 L2 로도 곧바로 내려간다(write-through). 재시작 뒤 L1 이 비어도 DAOS 에서 `0 L1, 21 L2` 로 채워짐 |
+| `--disable-observability` | 이미지에 `opentelemetry.exporter.prometheus` 가 없어 필수 |
+| vLLM 0.18 ↔ LMCache 0.5.2 스큐 | vLLM 내장 `LMCacheMPConnector` 와 LMCache 의 `_0180` 변형 모두 서버 URL 을 **문자열**로 넘기는데 어댑터는 리스트를 받는다(`ZMQError addr='t'`). 일반 변형은 `KVCacheSpecKind` 로 vLLM ≥0.19 를 요구. 셈이 `_0180` 을 고르고 `LMCacheMPSchedulerAdapter.__init__` 의 URL 을 리스트로 강제 |
+| vLLM factory | 등록된 이름을 `kv_connector_module_path` 보다 먼저 해석 → 미등록 이름 `DaosMPConnector` 로 우회 |
+
+### 6.2 측정 (client-5, Qwen3-14B/32K, ucx+rc_v, c_ops, 서버 `--l1-size-gb 100`)
+
+정합성 게이트: **PASS 6/6** (`HIT_PATTERN` MP 패턴).
+
+| 프롬프트 | miss(recompute) | MP warm hit (L1) | **MP cold hit (DAOS L2→L1→GPU)** | in-process hit (2026-09-03) |
+|---|---|---|---|---|
+| ~4K tok | 364~373 ms | 50~61 ms | **189 ms**(재시작 직후 1회) | 103~127 ms |
+| ~8K tok | 779~787 ms | 85~95 ms | **163 ms** | 151~221 ms |
+| ~16K tok | 1931~2045 ms | 126~135 ms | **275 ms** | 251~444 ms |
+
+- 콜드 hit 는 `bench_persist.py` 로 저장 → 컨테이너 재시작(L1 소거) → 같은 프롬프트 재요청. 서버 로그
+  `Prefetch request completed: 21/21 retained keys (0 L1, 21 L2) in 91.4 ms`(840 MiB → 약 9 GB/s) 가 DAOS 경로임을 증명.
+- 4K 콜드의 189 ms 는 재시작 후 첫 요청의 일회성 비용을 포함한다(이후 같은 크기의 8K 가 163 ms).
+- **MP 의 DAOS 경로는 in-process 와 같거나 빠르고**(16K 275 vs 251~444), 반복 hit 는 L1 에서 50~135 ms 로 끝난다.
+  §2.5 의 스트리밍 겹침 가설은 아직 분리 측정하지 않았다(Phase 3).
+
+### 6.3 남은 것 (Phase 3)
+1. 소태스크 분할로 L2 load 완료를 잘게 통지해 L2→L1→GPU 겹침이 생기는지 실측. `workers` 스윕.
+2. `report_status` 를 볼 경로(HTTP 프런트 또는 주기 로그).
+3. 두 vLLM 인스턴스가 한 MP 서버를 공유하는 시나리오.
+4. LMCache `Double free` 경고가 MP 경로에도 나는지 확인.

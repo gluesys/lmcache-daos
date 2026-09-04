@@ -15,4 +15,4 @@ dependencies = []
 dev = ["pytest"]
 
 [tool.setuptools]
-packages = ["lmcache_daos"]
+packages = ["lmcache_daos", "lmcache_daos.mp"]

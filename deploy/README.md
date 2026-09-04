@@ -300,3 +300,9 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 
 함정 하나 추가: `scm_size` 를 바꿔도 **이미 마운트된 `/mnt/daos0` tmpfs 크기는 그대로**라 `pool create` 가 크기와
 무관하게 `DER_NOSPACE` 를 낸다. 서버 정지 후 `umount /mnt/daos0` 를 하고 재포맷해야 한다.
+
+## 11. LMCache MP 모드 (2026-09-04, 브랜치 `mp-mode`)
+
+별도 프로세스의 LMCache 캐시 서버(L1 pinned + DAOS L2 어댑터) + vLLM `DaosMPConnector`. 설계·결과는
+`doc/MP-MODE-PLAN.md`, 런처는 `launchers/run_vllm_mp_c5.sh`. 콜드 L1 기준 DAOS hit TTFT 는 8K 163 ms,
+16K 275 ms 로 in-process 와 같거나 빠르고, 반복 hit 는 L1 에서 50~135 ms. 게이트 PASS.
