@@ -13,6 +13,11 @@ MP_PORT=${MP_PORT:-5555}
 POOL=${POOL:-attr1}; CONT=${CONT:-kvlmc5}; ROOT=${ROOT:-/mp}
 WORKERS=${WORKERS:-8}; GPU_WORKERS=${GPU_WORKERS:-4}; CPU_WORKERS=${CPU_WORKERS:-8}; STATUS_S=${STATUS_S:-0}
 MODEL=${MODEL:-/hf/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18}
+# YaRN for contexts beyond the model's native 40960 (same as run_arm_yarn.sh):
+#   MML=66560 FACTOR=1.625 (64K)   MML=131072 FACTOR=3.2 (127K)
+FACTOR=${FACTOR:-}
+YARN=""
+[ -n "$FACTOR" ] && YARN="--hf-overrides '{\"max_position_embeddings\":$MML,\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":$FACTOR,\"original_max_position_embeddings\":40960}}'"
 
 podman rm -f vllm-daos >/dev/null 2>&1; sleep 15
 
@@ -31,7 +36,7 @@ for i in \$(seq 1 180); do
 done
 echo "[launcher] mp server port open after \$i s"
 exec numactl --interleave=all vllm serve $MODEL \
-  --served-model-name qwen3 --max-model-len $MML --gpu-memory-utilization 0.90 \
+  --served-model-name qwen3 --max-model-len $MML --gpu-memory-utilization 0.90 $YARN \
   --enforce-eager --no-enable-prefix-caching --port 8001 \
   --kv-transfer-config '{"kv_connector":"DaosMPConnector","kv_connector_module_path":"lmcache_daos.mp.vllm_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":$MP_PORT}}'
 EOF
