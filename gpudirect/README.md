@@ -1502,8 +1502,8 @@ p95 201 ms 로 MP 의 151 에 근접한다. **DRAM: 100 GB 를 GPU 로 가져오
 | MP verbs 콜드(비교) | 216 | 210 | 295 | 36.2 |
 
 Part A 콜드는 그대로(80 / 132~138 / 215~218 ms). 남은 격차(27.7 vs 36.2)는 엔진 쪽 — retrieve 의 `to_gpu` 청크 루프와 요청 단위 직렬 처리 — 이고 스토리지 읽기
-자체는 요청당 23~25 ms(26~30 GB/s)로 MP 어댑터와 같다. **GPU 풀은 inflight × KV 크기 이상**이어야 한다: 24 inflight × 640 MB = 15 GB > 10 GiB 에서
-할당 실패 → 접두 절단 → 재계산으로 급락한다(정합성은 유지). 가중 세마포어는 prefetch 동시성만 막고 소비 지연은 못 막으므로 여유를 둘 것
+자체는 요청당 23~25 ms(26~30 GB/s)로 MP 어댑터와 같다. **GPU 풀은 inflight × KV 크기 이상**이어야 한다: 24 inflight × 640 MB = 15 GB > 10 GiB 인 런에서 백엔드 오류 355 줄과 함께 급락했다
+(정합성은 유지; 오류 분류 전에 컨테이너가 교체되어 "GPU buffer full → 접두 절단 → 재계산" 은 정황 추정이다 — 재현 시 `GPU buffer full` 카운트로 확정할 것). 가중 세마포어는 prefetch 동시성만 막고 소비 지연은 못 막으므로 여유를 둘 것
 (`GDS_GB`, `--gpu-memory-utilization` 과 상충).
 
 MR 캐시: mercury na_ofi 가 `FI_MR_CACHE_MAX_COUNT=0` 을 강제해 libfabric 캐시가 꺼진 상태(`ofi_mr_cache_init` → ENOSPC). 환경변수 덮어쓰기는 듣지 않고,
