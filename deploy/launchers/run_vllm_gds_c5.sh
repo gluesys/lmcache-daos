@@ -2,9 +2,10 @@
 # client-5 in-process launcher with the GPU-direct DAOS storage plugin (DaosGdsBackend).
 # Needs on the host: /opt/daos-gds-gpu (GPU-direct DAOS client), /opt/ofi-cuda (CUDA libfabric,
 # verbs dmabuf patch), /usr/local/cuda-13.3 (libcudart for libfabric's dlopen), libgdrapi.
-# Env: MML (max model len), GDS_GB (GPU staging pool), GPU_UTIL, POOL/CONT, WORKERS, PODMAN_EXTRA.
+# Env: MML (max model len), GDS_GB (GPU staging pool), GPU_UTIL, POOL/CONT, WORKERS, ASYNC (enable_async_loading:
+# prefetch at lookup time so DAOS->GPU reads of the next request overlap the current prefill), PODMAN_EXTRA.
 MML=${MML:-32768}; GDS_GB=${GDS_GB:-6}; GPU_UTIL=${GPU_UTIL:-0.80}
-POOL=${POOL:-attr1}; CONT=${CONT:-kvgds_s16}; WORKERS=${WORKERS:-16}
+POOL=${POOL:-attr1}; CONT=${CONT:-kvgds_s16}; WORKERS=${WORKERS:-16}; ASYNC=${ASYNC:-False}
 podman rm -f vllm-daos >/dev/null 2>&1; sleep 15
 cat > /root/lmc/gds.yaml <<Y
 chunk_size: 256
@@ -18,7 +19,7 @@ extra_config:
   daosgds.container: $CONT
   daosgds.gpu_buffer_gb: $GDS_GB
   daosgds.io_workers: $WORKERS
-enable_async_loading: False
+enable_async_loading: $ASYNC
 Y
 read -r -d '' INNER <<'EOS'
 mkdir -p /tmp/links && cp -f /cuda13/libcudart.so.13 /tmp/links/libcudart.so

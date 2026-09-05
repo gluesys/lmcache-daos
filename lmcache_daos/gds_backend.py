@@ -38,6 +38,7 @@ verbs dmabuf patch, ``D_MEM_DEVICE=1``, nvidia open kernel module.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import json
 import logging
@@ -358,6 +359,39 @@ class DaosGdsBackend(AllocatorBackendInterface):
 
     def get_non_blocking(self, key: CacheEngineKey, location: Optional[str] = None) -> Optional[Future]:
         return None
+
+    # -- async loading (enable_async_loading: True) ----------------------------
+    # The storage manager runs these on its event loop at *lookup* time, before
+    # the request is scheduled, and hands the objects to retrieve() through the
+    # event manager (not through LocalCPUBackend). That is what lets request
+    # N+1's DAOS->GPU reads overlap request N's prefill -- the overlap the MP
+    # server gets from its own load tasks, without a separate process.
+    async def batched_async_contains(self, lookup_id: str, keys: List[CacheEngineKey],
+                                     pin: bool = False) -> int:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._pool, self.batched_contains, keys, pin)
+
+    async def batched_get_non_blocking(self, lookup_id: str, keys: List[CacheEngineKey],
+                                       transfer_spec: Any = None) -> List[MemoryObj]:
+        t0 = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        res = await asyncio.gather(*(loop.run_in_executor(self._pool, self.get_blocking, k) for k in keys))
+        # prefix semantics: stop at the first miss, release anything after it
+        out: List[MemoryObj] = []
+        failed = False
+        for o in res:
+            if o is None or failed:
+                failed = True
+                if o is not None:
+                    o.ref_count_down()
+                continue
+            out.append(o)
+        nb = sum(o.get_size() for o in out)
+        dt = time.perf_counter() - t0
+        if nb:
+            logger.info("DaosGdsBackend prefetch[%s]: %d/%d objects, %.1f MiB in %.1f ms (%.2f GB/s, GPU-direct)",
+                        lookup_id[-8:], len(out), len(keys), nb / 2**20, dt * 1e3, nb / dt / 1e9)
+        return out
 
     # -- misc -------------------------------------------------------------------
     def pin(self, key: CacheEngineKey) -> bool:
