@@ -172,3 +172,14 @@ L1_GB=20  ROOT=/mp_ldq20  /root/run_vllm_mp.sh; ARM=mp_l1_20  POPULATE=1 python3
 ### 6.3 한 줄 정리
 verbs 전환으로 MP 의 DAOS 경로는 Hub 문서 대비 Part A 1.1~1.9×, Part B 1.7×, 스톨 없음. 남는 격차는 in-process 시절부터 같은
 L1→GPU 직렬 구간이며, 그것은 §7.7 의 스트리밍(현재 프로토타입, 기본 off)이 다룬다.
+
+## 7. GDS in-process(`DaosGdsBackend`) 열 추가 (2026-09-06)
+
+| ctx | Hub DAOS in-proc | MP verbs 콜드 | MP L1 warm | **GDS in-proc 콜드** |
+|---|---|---|---|---|
+| 8K | 151 | 139 | 105 | **76~149** |
+| 16K | 298 | 158 | 85 | **118** |
+| 31K | 437 | 281 | 141 | **198~211** |
+
+Part B(100 GB, 12 inflight): GDS in-proc 콜드 avg 363 / p50 359 / p95 477, 21.7 GB/s(엔진 요청 직렬화 한계), inflight 6 → p95 201; DRAM 0.09 B/B.
+콜드 단건은 GDS 가, 다중 요청 집계는 MP 가 최선. 상세 `gpudirect/README.md` "Phase 2".

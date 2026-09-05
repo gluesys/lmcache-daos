@@ -312,3 +312,13 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 인스턴스가 저장한 8K/16K KV 를 첫 요청에서 125/140 ms 로 받는다. 미해결: store 직후 수 초 안의 첫 대용량 load 가 ~15 s 멈춤(RPC 가 클라이언트
 mercury/UCX 송신 경로에 머묾, 서버 무죄, 쓰기+15 s 에 풀림; §7.7b). `ofi+tcp` 로 바꾸면 0/8 로 사라져 **UCX 한정**(§7.7c). `ofi+verbs;ofi_rxm` 은 스톨 0/6 에 대역폭 동일(35~38 GB/s), 정합성 통과 → 클러스터를 verbs 로 전환(§7.7d). **근본 원인 확정(§7.7e)**: mercury NA-UCX 가 서버 xstream 에 처음 RPC 를 보낼 때 rdma_cm 으로 지연 연결하는데, store 중(클→서 방향 포화, PFC 없는 손실형 RoCE)에 첫 접촉이 일어나면 CM `RTU` 가 유실되고 서버 커널 CM 의 `REP` 재전송(~16 s)까지 그 rank:tag 의 RPC 가 모두 대기. 어댑터 기동 프로브를 SX 오브젝트로 바꿔 모든 타깃 연결을 기동 시 조용할 때 맺도록 수정(`probe_chunks`, 기본 64) → ucx 에서도 10/10 스톨 없음. in-process `DaosConnector` 도 같은 워밍업을 기동 시 수행한다(`dfs_binding.warm_up_all_targets`, env `DAOS_PROBE_CHUNKS` 기본 64, 0 이면 끔; 검증 2026-09-05 verbs: 64 타깃 149 ms, 게이트 PASS). L1 < working set 의 p95 꼬리는 대역폭 포화 큐잉이며
 (12 inflight p95 456 → 6 inflight 152 ms, 처리량 동일 30 GB/s) 레버는 서버당 동시 요청 수(§7.6).
+
+## 12. GDS(GPU-direct) in-process 백엔드 (2026-09-06)
+
+`deploy/launchers/run_vllm_gds_c5.sh` — vLLM in-process + `storage_plugins: ["daosgds"]`(`lmcache_daos.gds_backend.DaosGdsBackend`). KV 청크를 DAOS 에서
+GPU 메모리로 직접 읽고(`dfs_read_gpu`) GPU 에서 직접 쓴다. 호스트 전제: `/opt/daos-gds-gpu`(b_cufile 초안 클라이언트, `gpudirect/README.md`),
+`/opt/ofi-cuda`(CUDA libfabric + `patches/libfabric-0001-verbs-cuda-dmabuf-and-close-fd.patch`), `/usr/local/cuda-13.3`, `libgdrapi`, nvidia open 모듈,
+서버는 **stockfull 그대로**(전송 `ofi+verbs;ofi_rxm`, agent domain `mlx5_0`). 컨테이너 env: `LMCACHE_DAOS_LIBDIR`, `D_MEM_DEVICE=1`, LD 경로 선두에
+CUDA libfabric, `--ulimit nofile=65536`. 설정 `GDS_GB`(GPU 스테이징 풀, 기본 6; Part B 는 10), `GPU_UTIL` 0.80.
+결과(Qwen3-14B, verbs): 재시작 후 콜드 hit 8K 76~149 / 16K 118 / 31K 198~211 ms(MP verbs 139/158/281), 31K retrieve 33 GB/s GPU-direct, 요청당 호스트 DRAM
+~0.9 GB. Part B 12 inflight avg 363 / p95 477, 21.7 GB/s(엔진 직렬화 한계; MP 36.2), inflight 6 p95 201, DRAM 0.09 B/B. 상세 `gpudirect/README.md`.

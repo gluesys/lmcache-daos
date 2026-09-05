@@ -1444,6 +1444,51 @@ DRAM(16W): gpu 971+895 MiB vs pinnedcopy 7428+7357 MiB (8.0×). GDS 엔진 빌�
 → in-process `DaosGdsBackend`(GPU 스테이징 + 페이지드 KV 로 D2D scatter) → 실제 KV 청크 TTFT 를 스테이징 경로와 비교.
 전제 조건은 컨테이너 이미지에 GDS 클라이언트 번들(`/opt/daos-gds-gpu` lib64 + `/opt/ofi-cuda` + CUDA 링크)을 넣는 것.
 
+## 2026-09-06 Phase 2 — in-process `DaosGdsBackend` end-to-end (vLLM + LMCache 0.5.2)
+
+계획서 §2~§4 의 세 단계를 구현해 client-5 에서 실제 KV 캐시로 검증했다(서버 stockfull + `ofi+verbs`, 컨테이너 `kvgds_s16`).
+- `lmcache_daos/serde_v2.py`: 4 KiB 헤더 페이지 + payload @4096, committed 플래그 + CRC, temp→`dfs_move` 원자 게시, `/v2` 네임스페이스. 단위 테스트 8/8.
+- `dfs_binding.py`: `dfs_read_gpu`/`dfs_write_gpu`(`daos_mem_attr_t`), `dfs_lookup`/`dfs_release`/`dfs_move`, `LMCACHE_DAOS_LIBDIR` 번들 선택. C shim 대신 ctypes
+  (계획서 §3 은 shim 을 권했지만 caller-owned sgl 로 충분했다). `tests/test_gds_binding.py`: torch GPU 버퍼 왕복 40 MiB 3/3, 4 MiB, 256 MiB 바이트 일치.
+- `lmcache_daos/gds_backend.py::DaosGdsBackend(AllocatorBackendInterface)`: `storage_plugins: ["daosgds"]` 로 로드(T-check 통과 — 0.5.2 의
+  `storage_plugin_launcher` 가 out-of-tree `module_path` 를 받는다). 자체 `GPUMemoryAllocator` 풀을 가지므로 스토리지 매니저가 store 객체를 GPU 로 복사해
+  넘기고(`allocate_and_copy_objects`), retrieve 는 GPU 객체를 할당해 `dfs_read_gpu` 로 채운 뒤 GPU 커넥터가 D2D scatter 한다. 런처 `deploy/launchers/run_vllm_gds_c5.sh`.
+
+구현 중 배운 계약 세 가지(각각 한 번씩 엔진을 죽였다):
+1. `batched_contains()` 는 bool 리스트가 아니라 **접두 히트 개수(int)** 를 돌려야 한다(매니저가 `keys[:n]` 으로 슬라이스). 틀리면 lookup 이 3 s 타임아웃을 반복해 TTFT 가 3.8 s 가 된다.
+2. `RemoteMetadata.serialize()` 는 RemoteBackend 가 프로세스 전역 포맷을 초기화해야 동작한다 → 플러그인은 자체 메타데이터(JSON, 헤더 페이지 안)를 쓴다.
+3. libfabric 의 CUDA 등록(`cuMemGetAddressRange`, dma-buf export)은 **호출 스레드에 CUDA 컨텍스트**가 있어야 한다. 스레드풀 워커는 없으므로
+   `CUDA_ERROR_INVALID_CONTEXT` → `DER_HG_FATAL` → 엔진 사망. 워커마다 한 번 `torch.cuda.set_device()` 로 컨텍스트를 올린다.
+
+### Part A — 재시작 후 콜드 hit(모든 청크 DAOS→GPU), Qwen3-14B, ms
+| ctx | GDS in-process 1번째 / 2번째 | MP verbs 콜드 | MP L1 warm | in-process 스테이징 콜드 | Hub in-process |
+|---|---|---|---|---|---|
+| 8K | **149 / 76** | 139 | 105 | 151~221 | 151 |
+| 16K | **119 / 118** | 158 | 85 | 251~444 | 298 |
+| 31K | **211 / 198** | 281 | 141 | — | 437 |
+
+retrieve 로그: 16K 2.5 GB 91 ms(백엔드 88 ms, 30.4 GB/s), 31K 4.84 GB 163 ms(157 ms, 33.2 GB/s). 31K hit 한 건 동안 호스트 DRAM 트래픽 read 893 + write 847 MiB(스테이징은 ~5 GB × 2).
+**콜드 hit 가 처음으로 L1 warm hit 수준에 왔다** — DAOS→L1→GPU 두 단계가 DAOS→GPU 한 단계가 됐기 때문이다. 게이트 3/3 PASS, put/get 오류 0.
+
+### Part B — 100 GB working set, 12 inflight, 149 쿼리
+| arm | avg | p50 | p95 | 집계 | populate |
+|---|---|---|---|---|---|
+| GDS in-process, 재시작 후 콜드 | 363 | 359 | 477 | 21.7 GB/s | 45 s |
+| GDS in-process, inflight 6 | 195 | 196 | **201** | 20.4 | — |
+| MP verbs 콜드(비교) | 216 | 210 | 295 | 36.2 | 42 s |
+| Hub in-process 스테이징 | 371 | 356 | 547 | 21.4 | 63 s |
+
+집계는 MP 에 진다. 스토리지가 아니라 **in-process 엔진이 요청별 retrieve 를 직렬로 실행**하기 때문이다(백엔드 로그의 640 MiB 읽기가 23~26 ms 씩
+순차로 찍힘 = 26~29 GB/s 단건, 겹침 없음; Hub §7-4a 가 지적한 구조 그대로). 대신 12 inflight 에서 p95 가 안정적이고(477, 큐잉만), inflight 6 에서는
+p95 201 ms 로 MP 의 151 에 근접한다. **DRAM: 100 GB 를 GPU 로 가져오는 동안 호스트 DRAM 트래픽이 read 4.5 + write 4.3 GB(0.09 B/B)** — 스테이징의 1.8~1.9 B/B
+대비 20 배 이상 절감으로, 계획서 §6 의 합격 기준(≤ 0.3 B/B)을 크게 넘는다.
+
+### 판정
+- 단일 GPU·단일 요청 콜드 지연과 DRAM 은 GDS in-process 가 최선이고, 다중 요청 집계 처리량은 MP(pinned L1 + 서버측 겹침)가 최선이다.
+  8-GPU 호스트(계획서 §6)에서는 집계 = GPU 수 × 단일 GPU 이므로 엔진 직렬화가 GPU 단위로 병렬화되고 DRAM 절감이 결정적이 된다 — 미측정(장비 없음).
+- 남은 것: (1) GDS 백엔드의 retrieve 를 LMCache `enable_async_loading`/prefetch 와 결합해 요청 간 겹침 확보(계획서 §1 은 GDS+async = hang 기록 →
+  재검증 필요), (2) `to_gpu` 청크 루프의 Python 고정비(§"운영 경로의 병목은 전송이 아니다"), (3) MR 캐시 비활성으로 매 I/O 등록, (4) RP_2 GPU 소스 쓰기 결함.
+
 ## 알려진 한계
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency

@@ -137,6 +137,7 @@ class DaosGdsBackend(AllocatorBackendInterface):
         self._put_tasks: set = set()
         self.stats = {"put": 0, "put_bytes": 0, "get": 0, "get_bytes": 0, "miss": 0,
                       "alloc_fail": 0, "get_ms": 0.0, "put_ms": 0.0}
+        self._tls = threading.local()
         logger.info("DaosGdsBackend: pool=%s cont=%s root=%s device=%s gpu_buffer=%.1f GiB workers=%d",
                     pool, cont, self.root, self.dst_device, self.gpu_buffer_bytes / (1 << 30),
                     self.io_workers)
@@ -176,6 +177,17 @@ class DaosGdsBackend(AllocatorBackendInterface):
             return max(1, self.gpu_buffer_bytes // chunk_bytes)
         except Exception:
             return 16
+
+    def _ensure_cuda_ctx(self) -> None:
+        """libfabric's CUDA HMEM path calls cuMemGetAddressRange / dma-buf export
+        on the *calling* thread; a pool thread that never touched CUDA has no
+        current context and fails with CUDA_ERROR_INVALID_CONTEXT (seen as
+        DER_HG_FATAL on the bulk). Make the device's primary context current
+        once per worker thread."""
+        if not getattr(self._tls, "ctx", False):
+            torch.cuda.set_device(self.device_id)
+            torch.cuda.current_stream(self.device_id)   # forces context creation on this thread
+            self._tls.ctx = True
 
     # -- paths ------------------------------------------------------------------
     def _path(self, key: CacheEngineKey) -> str:
@@ -233,6 +245,7 @@ class DaosGdsBackend(AllocatorBackendInterface):
     def _put_one(self, key: CacheEngineKey, obj: MemoryObj, cb) -> None:
         t0 = time.perf_counter()
         try:
+            self._ensure_cuda_ctx()
             if self.contains(key):
                 return
             tensor = obj.tensor
@@ -278,6 +291,7 @@ class DaosGdsBackend(AllocatorBackendInterface):
     # -- retrieve ---------------------------------------------------------------
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         t0 = time.perf_counter()
+        self._ensure_cuda_ctx()
         path = self._path(key)
         try:
             h = self._dfs.open_rdonly(path)
@@ -327,6 +341,14 @@ class DaosGdsBackend(AllocatorBackendInterface):
     def batched_get_blocking(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
         t0 = time.perf_counter()
         res = list(self._pool.map(self.get_blocking, keys))
+        # LMCache consumes hits as a prefix: after the first miss, later objects
+        # would be unusable, so release them and report None from there on.
+        cut = next((i for i, o in enumerate(res) if o is None), None)
+        if cut is not None:
+            for o in res[cut + 1:]:
+                if o is not None:
+                    o.ref_count_down()
+            res = res[:cut] + [None] * (len(res) - cut)
         nb = sum(o.get_size() for o in res if o is not None)
         dt = time.perf_counter() - t0
         if nb:

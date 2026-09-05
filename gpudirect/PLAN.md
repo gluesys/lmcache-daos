@@ -8,6 +8,9 @@
 >
 > 아래 Phase 1~5 설계는 폐기하지 않고 남긴다. 전제(스토리지 티어가 GPU 당 17 GB/s 이상을
 > 공급하고, QP 당 22 GB/s 제한을 우회할 방법이 생기는 것)가 바뀌면 그대로 유효하다.
+> **상태(2026-09-06)**: Phase 1(v2 포맷)·Phase 2(GPU 바인딩, ctypes)·Phase 3(`DaosGdsBackend`) **구현·검증 완료** — README "Phase 2 — in-process DaosGdsBackend".
+> Phase 4(store 우선)는 무의미해졌다(스토리지 매니저가 store 객체를 GPU 로 복사해 넘기므로 store/retrieve 가 함께 켜진다). Phase 5(8-GPU)는 장비 대기.
+>
 > **재개 조건은 §0 끝에 적었다.** 2026-09-05 분리 드라이브 재측정(README 말미)에서도 UCX 경로는 gpu/staging 0.46~0.79 로 판정 불변이었으나, **2026-09-06 `ofi+verbs` 에서는 0.86~1.1 로 재개 조건 충족**(README "GDS over ofi+verbs" 절). 백엔드 구현 재검토.
 >
 > 대신 하기로 했던 두 가지도 끝났다:
