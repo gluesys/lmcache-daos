@@ -1422,6 +1422,28 @@ DRAM 트래픽(16W, S16, perf uncore_imc): `gpu` read 999 + write 887 MiB vs `pi
 ("GDS 가 실제 청크 크기에서 스테이징보다 느리지 않다")이 **충족됐다.** LMCache 수준 GDS 백엔드는 다시 검토 대상이다. 다음 확인 순서:
 (1) stockfull 서버 + GDS 클라이언트 조합, (2) 실제 KV 청크(28~40 MiB) 크기의 TTFT 비교, (3) 8-GPU 호스트에서의 DRAM 경합.
 
+## 2026-09-06 Phase 1 — stockfull 서버 + GDS 클라이언트 (서버 변경 불필요 확인)
+
+서버를 운영 구성(`/var/daos-stockfull` 2.9.100, `ofi+verbs;ofi_rxm`, 드라이브 분리) 그대로 두고 client-5 에서 GDS 클라이언트
+(`/opt/daos-gds-gpu` + `/opt/ofi-cuda` + `D_MEM_DEVICE=1`)만 썼다. 같은 풀에서 stockfull 클라이언트의 MP 스택(`kvlmc5`)이 동시에 돌고 있었다.
+
+- `dfs_gpu_rt` 4 KiB~32 MiB 왕복 **3/3 ALL OK** — GDS 초안 클라이언트와 stock 서버는 wire 호환이다(초안의 변경은 클라이언트 측 메모리
+  속성·등록 경로에 국한). `PLAN.md` §1 의 "서버 설정 변경을 요구하는 설계 금지" 제약을 GDS 가 만족한다.
+- MP 스택은 영향 없음(8001 응답 정상).
+
+| 워커 | `gpu` | `pinnedcopy` | `pinned` | gpu/staging |
+|---|---|---|---|---|
+| 1 | 11.50 | 10.22 | 12.43 | 1.13 |
+| 4 | 25.08 | 28.10 | 29.75 | 0.89 |
+| 16 | 35.33 | 41.99 | 42.09 | 0.84 |
+| 16, **40 MiB 요청**(Qwen3-14B 의 LMCache 청크 크기) | 35.10 | 40.22 | — | 0.87 |
+
+DRAM(16W): gpu 971+895 MiB vs pinnedcopy 7428+7357 MiB (8.0×). GDS 엔진 빌드로 잰 앞 절과 같은 값이다.
+
+다음 단계(Phase 2, 계획서 §2~§4 의 Phase 1~3 에 해당): v2 정렬 포맷 → `dfs_read_gpu`/`dfs_write_gpu` 바인딩(GPU slab 1 회 등록·재사용)
+→ in-process `DaosGdsBackend`(GPU 스테이징 + 페이지드 KV 로 D2D scatter) → 실제 KV 청크 TTFT 를 스테이징 경로와 비교.
+전제 조건은 컨테이너 이미지에 GDS 클라이언트 번들(`/opt/daos-gds-gpu` lib64 + `/opt/ofi-cuda` + CUDA 링크)을 넣는 것.
+
 ## 알려진 한계
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency
