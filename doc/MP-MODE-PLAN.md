@@ -288,3 +288,26 @@ p95(≈460) 는 웨이브 도중 도착해 다음 웨이브까지 기다린 요�
 프로브(bytearray 로 읽기)와 워밍업 store 는 무관하다는 뜻이다. 새 가설: **pinned L1(100 GB, 10 GB 세그먼트 10 개)의
 첫 RDMA 메모리 등록**. 첫 load 만 L1 버퍼로 읽고, L1=20 GB 세션들에서는 스톨을 한 번도 보지 못했으며, 동시 소태스크가
 전부 같은 시간 멈춘 것(등록 락)과 맞는다. 검증은 `UCX_IB_REG_METHODS=odp`(pinning 없는 등록) A/B — §7.7b.
+
+### 7.7b 첫-로드 15 s 스톨 — 원인 국소화 (2026-09-05, 미해결)
+
+재현 조건이 확정됐다: **같은 프로세스에서 store(쓰기) 직후 몇 초 안에 대용량 load 를 하면** 그 load 의 모든 동시 read 가
+14.4~16.2 s 멈춘다. load 만 하면 0/10, store→load 는 12/16. store 뒤 12 s 를 두면 스톨이 ~3.5 s(= 15 − 12)로 줄고 30 s 뒤에는
+없다 → **쓰기 시각 기준 약 15 s 에 풀리는 타이머성** 현상이다. 스레드 수(2/8/16), L1 크기(20/100), `--no-l1-use-lazy`, 서버 GC,
+클라이언트 GC, UCX `IB_REG_METHODS=odp`, 풀 속성 `checkpoint:disabled`·`reclaim:disabled` 모두 무효(각 3 회 이상).
+
+계층별 관측:
+- 클라이언트(DAOS object/dtx/rpc DEBUG): fetch RPC 들을 `submitted` 로 찍은 뒤 **13 s 동안 로그 0 줄**(재시도·타임아웃·INPROGRESS 없음),
+  그 뒤 완료가 몰려온다. perf 는 그 동안 DAOS 클라이언트 진행 엔진(`tse_sched_progress`/`hg_core_progress`)이 futex 스핀락에서
+  CPU 54% 를 태우는 것을 보인다(결과이지 원인은 아님 — 스레드 2 개에서도 스톨).
+- 서버(cell1/cell2, RPC/CRT/HG DEBUG): 같은 창에 **클라이언트 RPC 수신이 0 건**(랭크 간 SWIM 5 s 주기만), fetch RPC 는
+  스톨이 끝나는 시각에 도착해 즉시 처리된다. VOS/DTX/BIO 경고 없음. 세 호스트 시계는 NTP 동기(µs).
+
+⇒ RPC 가 **클라이언트의 mercury/UCX 송신 경로에 ~14 s 머문다.** 서버·DAOS 서버 계층은 무죄다. 유력 후보는 store 의 bulk
+GET(서버가 클라이언트 pinned L1 을 RDMA read) 뒤 UCX 엔드포인트/플로우컨트롤 상태가 다음 송신을 막고 ~15 s 타임아웃으로
+회복되는 것. 클라이언트 mercury 로그(`HG_LOG_LEVEL`)는 이 빌드에서 잡히지 않아 여기서 멈춘다. 프로브(bytearray 쓰기→읽기)도
+1/15 스톨했으므로 pinned 메모리 한정은 아니다.
+
+**운영 함의**: 콜드 KV 를 저장한 직후 수 초 안에 다른 대용량 KV 를 읽는 패턴(populate 직후 질의)에서 첫 요청이 15 s 걸릴 수 있다.
+in-process 커넥터는 같은 라이브러리를 쓰므로 원리상 같은 노출이 있다(측정은 MP 에서만). 다음 단계는 mercury NA-UCX 로그를
+빌드에서 켜거나 `ofi+verbs`/`ofi+tcp` 로 전송을 바꿔 UCX 한정인지 가르는 것(서버 재포맷 필요).
