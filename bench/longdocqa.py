@@ -40,20 +40,32 @@ if POPULATE:
     print(f"populate: {time.time()-t0:.0f}s ({ws/(time.time()-t0):.2f} GB/s incl. prefill)",flush=True)
     time.sleep(30)   # store settle
 random.seed(42); order=[random.randrange(NDOC) for _ in range(NQ)]
-lat=[]; lk=threading.Lock(); idx=[0]
+if os.environ.get("NOGC","0")=="1":
+    # The harness holds 149 x 4096-int lists plus per-request JSON; a gen-2
+    # GC pass in the client stalls all INFLIGHT timers at once and shows up
+    # as a wave of ~INFLIGHT slow requests at a fixed position. Freeze the
+    # corpus and disable GC for the timed phase to test for that.
+    import gc; gc.collect(); gc.freeze(); gc.disable()
+lat=[]; seq=[]; lk=threading.Lock(); idx=[0]
 def worker():
     while True:
         with lk:
             if idx[0]>=len(order): return
             i=order[idx[0]]; idx[0]+=1
-        t=ttft(docs[i])
-        with lk: lat.append(t)
+        ts=time.time(); t=ttft(docs[i])
+        with lk: lat.append(t); seq.append((ts, i, t))
 t0=time.time()
 th=[threading.Thread(target=worker) for _ in range(INFLIGHT)]
 [x.start() for x in th]; [x.join() for x in th]
 wall=time.time()-t0
 lat_ms=sorted(t*1000 for t in lat)
 gb=NQ*DOCTOK*KVPT/1e9
+if os.environ.get("DUMP","0")=="1":
+    # per-request latencies in start order: shows whether the tail is at the
+    # start (warm-up), periodic (eviction) or random
+    base=seq[0][0] if seq else 0
+    for n,(ts,i,t) in enumerate(sorted(seq)):
+        print(f"LAT,{n},{ts-base:.2f},{i},{t*1000:.0f}")
 print(f"RESULT,{ARM},inflight={INFLIGHT},queries={NQ},"
       f"avg={st.mean(lat_ms):.0f}ms,p50={lat_ms[len(lat_ms)//2]:.0f}ms,"
       f"p95={lat_ms[int(len(lat_ms)*0.95)]:.0f}ms,wall={wall:.1f}s,agg={gb/wall:.2f}GB/s",flush=True)

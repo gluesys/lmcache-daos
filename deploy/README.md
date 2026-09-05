@@ -238,7 +238,9 @@ client-6 + cell1/cell2, Qwen3-14B(KV 160 KiB/token), DAOS 2.8 / UCX / 400GbE RoC
 ## 9. 권고 구성 (요약)
 
 ```
-DAOS      ucx+rc_v / 2-rank / S16 + DFS chunk 4 MiB + rd_fac:0
+DAOS      ofi+verbs;ofi_rxm / 2-rank / S16 + DFS chunk 4 MiB + rd_fac:0
+          (2026-09-05 변경: ucx+rc_v 는 store 직후 첫 콜드 load 가 ~15 s 멈추는 UCX 한정 스톨이 있고,
+           verbs 는 같은 대역폭에 스톨이 없다. §2 의 "rxm 이 손상시킨다" 는 공유 드라이브 오구성이 원인이었다 — doc/MP-MODE-PLAN.md §7.7d)
 LMCache   chunk_size 256 · enable_async_loading: True · max_local_cpu_size >= 100
           소스 빌드(c_ops 활성)
 vLLM      --enforce-eager --no-enable-prefix-caching, prompt_token_ids 로 전달
@@ -300,3 +302,13 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 
 함정 하나 추가: `scm_size` 를 바꿔도 **이미 마운트된 `/mnt/daos0` tmpfs 크기는 그대로**라 `pool create` 가 크기와
 무관하게 `DER_NOSPACE` 를 낸다. 서버 정지 후 `umount /mnt/daos0` 를 하고 재포맷해야 한다.
+
+## 11. LMCache MP 모드 (2026-09-04, 브랜치 `mp-mode`)
+
+별도 프로세스의 LMCache 캐시 서버(L1 pinned + DAOS L2 어댑터) + vLLM `DaosMPConnector`. 설계·결과는
+`doc/MP-MODE-PLAN.md`, 런처는 `launchers/run_vllm_mp_c5.sh`. 콜드 L1 기준 DAOS hit TTFT 는 8K 150 ms,
+16K 245~265 ms 로 in-process 와 같거나 빠르고(어댑터 읽기 33~37 GB/s = DAOS 상한), 반복 hit 는 L1 에서
+50~135 ms. 게이트 PASS. 두 vLLM 인스턴스가 한 MP 서버를 공유하면(`launchers/run_vllm_mp2_c5.sh`) 다른
+인스턴스가 저장한 8K/16K KV 를 첫 요청에서 125/140 ms 로 받는다. 미해결: store 직후 수 초 안의 첫 대용량 load 가 ~15 s 멈춤(RPC 가 클라이언트
+mercury/UCX 송신 경로에 머묾, 서버 무죄, 쓰기+15 s 에 풀림; §7.7b). `ofi+tcp` 로 바꾸면 0/8 로 사라져 **UCX 한정**(§7.7c). `ofi+verbs;ofi_rxm` 은 스톨 0/6 에 대역폭 동일(35~38 GB/s), 정합성 통과 → 클러스터를 verbs 로 전환(§7.7d). **근본 원인 확정(§7.7e)**: mercury NA-UCX 가 서버 xstream 에 처음 RPC 를 보낼 때 rdma_cm 으로 지연 연결하는데, store 중(클→서 방향 포화, PFC 없는 손실형 RoCE)에 첫 접촉이 일어나면 CM `RTU` 가 유실되고 서버 커널 CM 의 `REP` 재전송(~16 s)까지 그 rank:tag 의 RPC 가 모두 대기. 어댑터 기동 프로브를 SX 오브젝트로 바꿔 모든 타깃 연결을 기동 시 조용할 때 맺도록 수정(`probe_chunks`, 기본 64) → ucx 에서도 10/10 스톨 없음. L1 < working set 의 p95 꼬리는 대역폭 포화 큐잉이며
+(12 inflight p95 456 → 6 inflight 152 ms, 처리량 동일 30 GB/s) 레버는 서버당 동시 요청 수(§7.6).

@@ -54,6 +54,25 @@ _dfs = None   # libdfs handle
 # ---- gurt/types.h scatter-gather types -----------------------------------
 # Needed only for the async path: dfs_read() takes a d_sg_list_t whose storage
 # must outlive the operation, so the caller has to own it (see submit_read).
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+class _Stat(ctypes.Structure):
+    """glibc x86_64 ``struct stat`` (144 bytes). dfs_sys_stat fills st_mode,
+    st_size, st_nlink, timestamps; only st_size / st_mode are read here."""
+    _fields_ = [
+        ("st_dev", ctypes.c_ulong), ("st_ino", ctypes.c_ulong),
+        ("st_nlink", ctypes.c_ulong), ("st_mode", ctypes.c_uint),
+        ("st_uid", ctypes.c_uint), ("st_gid", ctypes.c_uint),
+        ("_pad0", ctypes.c_int), ("st_rdev", ctypes.c_ulong),
+        ("st_size", ctypes.c_long), ("st_blksize", ctypes.c_long),
+        ("st_blocks", ctypes.c_long), ("st_atim", _Timespec),
+        ("st_mtim", _Timespec), ("st_ctim", _Timespec),
+        ("_reserved", ctypes.c_long * 3),
+    ]
+
+
 class DIov(ctypes.Structure):
     """``d_iov_t`` — {void *iov_buf; size_t iov_buf_len; size_t iov_len;}"""
 
@@ -177,6 +196,18 @@ def _load() -> None:
     _dfs.dfs_sys_closedir.restype = ctypes.c_int
     _dfs.dfs_sys_closedir.argtypes = [ctypes.c_void_p]
 
+    # int dfs_sys_stat(dfs_sys_t *, const char *path, int flags, struct stat *buf);
+    _dfs.dfs_sys_stat.restype = ctypes.c_int
+    _dfs.dfs_sys_stat.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(_Stat),
+    ]
+    # int dfs_sys_mkdir_p(dfs_sys_t *, const char *dir_path, mode_t mode,
+    #                     daos_oclass_id_t cid);
+    _dfs.dfs_sys_mkdir_p.restype = ctypes.c_int
+    _dfs.dfs_sys_mkdir_p.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint,
+    ]
+
     # -- async path: the base dfs API, not the dfs_sys wrapper ---------------
     # int dfs_sys2base(dfs_sys_t *dfs_sys, dfs_t **dfs);
     _dfs.dfs_sys2base.restype = ctypes.c_int
@@ -274,11 +305,14 @@ class DfsSys:
             self._sys = ctypes.c_void_p()
 
     # -- object I/O ---------------------------------------------------------
-    def _open(self, path: str, flags: int, create: bool) -> ctypes.c_void_p:
+    def _open(self, path: str, flags: int, create: bool,
+              cid: int = 0) -> ctypes.c_void_p:
+        """``cid`` is the DAOS object class for a file created here (0 = the
+        container default); it is ignored when the file already exists."""
         mode = _S_IFREG | 0o644 if create else 0
         obj = ctypes.c_void_p()
         rc = _dfs.dfs_sys_open(self._sys, path.encode(), mode, flags,
-                               0, 0, None, ctypes.byref(obj))
+                               cid, 0, None, ctypes.byref(obj))
         if rc != 0:
             raise DaosError(f"dfs_sys_open({path})", rc)
         return obj
@@ -295,8 +329,8 @@ class DfsSys:
         finally:
             _dfs.dfs_sys_close(obj)
 
-    def open_rdwr_create(self, path: str) -> ctypes.c_void_p:
-        return self._open(path, DFS_RDWR | os.O_CREAT, create=True)
+    def open_rdwr_create(self, path: str, oclass: int = 0) -> ctypes.c_void_p:
+        return self._open(path, DFS_RDWR | os.O_CREAT, create=True, cid=oclass)
 
     def write_obj_from(self, obj: ctypes.c_void_p, offset: int, length: int,
                        src) -> int:
@@ -428,6 +462,27 @@ class DfsSys:
             raise
         _dfs.dfs_sys_close(obj)
         return True
+
+    def stat_size(self, path: str) -> Optional[int]:
+        """``st_size`` of ``path``, or ``None`` if it does not exist.
+
+        One metadata RPC instead of the open/close pair ``exists()`` costs, and
+        it gives the length, which is what the MP L2 adapter needs to decide
+        whether a stored object is complete before advertising it as a hit.
+        """
+        st = _Stat()
+        rc = _dfs.dfs_sys_stat(self._sys, path.encode(), 0, ctypes.byref(st))
+        if rc == 2:  # ENOENT
+            return None
+        if rc != 0:
+            raise DaosError(f"dfs_sys_stat({path})", rc)
+        return int(st.st_size)
+
+    def mkdir_p(self, path: str) -> None:
+        """Create ``path`` and any missing parents (EEXIST is not an error)."""
+        rc = _dfs.dfs_sys_mkdir_p(self._sys, path.encode(), 0o755, 0)
+        if rc not in (0, 17):  # EEXIST
+            raise DaosError(f"dfs_sys_mkdir_p({path})", rc)
 
     # -- enumeration --------------------------------------------------------
     def iterdir(self, path: str = "/"):

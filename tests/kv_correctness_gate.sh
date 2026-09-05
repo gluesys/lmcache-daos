@@ -33,6 +33,10 @@ URL=${1:-http://127.0.0.1:8001/v1/completions}
 N=${2:-6}
 MAXTOK=${3:-24}
 CONT=${CONT:-vllm-daos}
+# Log line that proves pass B was served from cache. In-process mode logs
+# "Retrieved N out of M"; MP mode's server logs "Retrieved N tokens in T seconds"
+# (prefixed by the launcher). Override with HIT_PATTERN for other setups.
+HIT_PATTERN=${HIT_PATTERN:-'Retrieved [0-9]+ (out of|tokens in)'}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -74,7 +78,7 @@ pass=0
 fail=0
 nocache=0
 for k in $(seq 0 $((N - 1))); do
-	mark_before=$(podman logs "$CONT" 2>&1 | grep -c 'Retrieved .* out of' || true)
+	mark_before=$(podman logs "$CONT" 2>&1 | grep -Ec "$HIT_PATTERN" || true)
 
 	curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
 		-d @"$TMP/g$k.json" -o "$TMP/a$k.json"
@@ -85,7 +89,7 @@ for k in $(seq 0 $((N - 1))); do
 
 	a=$(get_text "$TMP/a$k.json")
 	b=$(get_text "$TMP/b$k.json")
-	mark_after=$(podman logs "$CONT" 2>&1 | grep -c 'Retrieved .* out of' || true)
+	mark_after=$(podman logs "$CONT" 2>&1 | grep -Ec "$HIT_PATTERN" || true)
 
 	if [ "$mark_after" -le "$mark_before" ]; then
 		# Pass B never hit the cache, so this iteration proves nothing.
