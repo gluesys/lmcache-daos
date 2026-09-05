@@ -529,3 +529,64 @@ class DfsSys:
         if rc != 0:
             raise DaosError(f"dfs_sys_remove_type({path})", rc)
         return True
+
+
+# -- start-up warm-up shared by the in-process connector and the MP adapter --
+
+# daos_obj_class.h: OBJ_CLASS_DEF(OR_RP_1, MAX_NUM_GROUPS) -- one shard on
+# every target of the pool.
+OC_SX = (1 << 24) | 0xFFFF
+
+
+def warm_up_all_targets(dfs, probe_path: str, nchunks: int = 64, executor=None,
+                        chunk: int = 4 << 20) -> dict:
+    """Open a transport connection to EVERY target before serving requests.
+
+    mercury NA-UCX connects to a server xstream lazily, on the first RPC to
+    it, through rdma_cm. If that first contact happens while the
+    client->server direction is saturated (a store: the servers RDMA-read the
+    client) on a lossy RoCE fabric, the CM RTU can be dropped and the server's
+    endpoint stays half-open until the kernel CM retransmits REP (~16 s);
+    every RPC to that rank:tag waits meanwhile (doc/MP-MODE-PLAN.md 7.7e).
+
+    Phase 1 -- connect: an SX probe file (one shard per target) gets one tiny
+    write per DFS chunk, sequentially, so the first RPC to each target is
+    issued one at a time on a quiet fabric. Phase 2 -- bandwidth warm-up: a
+    full chunk write per shard in parallel, then read back. The probe is
+    removed. ``nchunks`` must be >= the pool's target count. Returns a dict
+    with ``connect_ms``, ``total_ms``, ``ok`` (chunks read back complete).
+    """
+    import time as _time
+    t0 = _time.monotonic()
+    tiny = 4096
+    small = (ctypes.c_char * tiny).from_buffer(bytearray(b"\x5a" * tiny))
+    h = dfs.open_rdwr_create(probe_path, oclass=OC_SX)
+    try:
+        for i in range(nchunks):
+            dfs.write_obj_from(h, i * chunk, tiny, small)
+        t1 = _time.monotonic()
+        src = (ctypes.c_char * chunk).from_buffer(bytearray(b"\xa5" * chunk))
+
+        def _write(i):
+            return dfs.write_obj_from(h, i * chunk, chunk, src)
+
+        _map = executor.map if executor is not None else map
+        list(_map(_write, range(nchunks)))
+    finally:
+        dfs.close_obj(h)
+
+    def _read(i):
+        dst = (ctypes.c_char * chunk).from_buffer(bytearray(chunk))
+        hh = dfs.open_rdonly(probe_path)
+        try:
+            return dfs.read_obj_into(hh, i * chunk, chunk, dst)
+        finally:
+            dfs.close_obj(hh)
+
+    got = list(_map(_read, range(nchunks)))
+    try:
+        dfs.remove(probe_path)
+    except Exception:  # pragma: no cover - best effort
+        pass
+    return {"connect_ms": (t1 - t0) * 1e3, "total_ms": (_time.monotonic() - t0) * 1e3,
+            "ok": sum(1 for g in got if g == chunk), "n": nchunks}

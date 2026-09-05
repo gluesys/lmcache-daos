@@ -36,7 +36,7 @@ from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import serde
-from .dfs_binding import DfsSys, DaosError
+from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -132,6 +132,35 @@ class DaosConnector(RemoteConnector):
         self._workers = 16
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._workers, thread_name_prefix="daos-io")
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Connect to every target now, not on the first user request.
+
+        Same exposure as the MP adapter (doc/MP-MODE-PLAN.md 7.7e): a lazy
+        first RPC to a target in the middle of a store can wait ~16 s for the
+        rdma_cm handshake on a lossy fabric. ``DAOS_PROBE_CHUNKS`` (default
+        64, must be >= target count; 0 disables) sets the SX probe size.
+        """
+        import sys as _s
+        import time as _t
+        try:
+            nchunks = int(os.environ.get("DAOS_PROBE_CHUNKS", "64"))
+        except ValueError:
+            nchunks = 64
+        if nchunks <= 0:
+            return
+        t0 = _t.monotonic()
+        try:
+            r = warm_up_all_targets(self._dfs, f"/.daos-probe.{os.getpid()}",
+                                    nchunks, self._pool)
+            _s.stderr.write(f"[DaosConnector] warm-up: SX probe, {r['n']} targets contacted "
+                            f"in {r['connect_ms']:.1f} ms, {r['ok']}/{r['n']} chunks ok, "
+                            f"total {r['total_ms']:.1f} ms\n")
+        except Exception as e:  # best effort
+            _s.stderr.write(f"[DaosConnector] warm-up failed ({e}) after "
+                            f"{(_t.monotonic() - t0) * 1e3:.1f} ms\n")
+        _s.stderr.flush()
 
     def _run(self, fn, *args):
         return self.loop.run_in_executor(self._pool, fn, *args)
