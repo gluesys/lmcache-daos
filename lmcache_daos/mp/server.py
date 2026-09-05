@@ -74,6 +74,12 @@ def main(argv=None) -> None:
             return ret
 
         _l1.L1Manager.reserve_write = _rw
+    #  DAOS_MP_STREAM=<n> -- PROTOTYPE: overlap L2 loading with the L1->GPU
+    #      transfer in sub-batches of n keys (see streaming_patch.py).
+    stream = os.environ.get("DAOS_MP_STREAM", "")
+    if stream and int(stream) > 0:   # "0" / unset = off
+        from .streaming_patch import apply as _apply_stream
+        _apply_stream(int(stream))
     args = mp_server.parse_args()
     mp_config = mp_server.parse_args_to_mp_server_config(args)
     storage_manager_config = mp_server.parse_args_to_config(args)

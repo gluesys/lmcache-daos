@@ -48,7 +48,7 @@ podman run -d --name vllm-daos --net host --security-opt label=disable --device 
   -v /var/run/daos_agent:/var/run/daos_agent -v /etc/daos:/etc/daos \
   -v /root/lmcache-daos-repo:/lmd -v /home/hf/hf_cache:/hf \
   -e HF_HOME=/hf -e PYTHONHASHSEED=0 -e PYTHONPATH=/lmd \
-  -e VLLM_USE_FLASHINFER_SAMPLER=0 -e D_LOG_MASK=${D_LOG_MASK:-WARN} -e D_LOG_FILE=${D_LOG_FILE:-/tmp/daos_client.log} -e DAOS_MP_GC=${DAOS_MP_GC:-} -e DAOS_MP_EVICT_TICK_S=${DAOS_MP_EVICT_TICK_S:-} -e DAOS_MP_TRACE=${DAOS_MP_TRACE:-} \
+  -e VLLM_USE_FLASHINFER_SAMPLER=0 -e D_LOG_MASK=${D_LOG_MASK:-WARN} -e D_LOG_FILE=${D_LOG_FILE:-/tmp/daos_client.log} -e DAOS_MP_GC=${DAOS_MP_GC:-} -e DAOS_MP_EVICT_TICK_S=${DAOS_MP_EVICT_TICK_S:-} -e DAOS_MP_TRACE=${DAOS_MP_TRACE:-} -e DAOS_MP_STREAM=${DAOS_MP_STREAM:-} \
   -e LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:/usr/local/cuda-12.9/targets/x86_64-linux/lib:${UCXLIB:-/opt/ucx/lib}:/daoslib:/daoslib/mercury:/daoslib/libibverbs \
   localhost/kvsup-ucx-lmc:local \
   bash -c "$INNER" >/dev/null 2>&1

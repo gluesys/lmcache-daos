@@ -376,7 +376,13 @@ class DaosL2Adapter(L2AdapterInterface):
         path = f"{self._root}/.daos-l2-probe"
         t0 = time.monotonic()
         try:
-            n = 4 << 20  # one DFS chunk: exercises the bulk path, not just RPC
+            # 16 DFS chunks of 4 MiB: with S16 striping every target of both
+            # ranks serves one chunk, so the first RPC/bulk to each target --
+            # where the intermittent 14-17 s stall was observed to hit ALL
+            # concurrent reads of the first user request -- happens here.
+            chunk = 4 << 20
+            nchunks = 16
+            n = chunk * nchunks
             src = (ctypes.c_char * n).from_buffer(bytearray(b"\x5a" * n))
             h = self._dfs.open_rdwr_create(path)
             try:
@@ -384,21 +390,18 @@ class DaosL2Adapter(L2AdapterInterface):
             finally:
                 self._dfs.close_obj(h)
 
-            def _read(_):
-                dst = (ctypes.c_char * n).from_buffer(bytearray(n))
+            def _read(i):
+                dst = (ctypes.c_char * chunk).from_buffer(bytearray(chunk))
                 hh = self._dfs.open_rdonly(path)
                 try:
-                    return self._dfs.read_obj_into(hh, 0, n, dst)
+                    return self._dfs.read_obj_into(hh, i * chunk, chunk, dst)
                 finally:
                     self._dfs.close_obj(hh)
 
-            # one read per I/O thread, concurrently: the first bulk transfer
-            # on a fresh process runs at ~half speed (endpoint set-up); do it
-            # here rather than on the first user request
-            got = list(self._pool.map(_read, range(self._config.workers)))
-            logger.info("DaosL2Adapter warm-up: probe %s, %d parallel reads of %d bytes "
-                        "(%s ok) in %.1f ms", path, len(got), n,
-                        sum(1 for g in got if g == n), (time.monotonic() - t0) * 1e3)
+            got = list(self._pool.map(_read, range(nchunks)))
+            logger.info("DaosL2Adapter warm-up: probe %s, %d chunk reads of %d bytes "
+                        "(%s ok) in %.1f ms", path, len(got), chunk,
+                        sum(1 for g in got if g == chunk), (time.monotonic() - t0) * 1e3)
         except Exception as e:  # pragma: no cover - best effort
             logger.warning("DaosL2Adapter warm-up failed (%s) after %.1f ms",
                            e, (time.monotonic() - t0) * 1e3)
