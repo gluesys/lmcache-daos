@@ -1,0 +1,17 @@
+diff --git a/src/include/daos/tse.h b/src/include/daos/tse.h
+index 931be3349..1da35fb6e 100644
+--- a/src/include/daos/tse.h
++++ b/src/include/daos/tse.h
+@@ -21,7 +21,11 @@
+ #include <stdbool.h>
+ 
+ /** tse_task arguments max length (pthread_mutex_t is of different size between x86 and aarch64). */
+-#define TSE_TASK_ARG_LEN	(840 + sizeof(pthread_mutex_t))
++/* Enlarged from 840: the GPU-direct API adds daos_mem_attr_t pointers to
++ * obj_auxi_args and daos_task_args, which overflowed the original budget.
++ * obj_internal.h documents this as the sanctioned fix ("enlarge tse_task").
++ */
++#define TSE_TASK_ARG_LEN	(968 + sizeof(pthread_mutex_t))
+ /** internal tse private data size (struct tse_task_private) */
+ #define TSE_PRIV_SIZE		(TSE_TASK_ARG_LEN + 136)
+ /** tse_task is used to track single asynchronous operation (8 bytes used for public members). */

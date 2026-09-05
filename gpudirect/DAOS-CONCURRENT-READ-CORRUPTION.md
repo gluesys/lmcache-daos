@@ -1,0 +1,4240 @@
+# DAOS 읽기 데이터 손상 — 최종 검토 결과, 상류 제출용 분석, 세션 인계
+
+> ## ⚠️ 2026-09-03 최종 정정 — **DAOS·SPDK·드라이브 결함이 아니다. 두 랭크가 같은 물리 NVMe 를 쓰고 있었다.**
+> cell1 과 cell2 는 같은 Artemis U.2 섀시의 두 노드이고, 24 개 PASCARI 는 **듀얼포트로 양 노드에 동시에
+> 노출**된다. 양 노드의 `0000:02:00.0` 은 **같은 드라이브**(PCI DSN `6479A701A8C0D000`, DAOS 디바이스 UUID
+> `fd30a787…` 동일)다. 두 엔진이 각자의 blobstore/VEA 로 같은 네임스페이스에 쓰면서 서로를 덮어썼다.
+> cell2 를 다른 드라이브(`03:00.0`)로 옮기자 **0/640, 감사 0/64**. 상세·증거·이전 결론의 재해석은 **§62**.
+> §0~§61 은 이 사실을 모른 채 쓴 기록이며, "DAOS 결함", "PASCARI 의존", "두 머신 필요", "미기록 미디어"
+> 등의 판정은 **모두 이 하나로 설명되고 철회된다.** 상류 티켓·Phison 문의는 **내지 않는다.**
+
+최종 검토 2026-09-01. 근거 커밋 `ee8439b` (브랜치 `streaming-get-and-client6-assets`).
+재현기 `tests/dfs_integrity.c`, 보조 `tests/dfs_integrity_ab.sh`·`tests/agg_ab.sh`.
+상세 서술 `README.md`, 배포 정보 `../deploy/MANIFEST.md`.
+
+| | |
+|---|---|
+| **판정** | **DAOS 자체 결함.** 우리 패치·커넥터·LMCache·GPU-direct prereq 전부 측정으로 배제됨 |
+| **영향 버전** | **완전 upstream 2.9.100 스택(코어+prereq+클라 전부 스톡)에서 재현 확정(§18).** ExaStor 2.8-wsd·2.9-gds 빌드도 동일 |
+| **증상** | 읽기 버퍼의 **정확히 DFS chunk 하나**가 **다른 객체의 같은 오프셋 데이터**로 조용히 바뀜 |
+| **비율** | 28 MiB · 16 스레드 mixed 부하에서 읽기당 **0.3 ~ 1.5 %** (버스트로 몰려서 옴) |
+| **탐지 가능성** | 반환값·크기 정상 → 호출자는 알 수 없음. 컨테이너 checksum 을 켜면 **EIO 로** 표면화 |
+| **상류 보고** | **같은 서명의 보고 없음.** 가장 가까운 DAOS-18862 는 "Cannot Reproduce" 로 종결 |
+| **결론** | **이 백엔드는 사용 불가 유지.** 조용히 틀린 KV 를 서빙한다 |
+
+## 0. 최종 검토 결과
+
+### 0.1 측정으로 확정한 것
+
+| # | 확정 사실 | 근거 |
+|---|---|---|
+| 1 | **DAOS 결함이다.** 코어·mercury·UCX 를 `--build-deps=yes` 로 전부 스톡 빌드한 클라이언트가 패치 클라와 **동률로 실패**: 34/3840(0.885 %, CI 0.634–1.235) vs 25/3840(0.651 %, CI 0.441–0.959), 런 단위 교대 A/B | §12.1 |
+| 2 | **완전 upstream 스택에서 재현.** 스톡 2.9.100 서버(코어+mercury/UCX/SPDK prereq 전부 upstream, WS-D 0)+스톡 클라, ofi+tcp: DFS 86/5120, raw obj 59/1920, 서명 동일 | **§18** |
+| 2b | rc3 기반 ExaStor 2.8-wsd 서버도 동일(§13 — 단 upstream 이 아니라 wsd 브랜치였음, §13 정정 참조) | §13 |
+| 3 | **서명**: 정확히 DFS chunk 하나가 **같은 오프셋의 다른 객체 데이터**(가끔 같은 객체의 다른 오프셋, 드물게 이전 세대, 드물게 zeros). 구간 크기는 **컨테이너 chunk 크기를 따라감**(1 MiB 컨테이너 → 1 MiB) | §12.2 |
+| 4 | **저장된 바이트는 정상**이다. 같은 런에서 조용히 되읽으면 깨끗 ⇒ **읽기가 저장되지 않은 바이트를 돌려준다** | §12.2 |
+| 5 | **서버가 스스로 손상을 검출하고 있다.** 양 rank 가 `vos_csum_recalc.c:csum_agg_verify()` 에서 `DER_CSUM(-2021)`, 실패 창이 정확히 4 MiB. NVMe 는 Media/Read/Write Errors **0** 인데 DAOS Checksum Errors 2~6 ⇒ 하드웨어 아님 | §12.5 |
+| 6 | **checksum 은 해결책이 아니라 검출기**다. `cksum:crc32` 컨테이너에선 조용한 손상 대신 **EIO** 가 난다 | §12.6 |
+| 7 | **부수 증상 2건**: 지속 부하에서 쓰기가 `DER_MISC(-1025)`→EIO(서버측 **bulk 핸들 역직렬화 실패**가 원인), 컨테이너 close 마다 **DTX CoS flush 실패** | §12.7·§12.8c |
+
+### 0.2 측정으로 기각한 것 (가설 묘지)
+
+| 기각된 가설 | 어떻게 기각됐나 |
+|---|---|
+| 우리 패치·커넥터·LMCache·GPU-direct prereq | 완전 스톡 클라가 동률 실패 (§12.1) |
+| **VOS aggregation** | arm 당 5120 읽기 + 순서 교대. 1차 1.50 % vs 0.53 % 로 확정처럼 보였으나 순서를 뒤집으면 1.44 % vs 1.33 %. 끄고도 78/8960 = 0.87 % (§12.8) |
+| oclass·복제·컨테이너 신선도 | RP_2G1/G4/G8·SX(rd_fac 0)·S1 전부 재현, 갓 만든 컨테이너도 6/1920 (§12.4) |
+| payload chunk 정렬 | 교대 A/B 5120×2 에서 0.37 %(정렬) vs 0.68 %(straddling) — 완화책 아님 (§13.5) |
+| 2.9 신규 도입 / GPU-direct 백포트 | 2.8-wsd 에서 동률 재현 (§13.3) |
+| **ExaStor 패치 전체 (서버 포함: WS-D·zfs-cap·GDS cart)** | **완전 upstream 서버+클라에서 동일 재현 (§18)** — §17.1 서로소 논증의 잔여 구멍까지 봉합 |
+| 하드웨어 미디어 오류 | 전 장치 Media/Read/Write Errors 0 (§12.5) |
+| DAOS-15847·DAOS-18901 (상류 fetch/aggregation 수정) | 2.9.100 엔 있고 2.8-rc3 엔 없는데 비율이 같은 자릿수 (§14.6) |
+
+### 0.3 남은 미해결 (다음 세션의 일)
+
+1. **근본 원인 미규명.** 남은 유력 방향은 **서버측 fetch/bulk 경로** — §12.8c 의 `hg_bulk_deserialize` 실패와 같은 뿌리일 가능성.
+2. **DAOS-19569**(2026-08-31, affects 2.8·3.0, Awaiting backport): "multiple IODs" IOM 처리 오류, 본문에 *"possibly cause data corruption"*. 28 MiB 읽기는 정확히 multi-IOD 케이스다. component 가 EC 로 적혀 있어 RP 경로 해당 여부 확인 필요 (§14.4).
+3. **`UCX_ENABLE_RCACHE=n`** 미시험. DAOS-18862 보고자가 양쪽에서 끈 상태였다 = UCX 등록 캐시를 의심했다는 뜻 (§14.3).
+4. **§12.8b**(단일 스레드 덮어쓰기 세대만으로 재현)를 **건강한 풀에서** 결론내기. 열화된 풀에서 관측된 것이고, 2.8 에서도 포맷 직후엔 심했다가 치유됐다(§13.4).
+5. ~~완전 상류 vanilla 서버 미검증~~ → **§18 에서 해소. 이제 상류 제출을 막는 것이 없다.**
+
+### 0.4 이 조사에서 얻은 측정 규칙 (이걸 어기면 또 틀린다)
+
+- **실패는 버스트로 온다.** 같은 arm 안에서도 블록별 0.16 %~3.75 % 로 20배 흔들린다. ⇒ **풀 읽기수 기준 이항(Wilson) 신뢰구간은 arm 비교에 쓸 수 없다**(과산포).
+- **arm 비교는 런 단위 교대**로 한다. 블록으로 묶어야 하면 **순서를 뒤집은 대조**를 함께 돌린다.
+- **검증 페이로드는 위치·객체를 식별하는 태그**여야 한다. 상수 채움·난수 한 덩어리는 "같은 객체의 다른 오프셋" 유형을 원리적으로 못 본다(과거 "2.8+UCX 무결 30/30" 오판의 절반이 이것 — §13.6).
+- **30~200 읽기로 판정하지 않는다.** 1 % 결함은 30회를 74 %, 80회를 45 % 확률로 통과한다.
+- 이 규칙을 어겨서 이 세션에서도 두 번 틀렸다: "S1 은 면역"(0/2560 → 2/1920), "aggregation 이 원인"(순서 뒤집으니 소멸).
+
+### 0.5 문서 읽는 순서
+
+| 목적 | 볼 곳 |
+|---|---|
+| 결론만 | §0 (여기) |
+| 재현 | §2 |
+| 상류 제출 초안 | §0.1 + §2 + §12.2 + §12.5 + §13 + §14 |
+| 다음 작업 | §0.3 + §10 |
+| 환경 인계 | §13.7(현재 = 2.8) + §7(2.9 시절 기록) + §8 운영 함정 |
+| 역사·철회 기록 | §11 + §12.11 + §13.4 |
+
+⚠️ **§4·§5·§7 은 2026-08-31 이전 기록이다.** §4 의 스톡 대조는 §12.1 이 대체하고, §5 의 서명은
+모호한 패턴으로 얻은 것이라 §12.2 가 대체한다. §7 의 환경은 서버가 2.8 로 바뀌기 전 상태다.
+
+---
+
+## 1. 한 문장
+
+**DAOS 2.8.0-rc3 · 2.9.100 에서, 크게 덮어쓰이는 객체를 읽으면 읽기 버퍼의 정확히 DFS chunk
+하나가 다른 객체의 같은 오프셋 데이터로 조용히 바뀐다.** 28 MiB 객체 · 16 스레드 쓰기+읽기
+혼합에서 읽기당 0.3~1.5 %. 반환값과 크기는 정상이므로 호출자가 알 수 없다.
+
+(초판은 이것을 "동시 읽기" 문제로 적었으나 부정확하다 — 읽기만 동시에 해서는 나오지 않고
+쓰기가 섞여야 한다(§12.3). 다만 덮어쓰기 세대를 쌓으면 단일 스레드로도 관측된 적이 있다(§12.8b).)
+
+## 2. 재현
+
+**필요한 것: DAOS 클라이언트뿐.** LMCache·GPU·torch·모델·Python 전부 불필요.
+
+```bash
+gcc -O2 -pthread -o dfs_integrity tests/dfs_integrity.c \
+    -I$DAOS/include -L$DAOS/lib64 -ldfs -ldaos -ldaos_common -lgurt -lm \
+    -Wl,-rpath,$DAOS/lib64
+
+# 컨테이너: POSIX, RP_2G4, chunk 4 MiB, rd_fac:1
+daos cont create <pool> <cont> --type=POSIX \
+    --file-oclass=RP_2G4 --dir-oclass=RP_2G4 --oclass=RP_2G4 \
+    --chunk-size=4194304 --properties=rd_fac:1
+
+# 기본 arm: 16 스레드 × 40 라운드 = 640 읽기, 보통 2~15 건 손상
+NA_UCX_EXTRA_TLS= ./dfs_integrity -p <pool> -c <cont> -s 28 -t 16 -r 40
+```
+
+출력은 손상마다 그 조각의 **출처를 이름으로** 말한다:
+
+```
+CORRUPT t8  r9  first bad word at 25165784: object t7's data (round 9, offset 25165784)
+                | words ok=3145727 zero=0 foreign-obj=524288 stale-round=0 shifted=1 junk=0
+                | retry=clean
+PASS/FAIL: 64/640 concurrent reads corrupt (10.00%, 95% CI 7.91-12.57%) ...
+```
+
+arm 분리 플래그(한 번에 하나만 바꿀 때):
+
+| 플래그 | 의미 | 기대 |
+|---|---|---|
+| (기본) | 쓰기+읽기 혼합 | 0.3~1.5 % 손상 |
+| `-W -Q -V 3` | 조용한 단일 스레드 쓰기 + 조용한 검증 3회 | 깨끗 (건강한 풀에서) |
+| `-W -M` | 조용히 쓴 뒤 **읽기만** 동시 | 깨끗 (0/4320) |
+| `-N -V 3` | **쓰기만** 동시 + 조용한 검증 | 깨끗 |
+| `-t 1` | 단일 스레드, 단일 객체 | 깨끗 (0/150) |
+| `-o 0` / `-o 36` | payload 정렬 / straddling | 0.37 % / 0.68 % (§13.5) |
+| `-Q` | 기존 객체만 감사(쓰기 없음) | 남아 있는 객체의 상태 확인용 |
+
+**한 번의 PASS 는 결함 부재가 아니다** — §0.4 의 측정 규칙을 먼저 읽을 것. arm 을 비교하려면
+`tests/dfs_integrity_ab.sh`(런 단위 교대 + Wilson 구간)를 쓴다.
+
+원본 Python 판(`tests/test_rawio_integrity.py 28 16 13 hdr burst`)은 기록으로 남긴다. 패턴이
+모호해 "다른 객체" 와 "같은 객체의 다른 오프셋" 을 구분하지 못하므로 신규 측정에는 쓰지 말 것.
+
+## 3. 배제된 것 (다시 검증하지 말 것)
+
+| 후보 | 배제 근거 |
+|---|---|
+| 우리 커넥터의 zero-copy read (MemoryObj alias) | 목적지를 전용 `bytearray` 로 바꾸면 **더 나빠짐** (1.9% → 6.2%) |
+| LMCache 전체 | LMCache 를 임포트하지 않는 순수 DFS 테스트에서 재현 |
+| LMCache MemoryObj 수명/참조 계수 | 위와 동일. 참조 반납 수정도 효과 없음 (85%→70%, 겹침) |
+| 우리 저장소의 특정 커밋 | 같은 호스트에서 main·브랜치·alias 세 코드가 30~40% 로 구분 안 됨 |
+| `daos-0002` (TSE_TASK_ARG_LEN 840→968) | `D_CASSERT` 로 컴파일 타임 검증되고, 변경은 여유를 늘리는 방향 |
+| **`daos-0004` (rkey 스텁) 및 draft 패치 전체** | **스톡 2.9.100 코어(`841487de8`)에서도 재현** — §4 |
+| `dfs_sys` 핸들 캐시 | `DFS_SYS_NO_CACHE` 에서도 재현 (4.3% → 1.9%, 겹침) |
+| DFS chunk 정렬 / 헤더 36 B straddling | 페이로드 오프셋 0·4 MiB 정렬에서도 재현. 2026-09-01 교대 A/B 로 재확인: 0.37 %(정렬) vs 0.68 %(straddling) — 완화책 아님 — §13.5 |
+| 목적지 버퍼 타입 | `bytearray` 와 torch 백업 메모리 양쪽 재현 |
+| 4 MiB chunk 크기 자체 | 32 MiB chunk 컨테이너에서도 재현(더 심한 형태) |
+| **완전 스톡 prereq (mercury/UCX 포함)** | **2026-09-01 에 측정으로 배제됨 — §12.1.** 남은 마지막 변수였고, 이제 없다. |
+| oclass·복제 | RP_2G1/G4/G8·SX(rd_fac 0)·S1 전부에서 재현 — §12.4 |
+| 클라이언트 읽기 동시성 자체 | 조용히 쓴 객체를 16 스레드로 읽기만 하면 **0/4320** — §12.3 |
+| **VOS aggregation** | `reclaim:disabled` 로 꺼도 78/8960 = 0.87 %. 순서 교대로 효과 소멸 — §12.8 |
+| 2.9 에서 새로 생긴 결함 / GPU-direct 백포트 | **2.8.0-rc3 에서 동률 재현** — §13.3 |
+| 하드웨어 미디어 오류 | 전 NVMe 가 Media/Read/Write Errors **0**, DAOS 내부 csum 카운터만 증가 — §12.5 |
+| 컨테이너 신선도 | 갓 만든 컨테이너도 6/1920 — §12.4 |
+
+## 4. 스톡 대조 실험 (초판 — **§12.1 이 대체**)
+
+⚠️ 이 실험은 두 arm 이 **패치된 mercury/UCX 를 공유**했다. 그 변수를 닫은 것이 §12.1 이며,
+현재의 핵심 증거는 §12.1 이다. 아래는 기록으로 남긴다.
+
+같은 저장소에서 GPU-direct API 도입 커밋 `133e6f8ca` 의 **부모 `841487de8`**
+(`v2.9.100-tb` 태그가 조상)를 별도 prefix 로 빌드하고, prereq 는 패치본을 그대로 복사해
+재사용했다. 두 arm 의 차이는 **DAOS 코어 라이브러리 하나뿐.**
+
+| | A: 패치 | B: 스톡 |
+|---|---|---|
+| `libdaos.so.2.8.0` 크기 | 8950616 | **8922384** |
+| `libcart.so.4` → `HG_Bulk_import_rkey` | 1 | **0** |
+| 버전 | 2.9.100 | 2.9.100 |
+| 실패 / 208 | 2 (1.0%) | **4 (1.9%)** |
+
+각 arm 이 실제 로드한 `libdaos` 크기를 출력해 번들 교체를 확인했다.
+
+## 5. 손상 서명 (2026-08-31 이전 관측 원자료 — §12.2 가 대체)
+
+⚠️ 이 절은 모호한 바이트 패턴으로 얻은 초기 기록이다. **현재 서명은 §12.2**(태그 페이로드).
+아래의 "오프셋·크기 모두 가변" 판정도 일부는 패턴 모호성 때문이었다.
+
+`payload_off=36` 이므로 **파일 오프셋 = 표시된 페이로드 위치 + 36**.
+
+| 페이로드 위치 | 파일 오프셋 | 4 MiB 배수? |
+|---|---|---|
+| 4194268 | 4 MiB | 예 |
+| 8388572 | 8 MiB | 예 |
+| 12582876 | 12 MiB | 예 |
+| 16777180 | 16 MiB | 예 |
+| 20971484 | 20 MiB | 예 |
+| 25165788 | 24 MiB | 예 |
+| 3145728 | ~3 MiB | **아니오** |
+| 6291420 | 6 MiB | **아니오** |
+| 7339996 | 7 MiB | **아니오** |
+| 11534300 | 11 MiB | **아니오** |
+| 2572288 | ~2.45 MiB | **아니오** |
+| 0 | 0 | — |
+
+손상 크기(4 KiB 페이지 단위 표본): **116, 256, 396, 512, 628, 1024, 2048, 7168**
+→ 약 0.45 MiB ~ 28 MiB(객체 전체).
+
+버퍼 내용:
+- **대개** 버퍼 앞부분은 올바른 스레드/키의 패턴 → 객체 중간이 깨진다
+- **때때로** 다른 스레드/키의 패턴 → 동시 실행 중인 다른 읽기의 데이터 혼입
+- **드물게** 객체 **전체**가 다른 스레드의 데이터 (7168/7168)
+- **때때로** 어느 패턴도 아님 (`unknown`) → 미기록 영역의 잔여 내용으로 보임
+
+⚠️ 초기 판에서 "정확히 4 MiB chunk 하나가 chunk 경계에서 유실" 이라고 특성화했으나
+**표본을 늘리자 오프셋과 크기 모두 가변**이었다. 철회했다. 상류 제출 시 "chunk 경계" 로
+단정하지 말 것.
+
+## 6. 검정력 — 이것이 왜 지금까지 안 보였나
+
+읽기당 ~1% 결함은 소규모 시험을 그냥 통과한다:
+
+- 순차 30회 전부 통과 확률 `0.99³⁰ ≈ 74%`
+- 80회 전부 통과 확률 `0.99⁸⁰ ≈ 45%`
+
+그래서 Hub 문서 `DAOS KV-cache over RoCE v4`(id `0bf8fe7d-…`)의 **"무결성 30/30"** 과
+이 저장소의 초기 **"PASS 80/80"** 둘 다 **결함의 부재를 보인 것이 아니다.** 그 문서에
+정정 댓글을 달았다(§9).
+
+또한 순차 대 동시 비교(각 200/208 검사)에서 순차 0%, 동시 2.9% 였다 — 동시성이 방아쇠다.
+다만 이후 실행에서 순차(`loop` 모드)도 실패했으므로 **순차가 안전하다는 뜻은 아니다.**
+
+**교훈: 208 검사로도 arm 간 구분이 안 되는 경우가 있었다. 비율을 비교하려면 수백 단위
+표본과 신뢰구간이 필요하다.** `tests/kv_failure_rate.sh` 가 Wilson 구간을 출력한다.
+
+**2026-09-01 보강 — 표본 수만으로는 부족하다.** 실패는 버스트로 오고(블록별 0.16~3.75 %),
+그래서 **풀 읽기수 기준 이항 신뢰구간 자체가 무효**다(과산포). arm 당 5120 읽기를 모아도
+순서만 뒤집으면 결론이 뒤집혔다(§12.8). 규칙은 §0.4 로 정리했다.
+
+## 7. 환경 (2.9 시절 기록 — **현재 상태는 §13.7**)
+
+⚠️ 2026-09-01 에 서버를 2.8.0-rc3 으로 되돌렸다(§13.2). 아래는 그 전 상태이며, 접속 경로와
+운영 함정은 그대로 유효하다.
+
+접속: `ssh tta1` → cell1 (116.89.174.82:20022). client-* 는 cell1 을 릴레이로 접속.
+**client 노드끼리 직결 SSH 없음.**
+
+| 호스트 | 역할 | 비고 |
+|---|---|---|
+| cell1 / cell2 | DAOS 서버 rank 0/1 | `/opt/daos-gds` 실행중, provider `ucx+rc_v` |
+| client-5 | **작업 장비** | 전체 스택 준비됨, 다른 사용자 없음 |
+| client-6 | vLLM 스택 | **다른 사용자가 CXL 작업 중** — 재시작 시 조율 필요 |
+
+client-5 준비 상태:
+- `/root/lmcache-daos-br` (브랜치 코드), `/root/lmcache-daos` (main 기반 코드)
+- `/root/daoslibs29` (패치 DAOS 클라이언트 번들), `/root/daoslibs-stock` (**스톡** 번들)
+- `/opt/daos-stock` (스톡 2.9.100 설치본), `/opt/daos-gds-gpu` (패치)
+- `localhost/kvsup:052` 이미지, `/home/hf/hf_cache` 모델
+- ⚠️ podman 스토리지가 `/home/containers` **bind mount** — **재부팅 시 해제됨**
+  (루트 69 GB 로는 22 GB 이미지 로드 피크 44 GB 를 못 버팀)
+- CDI 생성됨 (`nvidia.com/gpu=all`)
+
+cell1 빌드 트리:
+- `/var/daosbuild/daos-gds` — draft `theodore/b_cufile` `c87080a70`, **패치가 워킹트리 변경**
+- `/var/daosbuild/daos-stock` — 사본, `841487de8` (스톡)
+- ⚠️ **두 트리가 빌드 디렉터리를 공유**(`/var/daosbuild/build-gpu`). 패치 버전을 재빌드하려면
+  패치를 다시 적용해야 한다.
+
+CI 클러스터 192.168.35.40/41/42 (`root`, 자격증명은 사용자가 세션에서 제공):
+**대조군으로 쓰지 말 것.** provider 가 `ofi+verbs;ofi_rxm` — v4 문서가 "대용량 RDMA read
+를 조용히 손상시킨다" 고 특정해 UCX 로 전환한 그 provider다. 여기서 재현되면 RxM 버그를
+본 것이고 "스톡에서도 재현 → 우리 패치 무죄" 라는 거짓 결론이 된다. 추가로 VM(QEMU
+NVMe·zvol), `targets: 1`, rank 0·3 Excluded, `daos_server` 전부 inactive, 클라이언트/서버
+빌드 불일치(151.g4d2012d79 vs 340.g31214ce07).
+
+## 8. 운영 함정 (전부 실제로 겪음)
+
+1. **`daos_server` 재시작마다 SPDK wedge.** `device_unplugged` +
+   `load blobstore failed -1025` 가 재현되고, bdev 전체 wipe → `setup.sh reset` → 재기동 →
+   format 을 거쳐야 복구된다. format 은 **풀을 파기**한다. → **서버 설정 변경을 요구하는
+   실험을 설계하지 말 것.**
+2. **`NA_UCX_EXTRA_TLS=` 를 비워 둘 것.** 패치된 mercury 는 `cuda_copy,cuda_ipc` 를 TLS 에
+   넣을 수 있고, CUDA 가 로드 가능하면 **호스트 메모리 전송이 깨진다**(별개 결함, 이미 수정:
+   패치 기본값을 opt-in 으로 반전). 라이브러리 순서로 우회하지 말 것.
+3. **클라이언트 번들은 서버 빌드와 맞춰야 한다.** DAOS 는 버전과 무관하게
+   `libdaos.so.2.8.0` 이라는 파일명을 쓰므로 불일치가 보이지 않는다.
+   `deploy/check_manifest.sh` 로 검증(크기+심볼, 비영점 종료).
+4. **`daos` CLI 는 client-5 의 PATH 에 없다.** 컨테이너 생성/파기는 **cell1 에서** 할 것.
+5. **컨테이너 destroy 실패를 확인할 것.** vLLM 이 열고 있으면 실패하고, 다음 create 가
+   `DER_EXIST` 로 막힌다. 클라이언트를 먼저 정지.
+6. **출력을 `/dev/null` 로 버리지 말 것.** 이 세션에서 네 번, 그 때문에 실패 원인을 놓쳤다
+   (이미지 로드, 컨테이너 초기화, client-5 컨테이너 생성, destroy).
+7. **`podman save | podman load` 는 이미지 크기의 약 2배 피크 공간**을 쓴다(스테이징 tar +
+   레이어).
+8. **파이프라인 중간 `ssh` 가 heredoc stdin 을 삼킨다.** 수신측에 `-n` 을 붙이면 파이프가
+   끊긴다. 그리고 tar 스트림 앞에 정보 출력을 섞으면 아카이브가 깨진다.
+
+## 9. 문서 정정 상태
+
+- Hub `0bf8fe7d-…` (`DAOS KV-cache over RoCE v4`) — 댓글 2건: 손상 발견, 그리고
+  "무결성 30/30" 의 검정력 부족
+- Hub `cfa646ed-…` (개정 16), `5c944988-…` (GPUDirect 검증) — 각 댓글 1건
+- Hub `719497ff-…` — 정정 공지 문서(마크다운, 수정 가능). **현재 "원인 미해결" 로 되어
+  있으므로 갱신 필요. 갱신 내용: DAOS 결함 확정(스톡 동률), 2.8.0-rc3 도 동일, checksum 은
+  검출기일 뿐, 상류 선행 보고 없음(DAOS-18862 가 최근접·재현불가 종결).** — 미완료
+
+## 10. 작업 순서 (최종 검토 기준, 우선순위대로)
+
+1. **DAOS-19569 확인** — `git fetch origin` 후 패치 diff 를 보고 RP 경로 해당 여부 판단.
+   해당되면 재현기로 전후 비교(그 티켓이 원인이면 조사가 끝난다). §14.4
+2. **`UCX_ENABLE_RCACHE=n`** 을 서버·클라 양쪽에 걸고 런 단위 교대 A/B. DAOS-18862 의 힌트다.
+   §14.3
+3. **§12.8b 결론내기** — 건강한 풀(테스트 컨테이너 정리 후)에서 갓 만든 컨테이너에 단일 스레드
+   덮어쓰기 세대를 1→30 까지 올리며 세대별 실패율 기록. 성립하면 상류 재현기가 단일 스레드로
+   단순해진다.
+4. **손상 시점 서버 로그** — 런타임 `dmg server set-logmasks` 로 `DD_SUBSYS=vos,bio,object`
+   (재시작 불필요), 클라이언트는 `D_LOG_MASK=ERR`. §12.8c 의 bulk 역직렬화 실패와 대조.
+5. **상류 제출** — JIRA `daosio.atlassian.net` 에 신규 티켓(§14.1 의 API 로 검색·확인 가능).
+   포함: §0.1 확정 목록, §2 재현 절차와 C 파일, §12.2 서명 원문, §12.5 서버 로그 + 장치 카운터,
+   §13.3 버전 비교표, §12.6 checksum 거동, §12.7 부수 증상. **DAOS-18862 를 참조**하고
+   "그 티켓의 재현기를 제공한다"는 프레임으로 낼 것.
+6. **Hub 정정 공지 갱신**(§9).
+7. **chunk 크기 재확인**(512 KiB·16 MiB)으로 "손상 구간 = chunk 크기" 를 한 번 더 못박기.
+
+**그때까지 이 백엔드는 사용 불가로 유지한다.** 조용히 틀린 KV 를 서빙하기 때문이다.
+
+## 11. 철회한 주장 (반복 방지) — 2026-08-31 이전
+
+이후 세션의 철회 목록은 §12.11 에, 2.8 관련은 §13.4~§13.6 에 있다.
+같은 실수가 반복됐다 — **간헐적 실패를 소수 시행 또는 검증되지 않은 계측으로 판단**.
+
+| 철회한 주장 | 실제 |
+|---|---|
+| DRAM 상한 136.6 GB/s | 401.7 (단순 루프로 측정한 하한) |
+| "GPU 4장이면 DRAM 포화 → GDS 필연" | per-GPU 와 집계 대역폭 혼동 |
+| 256 KiB 에서 GDS 이득 | 서로 다른 두 임계 사이의 틈, 64·128 KiB 에선 GDS 가 더 느림 |
+| `put_time` 0.13 ms → "스토리지가 700배 빠름" | 비동기 제출이라 실제 쓰기 미포함 |
+| 4 MiB 정렬이 손상 원인 | 정렬해도 재현 |
+| 클라이언트/서버 버전 불일치가 원인 | 별개 문제였고 주원인 아님 |
+| UCX CUDA 플러그인 누락이 원인 | 무관 |
+| store alias 가 원인 (주장→철회→재주장→철회) | 유효 계측에서 효과 없음 |
+| "잔여는 read 측" | store 완료 미확인 상태의 분류였음 |
+| 실패율 10% / 85% / 100% / 65% / 75% | 계측 결함(프롬프트 중복→기준 패스가 캐시 히트, 컨테이너 미초기화, 침습적 관측) |
+| "loop 모드가 감도 낮아 80/80 통과" | loop 도 실패 |
+| "정확히 4 MiB chunk 하나가 chunk 경계에서" | 오프셋·크기 모두 가변 |
+
+**다음 세션 규칙:** 인과를 주장하기 전에 (a) 계측 전제를 코드로 강제하고, (b) 신뢰구간을
+붙이고, (c) 한 번에 변수 하나만 바꾼다.
+
+---
+
+# 12. 2026-09-01 세션 — DAOS 로 확정, 서명 확보
+
+이 세션의 질문은 "정합성 문제가 DAOS 문제인지"였고, **답은 그렇다**. §3 의 마지막 미배제
+변수를 측정으로 닫았고, 손상의 정확한 형태를 얻었다. 재현기는 C 로 이식했다
+(`tests/dfs_integrity.c`, 보조 `tests/dfs_integrity_ab.sh`·`tests/agg_ab.sh`).
+
+client-6 은 다른 사용자의 CXL 작업 때문에 사용하지 않았다. 전부 **client-5** 에서 했다.
+
+## 12.1 완전 스톡 클라이언트도 같은 비율로 실패 (핵심)
+
+cell1 `/var/daosbuild/daos-stock`(스톡 `841487de8`)를 **`--build-deps=yes` 로 prereq 까지
+새로 빌드**(mercury 는 0006 rkey 패치 없음, UCX 는 `--without-cuda --without-gdrcopy`),
+prefix `/var/daos-stockfull`. RPATH 보존을 위해 client-5 에도 **같은 경로**로 rsync.
+
+교차(interleaved) A/B, 28 MiB · 16 스레드 · burst, 컨테이너 `crp2g4`:
+
+| arm | 결과 |
+|---|---|
+| 패치 클라(`/opt/daos-gds-gpu`) | 25/3840 = **0.651 %** (95 % CI 0.441–0.959) |
+| **완전 스톡 클라(`/var/daos-stockfull`)** | 34/3840 = **0.885 %** (95 % CI 0.634–1.235) |
+
+구간이 겹치고 스톡이 오히려 높다. 두 arm 을 **블록이 아니라 교차**로 돌린 것이 중요하다 —
+실패율은 서버 상태에 따라 시간당 편차가 크고, §11 이 기록한 실패가 전부 그 편차를 arm 차이로
+읽은 것이었다. 검증: 스톡 `libcart.so.4` 에 `HG_Bulk_import_rkey` 심볼 0개, mercury 트리에
+0006 패치 미적용, `ucx_info -b` 에 CUDA/gdrcopy 매크로 없음.
+
+⇒ **우리 패치·커넥터·LMCache·GPU-direct prereq 전부 무죄. DAOS 자체의 결함이다.**
+
+## 12.2 손상의 정확한 서명 (태그된 페이로드로 확보)
+
+이전 패턴 `base[i] = (i*31 + tid*101) & 0xff` 은 **다른 스레드의 데이터와 같은 스레드의
+오프셋 이동 데이터가 수학적으로 구별 불가**였다(둘 다 바이트값을 상수만큼 이동). 그래서
+"own pattern shifted by 245" 같은 판독이 나왔다 — 실제로는 다른 객체의 데이터였을 수 있다.
+지금은 8바이트 워드마다 `(tid<<56)|(round<<48)|payload_offset` 을 심어 **모든 바이트가
+자기 출처를 말한다**.
+
+관측된 실패의 압도적 다수는 하나의 형태다:
+
+> **읽기 버퍼의 정확히 DFS chunk 하나(4 MiB = 524288 워드) 구간이, 같은 오프셋·같은 라운드의
+> _다른 객체_ 데이터로 채워져 돌아온다.** 나머지 구간은 전부 정확하다.
+
+- 구간 크기는 **컨테이너 chunk 크기를 따라간다**: chunk 1 MiB 컨테이너(`ci_1m`)에서는 손상
+  구간도 ~1 MiB(131 072 워드). ⇒ "chunk 하나가 통째로 잘못 배달된다"가 정확한 표현이다.
+- 드물게 **zeros**(구멍) 또는 **stale round**(같은 객체의 이전 라운드 데이터)도 나온다.
+- 시작 오프셋은 대개 파일 오프셋 기준 4 MiB 경계(payload_off 36 이므로 워드 4194264 부터).
+- **at-rest 는 대체로 정상**: 같은 런에서 스레드 종료 후 단일 스레드로 다시 읽으면 깨끗하다.
+  ⇒ 저장된 바이트는 맞고, **읽기가 저장되지 않은 바이트를 돌려준다.**
+- 부하 중 즉시 재읽기: A/B 전체에서 clean 25 / STILL WRONG 34 — **틀린 답이 남을 수도 있다.**
+
+## 12.3 방아쇠는 "쓰기와 읽기가 섞일 때"
+
+한 번에 하나만 바꾼 결과(모두 `tests/dfs_integrity.c` 플래그):
+
+| 구성 | 결과 |
+|---|---|
+| 조용한 단일 스레드 쓰기 + 조용한 검증 3회 (`-W -Q -V 3`) | 깨끗 (48/48) |
+| 조용히 쓴 뒤 **읽기만** 16 스레드 (`-W -M`) | **0/4320** (18 GB/s) |
+| **쓰기만** 16 스레드 + 조용한 검증 (`-N -V 3`) | 깨끗 |
+| 단일 스레드 쓰기+읽기 150 라운드 (`-t 1`) | 0/150 |
+| 16 스레드 쓰기+읽기 (기본) | **0.2–1.9 %** |
+| 16 스레드, 쓰기와 읽기 사이 2초 대기 (`-d 2000`) | 0/240 (표본 부족, 참고만) |
+
+⇒ 읽기 동시성만으로는 안 나오고, 쓰기 동시성만으로도 안 나온다. **둘이 섞여야** 나온다.
+
+## 12.4 gate 가 아닌 것
+
+- **복제·oclass 아님**: `SX`(rd_fac 0, 복제 없음) 0.21–0.78 %, `RP_2G1`·`RP_2G4`·`RP_2G8`
+  전부 재현. 처음 `S1`(단일 shard)이 0/2560 으로 깨끗해 "shard fan-out 이 조건"이라 봤으나
+  표본을 1920 으로 올리자 **S1 도 2/1920 실패** → **그 판독은 철회한다.** 같은 배치에서
+  S4·SX 가 0/1920 이었다 — 0.2~0.9 % 대에서 2000 표본은 arm 을 가르지 못한다(§6, §11).
+- **컨테이너 신선도 아님**: 갓 만든 `ci_plain` 도 6/1920.
+
+## 12.5 서버 쪽 증거 — DAOS 가 스스로 손상을 검출한다
+
+**양 rank** 의 엔진 로그(`/var/log/daos/daos_engine.0.log`, cell1·cell2):
+
+```
+csum src/vos/vos_csum_recalc.c:111 csum_agg_verify() calc ({... first_csum: 0 ...})
+                                                  != phy ({... first_csum: 2092910456 ...})
+vos src/vos/vos_aggregate.c:1230 fill_one_segment() CSUM verify error: DER_CSUM(-2021)
+vos src/vos/vos_aggregate.c:1817 flush_merge_window() Fill segments 0-3fffff error: DER_CSUM
+RAS EVENT id: [device_media_error] msg: [Device: ba123b03 csum error logged from tgt_id:6]
+```
+
+- 실패하는 창은 **정확히 `0-3fffff` = 4 MiB**, 즉 클라이언트가 보는 손상 구간과 같은 크기다.
+- `dmg storage query list-devices --health`: 모든 NVMe 가 **Media/Read/Write Errors 0**,
+  그러나 장치마다 **Checksum Errors 2–6**. ⇒ 하드웨어 미디어 오류가 아니라 **DAOS 내부**
+  검사 실패다.
+- 이 DER_CSUM 은 **checksum 을 켠 컨테이너(`ci_csum`)를 쓰기 시작한 시각부터** 나타난다.
+  즉 원래도 손상되고 있었고, checksum 이 없을 때는 **아무도 검출하지 않고 클라이언트로
+  배달**된 것이다.
+
+## 12.6 checksum 은 해결책이 아니라 검출기
+
+`cksum:crc32,srv_cksum:on` 컨테이너에서 **조용한 손상은 관측되지 않았다**(약 4 000 읽기).
+대신 일부 런이 **EIO 로 중단**됐다(스레드 rc=5). 즉 침묵이 오류로 바뀐다 — KV 백엔드에
+당장 쓸 수 있는 **탐지** 수단이지만 정합성 보장은 아니다.
+
+## 12.7 부수 증상 2건 (같은 부하에서)
+
+1. **지속 부하에서 쓰기가 실패한다**: `dfs_write` → `daos_array_write()` →
+   `DER_MISC(-1025)` → 앱에는 EIO. 16 스레드·28 MiB 를 몇 분 돌리면 나오고, **한가해지면
+   회복**된다(가벼운 부하는 정상). 이 때문에 후반 측정의 표본이 잘렸다 — 런당 완료 읽기 수를
+   반드시 요약줄에서 되읽을 것.
+2. **컨테이너 close 마다** `dtx_flush_on_close() Some DTX in CoS cannot be committed` +
+   `Fail to flush CoS cache: rc = -1025`(양 rank). 소스(`src/dtx/dtx_common.c:1559`)를 보면
+   회계 조건에서 루프를 끊고 비동기 배치 커밋으로 넘기는 경로라 즉시 데이터 손상 경로는
+   아니지만, 상류 제출 시 함께 붙일 것.
+
+## 12.8 VOS aggregation 가설 — **검정력 있게 재시험한 결과 기각**
+
+`tests/agg_ab.sh` 로 `reclaim:lazy`(aggregation ON) 대 `reclaim:disabled`(OFF) 를 블록 교대로
+돌렸다. 런당 160 읽기, 블록당 8 런, arm 당 4 블록 = arm 당 5120 읽기. 짧은 런 + 런 사이
+대기로 §12.7-1 의 EIO 절단을 없앴다(1차 실험 truncated run 0건). **양성 대조**: OFF 블록마다
+NVMe free 가 701→626 GB 로 줄고 ON 블록에서 회복 → 속성이 실제로 적용됐음을 확인.
+
+| 실험 | ON | OFF |
+|---|---|---|
+| 1차 (블록마다 ON 먼저) | 77/5120 = **1.50 %** | 27/5120 = **0.53 %** |
+| 2차 (블록마다 OFF 먼저, 후반 환경 열화로 부분) | 54/3758 = **1.44 %** | 51/3840 = **1.33 %** |
+
+1차만 보면 3배 차이에 Wilson 구간도 안 겹쳐 확정처럼 보인다. **틀렸다.** 순서를 뒤집은 2차에서
+차이가 사라졌고, 블록별로 쪼개 보면 이유가 분명하다:
+
+| | 1차 ON | 1차 OFF | | 2차 OFF | 2차 ON |
+|---|---|---|---|---|---|
+| block 1 | 48/1280 (3.75 %) | 11/1280 (0.86 %) | block 1 | 40/1280 (3.13 %) | 6/1280 (0.47 %) |
+| block 2 | 7/1280 (0.55 %) | 8/1280 (0.63 %) | block 2 | 9/1280 (0.70 %) | 44/1280 (3.44 %) |
+| block 3 | 8/1280 (0.63 %) | 3/1280 (0.23 %) | block 3 | 2/1280 (0.16 %) | 4/1198 (0.33 %) |
+| block 4 | 14/1280 (1.09 %) | 5/1280 (0.39 %) | | | |
+
+**실패는 버스트로 온다.** 같은 arm 안에서도 블록에 따라 0.16 %–3.75 % 로 20배 흔들리고,
+양쪽 실험의 총합은 각각 딱 한 블록(48, 44, 40)이 지배한다. 즉 **읽기를 독립 베르누이 시행으로
+보고 계산한 Wilson 구간은 이 데이터에서 무효**다(과산포). 1차의 "겹치지 않는 구간"은 그
+착시였다. 블록을 단위로 보면 ON 이 높은 블록 5, OFF 가 높은 블록 2 — 부호검정 p≈0.45.
+
+⇒ **aggregation 은 원인이 아니다.** aggregation 을 끈 상태에서도 78/8960 = 0.87 % 로 손상이
+계속된다. 앞선 세션의 `0/737` 은 검정력 부족이었다(그 때 p≈0.008 이라고 적어둔 그 확률).
+
+**측정 규칙(다음 세션 필수):** arm 비교는 **런 단위 교대**로 하고(§12.1 의 패치/스톡 A/B 처럼),
+블록 단위로 묶어야 한다면 순서를 뒤집은 대조도 함께 돌릴 것. 풀 읽기수 기준 이항 신뢰구간만
+믿고 arm 차이를 주장하지 말 것.
+
+## 12.8b 동시성 없이도 재현된다 — 조건은 "덮어쓰기 세대"
+
+aggregation A/B 뒤 환경이 열화된 상태에서 조용한 대조군을 다시 돌리다 발견했다. **스레드 없음,
+동시 접근 없음**: 16개 객체를 단일 스레드로 쓰고, 같은 프로세스가 단일 스레드로 되읽는다.
+
+- 갓 만든 컨테이너에 1세대만 쓰면 깨끗(0/16 × 3 패스).
+- **같은 객체를 반복해서 덮어쓰면** 6세대째부터 틀리기 시작해 20세대 중 8세대에서 1–2개 객체가
+  틀렸다(9/320 ≈ 2.8 %).
+- 쓰기와 읽기를 **별개 프로세스**로 나눠도 동일(클라이언트 핸들/캐시 배제). 12세대에서
+  객체당 0–13개가 틀렸다.
+- 쓰기 프로세스 종료 후 **10초 대기해도** 줄지 않는다(0초 31/96, 10초 22/96) → 단순한 커밋
+  가시성 지연이 아니다.
+- 세대마다 다른 round 태그(`-R`)를 쓰면 틀린 조각의 정체가 나온다: **이전 세대의 데이터**
+  또는 **다른 객체의 데이터**. 같은 객체를 연속으로 읽으면 틀린 조각이 **패스마다 바뀐다**
+  (t7: 12 MiB 에 t13 데이터 → 같은 결과 → 다음 패스엔 16 MiB 에 t15 데이터) — 디스크 내용이
+  틀린 게 아니라 **읽기가 매번 다른 조각을 잘못 가져온다**.
+
+⚠️ **단, 이 관측은 풀이 이미 몇 시간 부하를 받아 열화된 뒤에 얻은 것이다**(그 시점엔 쓰기가
+간헐적으로 EIO). 건강한 풀에서 처음부터 재현되는지는 **아직 확인 안 했고, 다음 세션 1순위**다.
+성립하면 상류 재현기가 "16 스레드 burst" 에서 **"단일 스레드로 몇 번 덮어쓰고 읽기"** 로
+극적으로 단순해진다.
+
+## 12.8c 서버가 bulk 핸들 역직렬화에 실패한다
+
+부하가 쌓이면 cell2 엔진이 `tgt_update` RPC 를 못 푼다(오늘 7423건, 03:22 부터):
+
+```
+mercury->bulk [error] mercury_bulk.c:1431 hg_bulk_deserialize() Could not deserialize address
+mercury->bulk [error] mercury_bulk.c:2783 HG_Bulk_deserialize() Could not deserialize handle
+hg src/cart/crt_hg.c:1315 crt_rpc_handler_common() _unpack_body failed, opc: 0x40a000b: DER_HG
+```
+
+클라이언트에는 §12.7-1 의 `DER_MISC` → EIO 로 보인다. **RPC 본문 안의 bulk 핸들이 깨져서
+도착한다**는 뜻이므로, 페이로드만이 아니라 **RPC 본문도 손상된다**는 해석이 가능하다 —
+"chunk 하나가 다른 객체 것으로 바뀐다"와 같은 뿌리일 수 있다.
+
+wire 포맷 차이 때문일 가능성은 배제했다: 패치 mercury 와 스톡 mercury 의 `src/` 차이는
+`HG_Bulk_import_rkey` 스텁(호출자 없음)·그 헤더·`na_ucx.c` 의 TLS 한 줄(우리는
+`NA_UCX_EXTRA_TLS=` 로 무력화)뿐이고 **직렬화 코드는 동일**하다.
+
+## 12.8d 아직 바꿔보지 않은 변수 하나 — **서버 빌드**
+
+§12.1 이 배제한 것은 **클라이언트** 패치다. 모든 arm 이 **같은 패치 서버**(`/opt/daos-gds`)를
+공유했다. 서버까지 완전 스톡(`/var/daos-stockfull`)으로 바꾸려면 `daos_server` 재시작이
+필요하고, §8-1 대로 SPDK wedge → format → **풀 파기** 위험이 있다. 사용자 판단이 필요한
+파괴적 작업이므로 이 세션에서는 하지 않았다. 상류 제출 시 "서버는 2.9.100 백포트 빌드"라고
+명시할 것.
+
+## 12.9 환경 (다음 세션이 이어받을 상태)
+
+- cell1: `/var/daos-stockfull`(완전 스톡 2.9.100, 빌드 트리 `/var/daosbuild/build-stockfull`,
+  로그 `/var/daosbuild/build-stockfull.log`, 스크립트 `/var/daosbuild/build_stockfull.sh`).
+  기존 `/var/daosbuild/build-gpu` 와 별도라 패치 빌드는 그대로 살아 있다.
+- client-5: `/var/daos-stockfull`(같은 경로 필수), `/root/dfs_integrity.c`,
+  `/root/dfs_integrity_{patched,stock}`, `/root/dfs_integrity_ab.sh`. cell1: `/root/agg_ab.sh`.
+- 새 컨테이너(gdspool): `ci_plain`(RP_2G4 4 MiB) `ci_csum`(+crc32) `ci_1m`(1 MiB chunk)
+  `ci_s1` `ci_s2` `ci_s4` `ci_sx`. 풀 `reclaim` 은 **lazy 로 복원**해 두었다.
+- 서버는 건드리지 않았다(패치 빌드 그대로 실행 중, 재시작 없음 — §8-1 준수).
+
+## 12.10 다음 작업 순서 (개정 2)
+
+1. ~~aggregation A/B~~ — **완료, 기각(§12.8).**
+2. **§12.8b 를 건강한 풀에서 재현**하라. 풀을 쉬게 하고(또는 `ci_*` 테스트 컨테이너를 지워
+   공간·메타데이터를 회수하고), 갓 만든 컨테이너에서 단일 스레드 덮어쓰기 세대를 1→30 까지
+   올리며 세대별 실패율을 기록할 것. 성립하면 재현기가 단일 스레드로 단순해진다.
+3. `ci_1m` 외에 chunk 512 KiB·16 MiB 로 손상 구간 크기 = chunk 크기를 한 번 더 확인.
+3. 손상 발생 시각의 엔진 로그를 `DD_SUBSYS=vos,bio,object` 로 좁혀 확보(런타임
+   `dmg server set-logmasks` 로 가능, 재시작 불필요).
+4. **상류 제출**: §12.1 A/B 표, §12.2 서명(태그 페이로드 출력 원문), §12.5 서버 로그 + 장치
+   카운터, §12.3 방아쇠 표, §12.6 checksum 거동, §12.7 부수 증상 2건, 재현기 C 파일.
+5. Hub 정정 공지(`719497ff-…`) 갱신 — "원인 미해결" → "DAOS 확정, aggregation 의심".
+6. **그때까지 이 백엔드는 사용 불가로 유지한다.**
+
+## 12.11 이 세션에서 철회/정정한 것
+
+| 주장 | 실제 |
+|---|---|
+| "S1(단일 shard)은 면역" | 표본 늘리자 2/1920 실패. 0/2560 은 검정력 부족이었다 |
+| "checksum 켜면 손상이 사라진다" | 조용한 손상은 사라지지만 EIO 로 나온다. 검출기이지 수정이 아니다 |
+| "at-rest 도 손상된다"(초판 판독) | 두 계측 결함이었다 — (a) 태그 형식이 바뀐 객체를 옛 형식으로 검증, (b) EIO 로 쓰기가 중단된 객체는 라운드가 섞인 게 정상 |
+| "쓰기 동시성만으로 at-rest 가 깨진다" | `-N -V 3` 깨끗 |
+| "aggregation 이 원인일 수 있다"(§12.8 초판, 0/737) | 검정력 있게 재시험하니 기각 — 실패가 버스트로 오고 순서를 뒤집으면 차이가 사라진다 |
+| "쓰기+읽기 혼합이 필요조건"(§12.3) | 덮어쓰기 세대를 쌓으면 **단일 스레드로도** 재현(§12.8b, 단 열화된 풀에서 관측) |
+
+---
+
+# 13. "2.8.0-rc3" 서버에서도 동일하다 (2026-09-01, 서버 reformat 실측)
+
+> **⚠️ 정정(2026-09-01 심야, 사용자 지적):** 이 절에서 "2.8.0-rc3" 라고 부른 서버는 upstream
+> 이 아니라 **`port/2.8-wsd` = upstream rc3 + 66 커밋**(zfs-cap/WS-D staging, bio/vos 수정 포함)
+> 이다. TAG 파일이 2.8.0-rc3 인 것을 upstream 으로 오기했다. 실행 바이너리 검증: 8/23 빌드
+> RPM 의 `libbio.so` 에 WS-D 문자열 존재. 이 절이 실제로 증명한 것은 "**rc3 기반 ExaStor
+> 브랜치**도 동일 손상"이며, **완전 upstream 재현은 §18 이 확정**했다.
+
+질문: "2.8-rc3 에서도 동일할까?" — **동일하다.** 추론이 아니라 같은 하드웨어·토폴로지·provider
+에서 서버를 2.8.0-rc3 로 되돌려 측정했다(사용자 승인 후 gdspool 파기).
+
+## 13.1 왜 2.8-rc3 인지, 무엇이 같은 코드인지
+
+`port/2.8-wsd` 와 `verify/2.8-rc3-zoneinstr` 둘 다 `TAG=2.8.0-rc3`(상류 `3604d406ef`).
+2.8.0-rc3 ↔ 2.9.100(`841487de8`) diff:
+
+| 경로 | 차이 |
+|---|---|
+| `src/client/array/dc_array.c` — DFS 읽기를 chunk 로 쪼개는 곳 | **동일** |
+| `src/vos/vos_aggregate.c` | **동일** |
+| `src/vos/vos_csum_recalc.c` — DER_CSUM 을 찍는 함수 | **동일** |
+| `src/bio/` 전체 | **동일** |
+| `src/object/srv_obj.c` | 24+/74− |
+| `src/vos/vos_io.c` | 36+/14− |
+| `src/cart/` (crt_hg·crt_bulk 등) | 1128+/1079− |
+
+즉 손상 신호를 만드는 코드는 두 버전이 같고, 크게 바뀐 건 전송 계층뿐이다.
+
+## 13.2 전환 절차 (그대로 재현 가능)
+
+양 cell 에 **2.8.0-rc3 RPM 이 이미 설치돼 있었다**(`daos-server-2.8.0-4.el8`, `/usr/bin`).
+`/opt/daos`(소스빌드 prefix)와 RPM 은 **build-id 동일**(libdaos `8e52765f`, libdfs `54290720`)
+— stripped 여부만 다르므로 클라(prefix)와 서버(RPM)가 같은 빌드다. §8-3 의 불일치 함정 회피.
+
+1. 설정 백업: `/root/daos-cfg-backup-2.9/`(양 cell), `/root/daos-agent-unit-2.9.bak`(client-5)
+2. client-5 agent 정지 → 양 cell `systemctl stop daos_server`
+3. drop-in 을 `/usr/bin/daos_server` 로 교체 + `daemon-reload`
+4. 2.9 메타데이터 제거: `/var/daos/control_meta/daos_control/control_raft`, `/mnt/daos0/*`,
+   root shmem `ipcrm` → **여기서 풀이 파기된다**
+5. 기동 → `dmg -i storage format`(cell1) + **`dmg -i -l 10.100.230.82 storage format`**(cell2 는
+   명시 필요) → 양 rank Joined
+6. `dmg -i pool create gdspool --scm-size=8G --nvme-size=200G` (416 GB)
+7. client-5: cell1 `/opt/daos` 를 **같은 경로로** rsync, `libna_plugin_ucx.so`→`/usr/lib64/mercury`,
+   `/lib64/ucx` 심볼릭, agent unit 을 `/opt/daos` 로 sed 후 재시작
+8. 재현기 재빌드: `gcc ... -I/opt/daos/include -L/opt/daos/lib64 ... -o dfs_integrity_28`
+
+**SPDK wedge 는 일어나지 않았다** — format 이 한 번에 통과했다(§8-1 은 재시작 일반론이고, 이번
+전환에서는 문제 없었다).
+
+## 13.3 실측 (2.8.0-rc3, 갓 포맷한 풀, provider ucx+rc_v, RP_2G4/4 MiB)
+
+**정상상태에서 2.9.100 과 같은 범위다:**
+
+| arm | 2.8.0-rc3 | 2.9.100 (동일 프로토콜) |
+|---|---|---|
+| mixed 쓰기+읽기 16 스레드 (16×40 ×8) | **68/5120 = 1.33 %** | 34/5120 스톡=0.885 %, 25/5120 패치=0.651 % |
+| mixed, payload 오프셋 0(정렬) — 교대 A/B | 19/5120 = 0.37 % | (미측정) |
+| mixed, payload 오프셋 36(straddling) — 교대 A/B | 35/5120 = 0.68 % | 0.65–0.89 % |
+| read-only 동시성(조용히 쓴 뒤 읽기만) — 안정화 후 | 0/3840 | 0/4320 |
+| 단일 스레드·단일 객체 mixed | 0/100 | 0/150 |
+
+서명도 같다: 4 MiB 한 chunk 가 **같은 오프셋의 다른 객체 데이터**, 또는 같은 객체의 다른
+오프셋 데이터(`own data from offset N (-20971520)`), 드물게 stale round.
+
+⇒ **결함은 2.9 에서 새로 생긴 것도, GPU-direct 백포트가 만든 것도 아니다.** 2.8/2.9 공용
+코드(§13.1)에 있다.
+
+## 13.4 포맷 직후 과도 구간 — 훨씬 심하다 (기록용, 재현 실패)
+
+포맷 후 첫 1시간 동안은 비율이 자릿수로 달랐다:
+
+- 첫 smoke test(4 스레드×3): **8/12 = 67 %**
+- 조용한 대조군(동시성 전무, 16 객체 단일 스레드 쓰기→읽기): **10~13/16 객체 오류** — 2.9 에서는
+  이 arm 이 항상 깨끗했다
+- read-only 동시성 8회 연속: **275 → 181 → 152 → 133 → 96 → 57 → 29 → 0 /640** (단조 감소)
+
+이후 같은 arm 들이 재현되지 않았다(read-only 0/3840, 조용한 대조군 clean 3회). 덮어쓰기를
+반복하면 "치유"되는 초기 상태 의존 현상으로 보이며, **mixed load 로 다시 유도되지 않았다**
+(cycle 3회: read-only before/after 모두 0/640). 원인 미규명 — 상류에 붙일 만한 관측이지만
+현재 상태로는 주장하지 말 것.
+
+## 13.5 정렬(alignment)은 완화책이 아니다
+
+한 번의 측정에서 straddling 25.5 % 대 aligned 5.5 % 가 나와 완화책처럼 보였으나, **교대 A/B
+5120 읽기씩**으로 다시 재면 **0.68 % 대 0.37 %** 로 줄어든다(런별로 13:0, 0:11, 2:15 처럼
+뒤집힘). 약한 경향은 있으나 버스트를 감안하면 결정적이지 않다 → **§3 의 "정렬 무관" 판정 유지.**
+KV 커넥터 페이로드를 chunk 정렬해도 해결되지 않는다.
+
+## 13.6 과거 "2.8 + UCX 무결 30/30" 판정에 대하여
+
+그 판정(Hub v4)은 `tests/test_manyread.py` — 30개 객체를 각각 **한 바이트를 반복한 값**으로
+채워 순차 읽기·md5 비교하는 테스트였다. 두 가지 이유로 결함 부재의 근거가 못 된다:
+
+1. **검정력**: 이번에 측정된 정상상태 비율(0.4~1.3 %/읽기)이면 30 읽기가 전부 통과할 확률이
+   67~89 %, 3회 반복 전부 통과도 30~70 % 다.
+2. **상수 채움의 맹점**: 이번 2.8 실측 실패 중에는 `own data from offset N` (같은 객체의 다른
+   오프셋 조각)이 섞여 있다. 객체 전체가 같은 바이트면 **그 유형은 원리적으로 검출 불가**다.
+
+**교훈: 무결성 검증 페이로드는 위치·객체를 식별하는 태그여야 한다**(`tests/dfs_integrity.c`의
+8바이트 태그). 상수/난수 한 덩어리로는 이 결함의 일부가 보이지 않는다.
+
+## 13.7 현재 환경 상태
+
+- cell1/cell2: **DAOS 2.8.0-rc3**(`/usr/bin`, RPM) 실행 중, 양 rank Joined, pool `gdspool`
+  416 GB(SCM 8 G/rank + NVMe 200 G/rank), 컨테이너 `ci_plain ci_quiet ci_a0 ci_a36 ci_m28`
+- client-5: `/opt/daos`(2.8 클라), agent unit 도 2.8, 재현기 `/root/dfs_integrity_28`
+- 2.9 설치본은 **그대로 보존**: `/opt/daos-gds`(서버), `/opt/daos-gds-gpu`, `/var/daos-stockfull`
+- **2.9.100 으로 되돌리려면**: drop-in 을 `/opt/daos-gds/bin/daos_server` 로 복원(백업 있음) →
+  §13.2 의 4~6 단계 반복(= 2.8 풀 파기, 테스트 데이터뿐) → client-5 agent unit 복원
+
+---
+
+# 14. 상류 선행 보고 조사 (2026-09-01)
+
+## 14.1 어디를 봐야 하는가
+
+**`daos-stack/daos` 는 GitHub Issues 가 비활성**(`has_issues: false`)이다. GitHub 에 있는 건
+전부 PR 이고, 버그 보고는 **JIRA `daosio.atlassian.net`** 에 있다. 이 JIRA 는 **익명 읽기 가능**:
+
+```
+# 검색 (v2 /search 는 410 Gone, v3 를 쓸 것)
+https://daosio.atlassian.net/rest/api/3/search/jql?jql=project%3DDAOS%20AND%20summary~%22corruption%22&fields=key,summary,status,created
+# 개별 티켓
+https://daosio.atlassian.net/rest/api/2/issue/DAOS-18862?fields=summary,status,resolution,versions,description
+```
+
+## 14.2 결론 — 우리 서명과 일치하는 보고는 없다
+
+검색한 축: `summary~corruption`(40건), 2026년 이후 Bug+"data corruption"(28건),
+`"wrong data"/"stale data"/"incorrect data"`, `"another object"`, UCX·rcache·corruption,
+그리고 우리 로그 문자열 그대로(`csum_agg_verify`, `hg_bulk_deserialize`/`deserialize address`,
+`CoS cache`). 손상 티켓은 전부 **rebuild/reintegration/exclusion**, **EC aggregation**,
+**메모리 손상(double-linked list)**, 또는 테스트 하네스 문제였다. **장애·리빌드 없이 평상시
+읽기가 다른 객체의 chunk 를 조용히 돌려준다**는 보고는 없다.
+
+## 14.3 가장 가까운 이웃 — DAOS-18862 (Cannot Reproduce 로 종결)
+
+> **DAOS-18862** "release/2.8: Checksum mismatch at index 42/64" — 2026-04-21, affects 2.7,
+> **Resolved / Cannot Reproduce**, 원인 미규명.
+> 환경: **MD-on-SSD**, **UCX(dc_x)**, `release/2.8`(c22a7958), 2 TB 풀, HDF5 exerciser.
+> 클라이언트 읽기에서 `Checksum mismatch at index 42/64 59887 != 27441`.
+
+우리와 같은 축이 셋(MD-on-SSD · UCX · 2.8 계열 · 읽기 경로 체크섬 불일치)이고, 다른 축이 둘
+(EC_8P3GX vs 우리 RP_2G4, 체크섬 ON 이라 침묵이 아니라 오류로 표면화). **재현 불가로 닫혔는데
+우리는 재현기가 있다** → 상류 제출 시 이 티켓을 반드시 참조/재오픈 후보로 연결할 것.
+곁가지 힌트: 그 환경은 **`UCX_ENABLE_RCACHE` 를 서버·클라 양쪽에서 끈** 상태였다 — 보고자도
+UCX 등록 캐시를 의심했다는 뜻이다(우리는 아직 이 노브를 시험하지 않았다).
+
+## 14.4 열려 있는 신규 티켓 — DAOS-19569 (확인 필요)
+
+> **DAOS-19569** "IOM process did not correctly handle multiple IODs case" — 2026-08-31 생성,
+> affects **2.8 · 3.0 Community**, **Awaiting backport**, component **Erasure Code**.
+> 본문: "Some IOM detailed handling did not correctly handle multiple IODs case" +
+> **"This possibly cause data corruption in special cases."**
+
+28 MiB DFS 읽기는 dc_array 가 chunk 마다 IOD 로 쪼개므로 **정확히 multi-IOD 케이스**다. 단
+component 가 EC 이고 우리는 RP 이므로 경로가 EC 전용인지 확인해야 한다. 패치는 우리 로컬
+`origin/master`(2026-08-28 fetch)보다 최신이라 트리에 없다 → **fetch 후 diff 를 보고, 우리
+재현기로 전후 비교할 것. 다음 세션 1순위 후보.**
+
+## 14.5 참고로 관련되지만 조건이 다른 것들
+
+| 티켓 | 상태 | 왜 우리 것이 아닌가 |
+|---|---|---|
+| DAOS-18368 "Data corruption ... MDonSSD" | Resolved (2.6.5/2.8 수정) | reintegration 이 방아쇠, 우리는 리빌드 없음 |
+| DAOS-18524 "DER_CSUM -2021 + Data corruption found for recx" | Resolved | reintegration 중 |
+| DAOS-18869 "data corruption after two ranks failed (spdk)" | Open | rank 장애 필요 |
+| DAOS-16970 "Timeout and read corruption on target exclusion" | Open | target exclusion 필요 |
+| DAOS-3841 "fetch returning data at wrong offset" | Resolved (2019) | 우리 `own data from offset N` 유형과 결이 같으나 시기가 다름 |
+| DAOS-19451 / PR #18885 "enable checksum by default on non-v0 pools" | Open PR | 상류도 침묵 손상 위험을 의식해 기본값 전환 중(§12.6 과 맞물림) |
+| DAOS-17321 / PR #18940·#18942 ddb `csum_check` | Open PR | 오프라인 체크섬 검증 도구 추가 중 |
+
+## 14.6 우리 빌드에 없는 상류 수정 (로컬 `origin/master` 2026-08-28 기준)
+
+| 커밋 | 2.8-rc3 | 2.9.100 | 우리 증상과의 관계 |
+|---|---|---|---|
+| `1ff454966b` DAOS-19537 array: fix set_size at chunk boundaries | ✗ | ✗ | truncate/shrink 경로 — 우리는 축소를 안 하므로 무관 |
+| `4f919653da` DAOS-15847 object: restore iov_len for fetch on dup-only SGLs | ✗ | ✓ | fetch SGL 의 iov_len 만 어긋나는 버그(데이터 위치는 정상) |
+| `205e513c25` DAOS-18901 vos: Cap merged extent size | ✗ | ✓ | aggregation 병합 크기 제한 — 양쪽 다 손상되므로 결정적이지 않음 |
+| `c61ae699bb` DAOS-19036 dtx: handle DTX race issues | ✗ | ? | §12.7-2 의 DTX CoS 증상과 맞춰볼 가치 있음 |
+
+즉 **2.8-rc3 는 2.9.100 이 가진 fetch/aggregation 수정 두 건을 아직 안 갖고 있는데도 손상
+비율이 같은 자릿수**(§13.3)다. 이 조합은 "그 두 수정이 원인이 아니다"는 쪽 근거다.
+
+---
+
+# 15. 원인 분기 트리 완주 — transport 무관, mercury core/서버 fetch 경로로 수렴 (2026-09-01 야간)
+
+외부 검토 계획(/tmp/daos-fix.md)의 Phase 1~2 + P1 transport arm 을 실행했다. **계측 빌드 없이
+가능한 배제는 전부 끝났고, 남은 용의자는 mercury core bulk 로직과 DAOS 서버 fetch/bulk 버퍼
+수명 둘뿐이다.**
+
+## 15.1 Phase 1 — 런타임 검증 (전부 통과)
+
+- 세 노드(cell1·cell2 엔진, client-5)가 **실제 로딩하는** `libna_plugin_ucx.so` 에
+  `ucp_ep_flush_nbx` 심볼 존재 = **DAOS-18862 의 Mercury put-flush 수정이 이미 들어 있다.**
+  ⇒ 상류 제출 프레임: **"fix present, reproducer still fails."**
+- UCX 1.20.0 확인. `0005_ucx_put_flush.patch` 는 2.8/2.9 트리 동일 해시.
+- rcache 환경변수 정정 확인: 소스(`crt_init.c:579`)는 `UCX_RCACHE_ENABLE=n` 을 설정.
+  `CRT_MRC_ENABLE=0` → `FI_MR_CACHE_MAX_COUNT=0` + `UCX_RCACHE_ENABLE=n` + 로그
+  `Disabling MR CACHE`. **2.8 은 클라이언트 MRC 기본 ON**(c22a79582a 정책, 2.9 트리엔 없음).
+
+## 15.2 Phase 2 — 교차 A/B 3종 (전부 "원인 아님")
+
+하네스: `tests/crossover_ab.sh`(AB BA BA AB 균형 순서, stderr 보존, **런 단위 부호반전
+순열검정** — 기존 dfs_integrity_ab.sh 의 결함 3종 수정판), `tests/procmatrix_ab.sh`.
+재현기에 `-T`(tid base)·`-A`/`DFSI_BUFMODE`(reuse|malloc|mmap) 추가 — **`-T` 없인 멀티프로세스
+arm 이 구조적으로 장님**(전 프로세스 tid 0 → 교차 치환이 정답으로 검증됨).
+
+| arm | 결과 | 판정 |
+|---|---|---|
+| client MR cache off (`CRT_MRC_ENABLE=0`+`UCX_RCACHE_ENABLE=n`, 마커 로그 확인) | 46/5120 vs 기준 79/5120, p=0.25 | **원인 아님 — off 에서도 손상** |
+| 버퍼 VA 재사용 (reuse vs 매 라운드 새 mmap·기존 매핑 유지) | 59/4659 vs 64/4513, p=0.98 | **원인 아님** |
+| 1×16 threads vs 16×1 processes | T 60/3666 vs P 16/4007, p=0.44 | **원인 아님 — 프로세스 분리로도 발생** |
+
+## 15.3 서버 BIO bulk-handle cache — 원인 아님
+
+`DAOS_IO_BYPASS=srv_bulk_cache` 를 양 엔진에 적용(로그 `debugging mode: srv_bulk_cache is
+disabled` 양쪽 확인) 후 fresh pool 에서: **DFS 33/5120 손상 지속**(18/640·3/640·12/640),
+raw obj 0/1920. cached bulk handle 은 무죄. 단 **DMA chunk 버퍼 풀 자체는 bypass 대상이
+아니므로** bio DMA 버퍼 재사용은 아직 용의선상에 있다.
+
+## 15.4 `ucx+tcp` — 측정 불가, 그 자체가 별도 결함
+
+provider 를 `ucx+tcp` 로 바꾸면 **모든 update RPC 가 서버에서 결정적으로 실패**:
+`hg_bulk_deserialize() Could not deserialize address` → DER_HG → 클라 DER_MISC. fresh pool
+첫 RPC부터 100 %, 양 rank. 작은 RPC(pool 연결)는 정상 — **bulk 핸들(클라 워커 주소 내장)이
+든 RPC 만** 깨진다. rc_v 에서 부하 시 간헐 발생하던 것(§12.8c)과 같은 실패가 tcp 주소
+형식에선 항상 발생. **na_ucx 주소 직렬화 결함으로 상류에 별도 보고 가치.**
+
+## 15.5 ★ `ofi+tcp` — RDMA 없이도 같은 서명으로 손상 (결정적)
+
+libfabric NA 플러그인 + 커널 TCP(RDMA·MR·NIC DMA 전무)로 전환, fresh pool:
+
+| | 결과 |
+|---|---|
+| DFS 16×40 ×8 | **83/5120 = 1.62 %** (10.78 %·0 ×5·0.94 %·1.25 % — 버스트 패턴 동일) |
+| raw obj ×3 | **49/1920** (9·40·0) |
+| 서명 | **동일**: 4 MiB chunk 하나가 같은 라운드·같은 오프셋의 다른 객체 데이터 |
+
+⇒ **UCX·RDMA·NIC/PCIe DMA·MR 캐시 전부 최종 배제.** 서로 무관한 두 전송(ucx+rc_v RDMA,
+ofi+tcp 소켓)이 같은 서명으로 손상 = 결함은 그 위 공통층이다.
+
+## 15.6 분기 트리 최종 상태
+
+```
+client MRC off        → 손상 지속   (§15.2)
+VA 재사용 제거        → 손상 지속   (§15.2)
+프로세스 분리         → 손상 지속   (§15.2)
+server bulk-hdl cache → 손상 지속   (§15.3)
+raw obj API (dc_array/DFS 배제, nr=1 단일 recx) → 손상 지속 (아래)
+ofi+tcp (UCX/RDMA 배제) → 손상 지속 (§15.5)
+─────────────────────────────────────────────
+남은 용의자:
+  (a) mercury core bulk 로직 (mercury_bulk.c — 두 NA 플러그인 공용)
+  (b) DAOS 서버 fetch 경로의 DMA/bulk 버퍼 수명
+      (vos fetch 채움 ↔ bulk PUT 완료 사이 재사용; srv_bulk_cache 는 핸들만 캐시)
+  (c) crt/object 층의 bulk 디스크립터-태스크 매칭
+판별 수단 = Phase 3 경계 해싱 (S1/S2/S3/C1/C2/C3, 계측 빌드 필요)
+```
+
+**raw object 재현기**(`tests/obj_integrity.c`, 신규): daos_obj_fetch 직접 호출, dkey=chunk
+번호, IOD 1개·recx 1개 — DFS·dc_array 완전 배제 상태에서 26/385·20/144 손상, 서명 동일.
+계획서 §3.1 의 "DAOS-19569(EC IOM merge)는 우리 경로가 아니다"가 코드와 실측 양쪽으로 확정.
+
+## 15.7 운영 발견 (재현·복구 조작법)
+
+1. **§8-1 SPDK wedge 의 실제 원인 하나를 특정**: stale `/var/tmp/spdk_pci_lock_0000:*` +
+   `/var/run/dpdk/spdk_pid*`. **rm 만으로 복구**되는 경우가 있다(dd·재포맷 불필요).
+2. 그래도 blobstore 가 깨졌으면: setup.sh reset → **PCI 주소로 열거한 데이터 NVMe 만**
+   `blkdiscard`(nvme24n1=OS 접근 금지 가드 포함) → SCM/raft 정리 → format.
+3. **provider 전환 절차**: server.yml provider 수정 + 양쪽 재포맷 + **cell1 로컬 agent 와
+   client agent 의 domain 을 provider 에 맞게**(ucx: `mlx5_0:1`, tcp 계열: netdev 명) + agent
+   재시작. 서버 재기동 후 클라 agent 도 재시작(구 attach 정보로 DER_HG).
+4. **client-5 firewalld 가 ofi+tcp bulk 를 막는다**: mercury tcp bulk 는 서버→클라 역방향
+   연결. `firewall-cmd --zone=trusted --change-interface=ens255np0` (런타임, --permanent 아님).
+5. cell1 의 daos_agent 는 이 날까지 2.9-gds 바이너리로 돌고 있었다(서버측 CLI 만 사용해 무해).
+
+## 15.8 현재 환경 (다음 세션)
+
+- **cell1/cell2: 2.8.0-rc3, provider `ofi+tcp`** — 재현되는 가장 단순한 전송이라 디버깅에
+  유리해 이 상태로 남겼다. pool `gdspool`(416 GB), 컨테이너 `ci_m28`·`ci_obj`.
+- rc_v 로 되돌리려면: yml provider 수정 + §15.7-3 절차(재포맷 포함).
+- client-5: `/root/dfs_integrity_28`·`/root/obj_integrity_28`(2.8 링크), `-T`/`-A` 지원판.
+  결과 로그: `/root/mrcab`·`/root/bufab`·`/root/procab`·`/root/bulkoff`·`/root/ofitcp`.
+- 다음 작업 = **Phase 3 경계 해싱**: 서버 debug 빌드(cell1 `/root/daos-2.8` 소스, S1~S3 지점)
+  + 클라 C1~C3. 그 전에 값싼 것: `ofi+tcp` 상태에서 kernel tcpdump 로 fetch bulk 페이로드를
+  wire 에서 캡처해 S(송신)–C(수신) 을 코드 수정 없이 비교할 수 있다 — tcp 로 남긴 또 하나의
+  이유.
+
+---
+
+# 16. ★★ tcpdump 페이로드 비교 — 손상은 서버가 송신 전에 만든다 (2026-09-01 심야)
+
+§15 에서 클러스터를 `ofi+tcp` 로 남긴 이유가 이것이다: fetch 응답이 평범한 TCP 라, 계측 빌드
+없이 **wire 자체를 증인으로** 세울 수 있다. 페이로드가 자기술적 8바이트 태그이므로 pcap 만으로
+"누구의 어느 chunk 가 몇 바이트 지나갔는지" 셀 수 있다.
+
+## 16.1 방법 (전부 재현 가능)
+
+- `tests/pcap_tagscan.c`(신규): pcap 을 직접 파싱해 태그 런을 검출, (방향, tid, round, chunk)
+  별 바이트 집계. 0 은 run 연장이 안 돼 자동 배제(zeros 는 스캐너에 안 보임 — 그게 판별을
+  만든다). 18~20 GB pcap 을 3초에 처리(페이지 캐시).
+- `tests/cap_loop.sh`(신규): 서버→클라 방향만 필터(`src host .82 or .84`)로 tcpdump 를 켠 채
+  `obj_integrity` 를 반복, 깨끗한 try 의 pcap 은 즉시 삭제, 손상 try 만 보존.
+- 검증된 캡처 충실도: 두 이벤트 모두 **0 packets dropped**, 비피해 (tid,round) 행이 전부
+  정확히 chunk 당 4.00 MiB — 모델 오차 0.
+
+## 16.2 zeros 변종 — 서버가 0 을 보냈다
+
+`zeros_r25.pcap`(18 GB, 5/640 손상, 전부 라운드 25, chunk 전체가 0):
+
+| 피해자 | 손상 chunk | wire 관측 |
+|---|---|---|
+| t15 | c5 | **c5 태그 0바이트**(원독+재시도 모두), 나머지 chunk 8 M |
+| t4 | c4 | c4 부재, c0=4M(재시도에서 c0 도 0) |
+| t2·t3·t8 | c6 | c6 부재, c1=4M(재시도에서 c1 도 0) |
+
+앱 버퍼는 0xA5 로 오염시켜 두므로 0 이 "미기록"일 수는 없다 — **서버가 4 MiB 의 0 을 실제로
+전송했다.** 재시도의 STILL WRONG 까지 wire 와 정합.
+
+## 16.3 foreign 변종 — 서버가 남의 데이터를 보냈다
+
+`foreign_r11.pcap`(20 GB, 66/640 손상). 라운드 11 의 결정적 쌍:
+
+- 피해자 **t6**(c0 이 "t3 r11 off 25788416" 데이터로): 자기 c0 태그 **wire 에 0바이트**.
+- 출처 **t3**(자신은 무손상·재시도 없음): c6 이 4 M 이어야 하는데 **10.81 M** —
+  초과 **6.81 M = 3.41 M × 2회**, 3.41 M 은 정확히 "오프셋 25788416 → t3 객체 끝(28 M)" 크기.
+  즉 t6 의 fetch 응답(원독+재시도) 두 번에 t3 의 그 구간이 통째로 실려 나갔다.
+- t0(c2 피해) ↔ t13(c5 출처, 4→12 M) 쌍도 같은 산수로 맞는다.
+
+**추가 단서**: t6 이 받은 4 M 중 3.41 M 은 t3, 잔여 0.59 M 은 또 다른 객체의 태그 —
+응답이 **연속된 남의 데이터 두 도막**으로 채워졌다. 출처 오프셋(25788416, 21594112 등)은
+chunk 경계도 아니다. ⇒ 서버가 **풀링된 스테이징/DMA 버퍼의 잘못된 위치에서 연속 구간을
+그대로 퍼 보낸** 형상이다.
+
+## 16.4 판정과 남은 수사 범위
+
+> **두 변종 모두 손상은 서버 내부, 송신 이전에 발생한다. 클라이언트 수신 경로(mercury 클라,
+> libfabric, 커널 TCP RX)는 무죄다.**
+
+§15.6 의 용의자 (a)(b)(c) 중 클라이언트 측이 빠지고, 다음으로 좁혀진다:
+
+1. **bio DMA 버퍼 오프셋/수명** — `bio_iod_prep()` 이후 채움↔`bulk_transfer_sgl()` 송신 사이.
+   srv_bulk_cache bypass 는 **핸들** 캐시만 끈다: 풀링된 DMA chunk 버퍼와 오프셋 계산은
+   bypass 후에도 그대로다(§15.3 과 모순 없음).
+2. VOS fetch 가 biov 를 잘못 가리킴 (zeros 변종 = 미기록/미채움 구간 전송과 한 뿌리 가능).
+3. mercury core 서버측 bulk 송신의 로컬 오프셋 계산.
+
+zeros 변종의 해석도 정리된다: **hole 이 아니라 "아직 채워지지 않은(또는 0 으로 초기화된)
+서버 버퍼를 송신"** — foreign 과 같은 매커니즘의 다른 단면일 개연성.
+
+다음 단계(차기 세션): `src/bio/bio_buffer.c`(dma buffer 오프셋 회계)·`src/object/srv_obj.c`
+`bulk_transfer_sgl()`·`src/vos/vos_io.c` biov 경로 코드 감사 + 서버측 S1/S2 해시 계측(이제
+클라 계측 C1~C3 은 불필요). 손상 시각 대조용 원자료: client-5 `/home/cap/zeros_r25.*`,
+`/home/cap/foreign_r11.*` (pcap 38 GB — 분석 후 정리 여부는 사용자 판단).
+
+## 16.5 상류 제출용 한 줄 갱신
+
+"클라이언트가 무엇을 하든(어느 API, 어느 캐시 설정, 어느 프로세스 구성) 무관하고, **어느
+전송이든**(ucx+rc_v RDMA, ofi+tcp 소켓) 재현되며, **tcpdump 가 서버 송신 페이로드에서 이미
+다른 객체의 바이트를 보여준다.** 서버 fetch 데이터패스 결함이다."
+
+---
+
+# 17. 서버 코드 감사 (2026-09-01) — 정상 경로는 무죄, 용의 구간은 "채움 이하"로 축소
+
+§16 의 wire 판정("서버가 송신 전에 만든다")을 들고 서버 fetch 데이터패스를 감사했다.
+대상 트리: `port/2.8-wsd`(현재 2.8 서버의 소스), `c87080a70`(지난주 2.9-gds 서버),
+upstream `3604d406ef`(2.8.0-rc3)·`841487de8`(2.9.100).
+
+## 17.1 소스 계보 발견 — 두 서버의 커스텀 패치는 서로소다
+
+| 서버 빌드 | upstream 대비 커스텀 변경 |
+|---|---|
+| 2.9-gds (`c87080a70`, 지난주 전체) | **cart**(crt_bulk rkey import 배관 +165)·object(플래그/텔레메트리). **bio·vos 무변경** |
+| 2.8-wsd (`port/2.8-wsd`, 오늘) | **bio**(WS-D hot staging +368)·**vos**(zfs-cap staging +3525)·vea 소폭. **cart 무변경** |
+
+두 빌드가 같은 서명으로 손상되므로 **커스텀 패치는 어느 쪽도 원인이 될 수 없다**(교집합 없음).
+⇒ 결함은 양쪽이 공유하는 것: **upstream 코어(bio/vos/vea/object), prereq(SPDK v26.01 — upstream
+자체 bump, mercury 2.4.1+패치 5종), 그리고 MD-on-SSD 구성.**
+
+주의: §12.1 의 "스톡" A/B 는 클라이언트만 스톡이었다(§12.8d 그대로). ~~서버까지 완전 upstream
+인 검증은 여전히 미실시~~ → **§18 에서 실측 완료: 완전 upstream 서버에서도 동일 재현.**
+
+## 17.2 mercury/cart bulk 코어도 배제된다 (기존 증거 재해석)
+
+§12.5 의 엔진 로그 — **VOS aggregation 의 `csum_agg_verify()` 가 DER_CSUM 으로 실패** —
+aggregation 의 내부 읽기는 **mercury/cart/bulk 를 전혀 타지 않는다**(bio 로 직접 읽음).
+즉 순수 서버 내부 읽기에서 이미 깨진 데이터가 보였다. §16(전송 전 손상)과 합치면:
+
+> **손상은 "NVMe → DMA 버퍼 채움" 구간 또는 그 이하에서 발생한다.**
+> (VOS 주소해석 → VEA → bio nvme_rw → SPDK blob read → NVMe)
+
+(단서: 그 로그는 2.9-gds 시기의 것. 2.8 에서 agg-내부-읽기 손상은 아직 재확인 안 함.)
+
+## 17.3 정상 경로 검증 — 순서는 안전하다 (file:line)
+
+| 검증 항목 | 결과 |
+|---|---|
+| fetch bulk 동기 대기 | `obj_local_rw` 는 `obj_bulk_transfer(..., p_arg=NULL)` = sync. eventual 은 부분 실패 시에도 in-flight 전부를 기다림 (`srv_obj.c` obj_bulk_comp_cb/done: 경로) |
+| DMA 해제 시점 | `bio_iod_post_async()` 는 **UPDATE 전용**(`bio_buffer.c` "Async post is for UPDATE only") — fetch 는 bulk 완료 후 동기 해제 |
+| NVMe 채움 대기 | upstream·2.8-wsd 모두 `dma_rw()` 꼬리에서 `if (!bd_async_post) iod_dma_wait()` — fetch 는 `bio_iod_prep()` 반환 전에 채움 완료 |
+| DMA 예약 산술 | `chunk_reserve()`/`dma_map_one()` 은 yield 없이 원자적(xstream 당 협조적 스케줄링) — 이중 예약 창 없음 |
+| WS-D 활성 여부 | hot_pool 미구성 → `bd_hot_ctxt == NULL` → plain 경로. `dma_rw_mixed` 미사용 |
+
+"send-before-fill" 가설(§16 말미)은 **정상 경로에서는 기각** — 순서 보장이 코드에 있다.
+
+## 17.4 남은 용의자 (순위·근거·판별 실험)
+
+**S1. SPDK v26.01 blobstore read** — 상류가 최근 bump 한 새 의존성(DAOS-18943, #18172),
+양 빌드 공유. cluster map 이 stale/경합이면 **미할당 cluster 읽기 = zeros, 잘못된 cluster =
+foreign** — 두 변종이 한 기전으로 설명되는 유일한 후보. 내부 읽기(aggregation)도 같은 경로.
+→ 판별: prereq 만 SPDK v25.x 로 내려 재빌드 A/B (엔진 재빌드 필요, cell1 에서 가능).
+
+**S2. VEA 이중 할당/extent 겹침** — foreign 을 설명하나, at-rest 가 대체로 깨끗한 것(지속성
+없음)과 부딪힘. → 판별: VEA free/alloc 에 겹침 assert 를 넣은 debug 빌드.
+
+**S3. VOS evtree 주소의 일시적 오해석**(동시 overwrite 하) — stale-round 변종은 설명하지만
+**타 객체 데이터는 구조적으로 설명 불가**(evtree 는 객체별). 하위 순위.
+
+**S4. bio 채움 후 clobber** — 예약 산술은 결백 판정. 하위 순위.
+
+**최우선 판별 실험(차기 세션): `bio_iod_prep()` 반환 직후 chunk 내용 해시**(서버 debug 빌드,
+계획서 §5.2 의 S1 지점 하나면 충분해졌다 — §16 이 C1~C3 를, §17.2 가 S2/S3 를 제거).
+- 해시가 이미 틀림 → S1/S2 (채움 이하) 확정 → SPDK 다운그레이드 A/B 로 분기
+- 해시가 맞음 → S4 재부상 (채움 후 clobber)
+
+## 17.5 감사 범위의 한계 (정직 고지)
+
+- `bio_bulk.c` 의 bulk-group 예약 경로(`bulk_map_one`)는 정독하지 못했다 — 단 bypass arm
+  (§15.3)이 그 경로 없이도 손상됐으므로 단독 원인은 아니다.
+- VEA 내부(aging/reuse 창)와 SPDK blobstore 소스는 미감사 — S1/S2 판별 실험이 먼저다.
+- 2.8 서버에서 agg-내부-읽기 손상 재확인(§17.2 단서) 미실시.
+
+---
+
+# 18. ★★★ 완전 upstream 스택에서 재현 확정 (2026-09-01 심야) — 상류 버그로 종결
+
+사용자 지적("아까 upstream 2.8-rc3 에서 테스트 해본 거 아니었나?")이 §13 의 오기(升級)를
+드러냈고, 그 구멍을 측정으로 닫았다. **이번에는 진짜 전 스택 upstream 이다.**
+
+## 18.1 무엇이 스톡인가 (전부 검증)
+
+| 구성요소 | 내용 | 검증 |
+|---|---|---|
+| 서버 코어 | `/var/daos-stockfull` = upstream `841487de8`(v2.9.100-tb 계열) | `libbio.so` 에 WS-D 문자열 **0건**(wsd RPM 은 1건) |
+| 서버 prereq | mercury·UCX·SPDK·ofi 전부 `--build-deps=yes` 스톡 빌드(§12.1 의 그 빌드) | rkey 심볼 0, UCX CUDA 매크로 없음 |
+| 클라이언트 | 같은 `/var/daos-stockfull` (agent·libdaos·재현기 링크) | §12.1 검증 재사용 |
+| provider | `ofi+tcp` (RDMA 없음) | — |
+| 컨테이너 | RP_2G4·chunk 4 MiB·rd_fac:1 (기존과 동일) | — |
+
+## 18.2 결과 — 동일 서명, 동일 자릿수
+
+| | 결과 |
+|---|---|
+| DFS 16×40 ×8 | **86/5120 = 1.68 %** (62·0·0·0·0·0·7·17 — 버스트 패턴 그대로) |
+| raw obj ×3 | **59/1920** (6·7·46) |
+| 서명 | 동일: chunk 하나가 **같은 라운드 다른 객체** 데이터 (`object t9's data (round 0, offset 4194264)` 등), retry STILL WRONG 다수 |
+
+## 18.3 판정
+
+> **ExaStor 패치는 서버·클라이언트·prereq 어디에도 원인이 없다. 이것은 순수 upstream DAOS
+> (2.9.100 계열, MD-on-SSD, provider 불문)의 서버측 fetch 데이터패스 결함이다.**
+
+§17.1 의 서로소 논증에 남아 있던 잔여 가설("서로 다른 두 커스텀 패치가 우연히 같은 서명을
+만든다")까지 소멸. §17.4 의 용의자 순위(S1 SPDK v26.01 blobstore read, S2 VEA)는 그대로
+유효하며, 이제 전부 **upstream 코드** 안에 있다.
+
+상류 제출 관점에서 현재 클러스터 상태가 이상적이다: **재현기·서버·클라 전부 upstream 소스로
+빌드된 상태에서 재현 중** — "귀사 코드만으로 재현된다"를 스크린샷 수준으로 보여줄 수 있다.
+
+## 18.4 스톡 서버 배포 함정 (재현용 레시피)
+
+1. scons 설치본에는 SPDK 스크립트가 없다 → `daos_server` auto-prepare 가
+   "Could not find the SPDK setup.sh script" 로 실패. **빌드 트리에서
+   `external/release/spdk/{scripts,include/spdk}` 를 `<prefix>/share/daos/spdk/` 로 복사**
+   (setup.sh 는 `../include/spdk/pci_ids.h` 를 요구한다).
+2. `daos_server_helper` 는 **root:daos_server + setuid(4750)** 필요(RPM 과 동일하게).
+3. client-5 는 SELinux Enforcing — `/var` 아래 바이너리(var_t)를 systemd 가 실행 거부(203/EXEC).
+   `chcon -R -t bin_t <prefix>/bin` + lib 는 lib_t.
+4. helper 버전 불일치 주의: 셸 PATH 에 /usr/bin 이 앞서면 2.8 helper 를 집는다("version
+   mismatch server 2.9.100 / helper 2.8.0"). systemd drop-in 의 PATH 를 prefix 우선으로.
+5. cell1 wedge 레시피(§15.7)는 스톡 서버에서도 동일하게 유효했다.
+
+## 18.5 현재 환경
+
+- cell1/cell2: **완전 스톡 2.9.100 서버**(`/var/daos-stockfull`), provider `ofi+tcp`,
+  pool `gdspool`(SCM 8G+NVMe 200G/rank), 컨테이너 `ci_m28`·`ci_obj`. 양 rank Joined.
+- client-5: 스톡 agent(systemd, SELinux 라벨 수정됨), `/root/dfs_integrity_stock`·
+  `/root/obj_integrity_stock`(둘 다 stockfull 링크). 결과: `/root/stocksrv/`.
+- ExaStor 빌드로 복귀: drop-in 을 `/usr/bin/daos_server`(2.8-wsd RPM) 또는
+  `/opt/daos-gds/bin`(2.9-gds) 로 + 재포맷.
+
+---
+
+# 19. ★★★ 서버 계측 확정 — 손상은 NVMe→DMA 채움에서 발생 (2026-09-01 심야)
+
+계획서 §5.2 의 서버측 해시 지점을 **하나로 압축**해 계측했다. 완전 upstream 스택(§18)에
+디버그 패치를 얹어 fetch 버퍼를 **bulk 전송 직전**에 감사했다.
+
+## 19.1 계측 (upstream `841487de8` + 디버그, dev 박스 소스 반영)
+
+- `src/object/srv_obj.c`: `obj_local_rw()` 의 `bio_iod_prep()` 성공 직후, fetch 이면
+  `fillhash_check_sgl()` 로 각 iod 의 bio SGL 을 감사. env `FILLHASH_DEBUG=1` gate.
+- **핵심 설계 교정**: 처음엔 bio 계층(`bio_buffer.c`)에서 버퍼 자기일관성만 봤는데,
+  **chunk 전체가 통째로 다른 객체로 치환되면 자기일관(전 워드 동일 tid·단조 offset)이라
+  검출 못 함**. → OID 를 아는 object 계층으로 옮기고, obj_integrity 가 객체를
+  `oid.lo = 0xC0FFEE00 + tid` 로 만드는 것(set_oid 는 lo 보존)을 이용해 **기대 tid 대조**로
+  전환. bio 계측은 원복.
+- 빌드: `/var/daos-stockfull` 증분(`scons --build-deps=no`), `libobj.so` 재링크·양 cell 배포.
+
+## 19.2 결과 — 채움 직후 버퍼가 이미 틀렸다
+
+client 65/640 손상과 **같은 시각**, 양 rank 엔진 로그:
+
+```
+srv_obj.c:307 fillhash_check_sgl() FILLHASH <oid> iod0 iov0 exp_tid=7 len=4194304:
+    foreign=524288 zero=0 offbad=0, first bad at 0 val t14 r0 off 4194304
+    (buffer wrong BEFORE bulk send)
+```
+
+- **cell1 107건 + cell2 147건**, 전부 `foreign=524288` = **4 MiB 워드 전량**이 남의 데이터.
+  즉 fetch 한 chunk 버퍼가 **통째로 다른 객체의 chunk 로 채워졌다**(exp t7 → t14 의 off
+  4194304 데이터, 객체도 offset 도 다름).
+- `zero=0` — 이 라운드엔 zeros 변종 없음(foreign 변종만).
+- 위치: `bio_iod_prep()` 반환 직후 = **NVMe→DMA 채움 완료 시점**. mercury·cart·bulk·RDMA·
+  클라이언트 수신 경로는 **아직 실행되지도 않았다.**
+
+## 19.3 판정 — 분기 트리 종료
+
+> **손상은 서버의 fetch 채움 경로에서 발생한다: VOS extent 주소해석 → VEA → SPDK blobstore
+> read → NVMe. bulk/전송/클라이언트는 전부 무죄(코드가 아직 안 돎).**
+
+§17.4 의 남은 용의자 S1(SPDK v26.01 blobstore read)·S2(VEA 이중할당)만 남고, "채움 후
+clobber"(S4)는 계측으로 제거. §19.2 의 "chunk 전체 = 다른 객체" 형상은 S1(잘못된 cluster
+매핑)·S2(extent 겹침) 둘 다와 부합. 다음 판별:
+- **SPDK v26.01 → v25.x 다운그레이드 A/B**(prereq 만 교체 재빌드): clean 이면 S1 확정.
+- VEA alloc/free 겹침 assert 디버그 빌드: 걸리면 S2 확정.
+
+## 19.4 NVMe 물리 교차 점유는 아님 (사용자 질의 확인)
+
+`dmg storage query list-devices`: **8 NVMe ↔ target 0–7 이 1:1**, 공유 없음. 따라서 "다른
+객체 데이터"는 **두 SSD 가 서로 새는 것이 아니라 한 target 내부**(같은 SSD 의 blob 공간에
+여러 객체 chunk 공존)에서 cluster 오매핑/extent 겹침으로 발생. → S1/S2 와 일치. 소스라우팅은
+양 cell 에 적용 유지 확인(정책라우팅 100/101, arp_ignore/announce, rp_filter=2) — fetch 채움
+결함과는 무관(서버 내부라 네트워크 이전 문제).
+
+## 19.5 환경/자산
+
+- 디버그 서버 실행중: `/var/daos-stockfull`(upstream + fillhash 패치), `FILLHASH_DEBUG=1`
+  양 cell yml. provider ofi+tcp, pool gdspool, 컨테이너 ci_m28·ci_obj.
+- 디버그 패치 소스: dev 박스 `~/src/Flexa/daos` (branch `port/2.8-wsd` 워킹트리 —
+  srv_obj.c 에 fillhash_check_sgl/enabled, **커밋 안 함**. cell1 `/var/daosbuild/daos-stock`
+  에 동일 패치 적용본). 원복하려면 `/tmp/srv_obj.c.orig` 복원 후 재빌드.
+- 결과 로그: client-5 `/root/fh2/`, 서버 `/var/log/daos/daos_engine.0.log`.
+
+---
+
+# 20. ★★★ 손상이 안 나는 대조 클러스터 — 차이는 bio 백엔드 class (2026-09-01)
+
+사용자 제공: **192.168.34.30/31/32(ExaCI4)에서는 재현 안 됨.** 접속 `root/gluesys!!`(직결,
+dev 박스에서). 34.30=client(`ExaCI4-3J`), 34.31=server(`FlexA_3433_1-A`), access_points=[34.31].
+
+## 20.1 두 환경 비교
+
+| 축 | 우리(손상) | 34.x(정상) |
+|---|---|---|
+| DAOS | source `841487de8`(+wsd/gds) 및 stockfull | RPM `2.9.100-4.exastor.402.g64a818563` |
+| **bio class** | **`nvme` (SPDK userspace, vfio-pci)** | **`kdev` (커널 블록 디바이스)** |
+| vfio 바인딩 | 8개 | **0개** |
+| 데이터 디바이스 | 실 PASCARI NVMe ×8 | QEMU 가상 NVMe(1b36) + **zvol** `/dev/zvol/daoshdd/daosdata` |
+| bdev_roles | (ram=meta) + (nvme=data) 분리 | `[wal,meta,data]` 단일 디바이스 |
+| targets/engine | **8** | **1** |
+| provider | ucx+rc_v → ofi+tcp | ofi+verbs;ofi_rxm |
+| **SPDK** | **v26.01** | **v26.01 (daos-spdk-26.01-2)** ← 동일 |
+| 하드웨어 | 베어메탈 | VM |
+
+## 20.2 해석 — SPDK 버전이 아니라 SPDK userspace NVMe 경로
+
+**양쪽 SPDK 26.01 동일** → §17.4/§19 의 "SPDK v26.01 회귀" 프레임은 **버전 문제가 아니다**로
+정제. 남는 최유력 단일 차이는 **bio class: `nvme`(SPDK vfio userspace blobstore-over-raw-NVMe)
+vs `kdev`(커널 블록)**. 우리 §19 결론(손상 = NVMe→DMA 채움, 즉 blobstore read)과 정확히
+정합: **kdev 는 SPDK userspace NVMe 읽기 경로를 통째로 우회**하므로 손상이 안 나는 것과 부합.
+
+단 34.x 에는 교란요인이 많다(targets 1 vs 8, VM 가상디스크, provider verbs, RPM 빌드 상이).
+1-target VM 이 애초에 우리의 동시성/멀티타깃 부하를 못 만든다는 가능성도 배제 못 함. 그래서
+34.x 는 "kdev 가 원인"의 증명이 아니라 **강한 정황 + 단일변수 실험 설계의 근거**다.
+
+⚠️ 관측 시점: 34.31 daos_server 는 **현재 inactive**(구동 안 함). 사용자의 "문제 없음"은
+과거 구동 시 관측으로 이해. config 비교는 유효.
+
+## 20.3 결정적 단일변수 실험 (다음 세션)
+
+우리 클러스터에서 **다른 건 모두 고정하고 bio class 만 `nvme`→`kdev` 로**:
+1. `dmg storage` 정지 → vfio 에서 NVMe 언바인드 → 커널 nvme 드라이버로 복귀
+   (`/dev/disk/by-id/nvme-...`).
+2. server.yml storage tier 를 `class: kdev` + `bdev_list:[by-id 경로들]` 로. SCM=ram 유지.
+3. 재포맷 → 같은 obj_integrity/FILLHASH 배터리.
+- **kdev 에서 clean → SPDK userspace NVMe 읽기 경로(S1) 확정.** upstream 제출의 핵심 재현
+  경계가 된다("class:nvme 에서만, class:kdev 에선 안 남").
+- kdev 에서도 손상 → SPDK 아래(VEA/VOS 주소해석, S2) 또는 targets≥2 조건으로 범위 이동.
+
+보조 실험(교란 분리): 우리 클러스터를 **targets:1** 로 줄여도 나는지(멀티타깃이 조건인지),
+그리고 34.x 서버를 다시 띄워 **targets 를 8 로 올리고 class 를 nvme(가능하면)로** 바꿔 재현
+시도. 다만 34.x 는 가상디스크라 SPDK nvme class 부적합할 수 있음.
+
+## 20.4 부수 확정
+- **SPDK 버전은 범인이 아니다**(양쪽 26.01). §19.3 의 "SPDK v25 다운그레이드 A/B"는 우선순위
+  강등 — 대신 **class kdev A/B** 가 1순위.
+- 34.x 는 이전 세션이 "대조군으로 쓰지 말라"던 CI(35.x)와 같은 계열(VM·verbs·targets1·zvol)
+  이나 IP·빌드가 다름. verbs 라서가 아니라 **kdev·1-target 이라 안 나는 것**으로 재해석.
+
+---
+
+# 21. class:kdev A/B — arm A 확정, arm B 는 구성 장벽으로 미완 (2026-09-01)
+
+§20 의 1순위 실험(`class: nvme` → `kdev` 단일변수)을 시도했다. **결론: arm B 를 우리 하드웨어에
+세울 수 없었다.** 원인 격리는 진전 없음, 대신 계측의 적용 범위와 kdev 구성 요건을 배웠다.
+
+## 21.1 arm A (class:nvme) 기준선 — 같은 세션 대조로 확보
+
+| 워크로드 | 클라이언트 손상 | 서버 FILLHASH(실손상) |
+|---|---|---|
+| obj_integrity ×8 (16×40) | **67/5120** | **171건** (cell1 108 + cell2 63) |
+| dfs_integrity ×6 (16×40) | 148/3840 | **0건** |
+
+**중요 — FILLHASH 는 obj_integrity 에만 유효하다.** 계측이 `oid.lo = 0xC0FFEE00+tid` 센티넬로
+기대 tid 를 얻으므로, DFS 객체(센티넬 없음)에서는 조용히 건너뛴다. DFS 손상 148건에 FILLHASH
+0건인 것은 "DFS 는 채움이 정상"이 아니라 **검사 미적용**이다. §19 의 결론은 obj 경로 실측이라
+그대로 유효하되, DFS 경로의 채움 단계 검증은 별도 계측이 필요하다(오해 방지).
+
+**오탐 1종 확인**: `foreign=0 zero=1 offbad=0` 은 t0 객체 offset 0 의 첫 워드가
+`tag_of(0,0,0)==0` 이라 0 과 구별되지 않는 것 — 진짜 손상 아님. 집계에서 제외해야 한다.
+
+## 21.2 arm B (class:kdev) — 세우지 못함
+
+시도한 것과 각 단계의 벽:
+
+1. vfio → 커널 드라이버 복귀(setup.sh reset), by-id 경로 8개 확인 → OK.
+2. yml `class: nvme` → `class: kdev` + `bdev_list:[by-id 8개]` (targets 8 유지) → 기동 시
+   `bio_xstream.c:584 subsys_init_cb() subsystem init failed: -22`(EINVAL) →
+   `failed to init bdevs: DER_INVAL`.
+3. 로그의 `bdev_name2roles() bdev name:AIO_cell1_N_1_0, bdev role:0` 을 근거로 34.x 처럼
+   `bdev_roles: [wal, meta, data]` 추가 → `SCM format required` 로 진행(MD-on-SSD 로 인식),
+   `control_metadata: path:` 도 추가 → 포맷은 8 디바이스 성공.
+4. 그러나 엔진은 여전히 `failed to init spdk context ... DER_INVAL(-1003)`.
+
+미해결 가설(다음 세션):
+- **4 KiB 논리 섹터**: 우리 NVMe 는 `logical_block_size=4096`, 34.x 는 512 B QEMU 디스크.
+  SPDK AIO 자체 검사(512 이상·2^n)는 통과하므로 상위(bio blob/cluster 정렬, WAL 요건)에서
+  거부되는 것으로 의심. `block_size` 명시 주입 경로가 DAOS yml 에 없음.
+- **8 디바이스에 wal+meta+data 동시 롤**: 34.x 는 디바이스 1~2개. 롤 분리(예: 1개 wal/meta,
+  나머지 data)로 재시도할 가치 있음.
+- `class: file`(sparse file bdev)로 대체하면 SPDK userspace NVMe 경로를 우회하면서 4K 문제를
+  피할 수 있어, **kdev 대신 file 로 같은 판별을 얻는 우회로**가 유력하다.
+
+## 21.3 판정과 다음 순서
+
+- §20 의 "kdev 가 clean 의 원인" 가설은 **여전히 미검증**. 34.x 는 교란요인(targets 1, VM,
+  512 B, 단일 디바이스, verbs, 다른 RPM)이 많아 정황 이상으로 못 쓴다.
+- 우선순위 재조정:
+  1. **`class: file` A/B** — SPDK userspace NVMe 우회를 4K 섹터 문제 없이 달성(파일 bdev).
+     clean 이면 §19 의 "채움 = SPDK NVMe read" 를 강하게 지지.
+  2. **targets 8 → 1** 단일변수(멀티타깃이 조건인지) — 구성 변경이 가벼움.
+  3. kdev 재도전: 롤 분리 + 디바이스 수 축소.
+- 환경은 **arm A(class:nvme)로 원복 완료**: 양 rank Joined, pool gdspool, ci_m28·ci_obj 재생성,
+  fillhash 계측 서버 유지. 백업 `/root/daos_server.yml.nvme-arm`(양 cell).
+
+---
+
+# 22. 정정: 34.x 는 nvme blob 으로도 통과 — kdev 가설 폐기, 동시성 축도 배제 (2026-09-02)
+
+사용자 보고: **34.x 에서 `class: nvme`(SPDK blob) 구성으로도 정상 통과.** §20/§21 의
+"kdev 가 차이" 가설은 **폐기**한다.
+
+## 22.1 34.x 가 통과시킨 실제 구성 (`/etc/daos/daos_server_nvme_blob.yml`, 9/1 23:45)
+
+```yaml
+disable_vfio: true        # ← UIO, not VFIO
+disable_hotplug: true
+nr_hugepages: 2048
+control_metadata: {path: /var/daos/control_meta_nvme_blob_20260901}
+engines:
+- targets: 1              # ← 우리 8
+  nr_xs_helpers: 0        # ← 우리 2
+  storage:
+  - {class: ram, scm_size: 4}
+  - {class: nvme, bdev_list: ['0000:00:03.0','0000:00:04.0'],
+     bdev_roles: [wal, meta, data]}   # ← MD-on-SSD 롤; 우리는 롤 없는 ram+nvme 분리
+```
+디바이스는 **QEMU 가상 NVMe 2개, 논리섹터 512 B**(lspci 실 NVMe 0개). provider ofi+verbs;ofi_rxm.
+
+## 22.2 동시성 축(targets/helpers) 실측 — 조건 아님, 오히려 악화
+
+우리 하드웨어에서 그들의 동시성 설정만 맞췄다(`targets: 1`, `nr_xs_helpers: 0`, 나머지 고정).
+2-target 풀이 되므로 컨테이너·객체 oclass 를 **RP_2G1** 로(oclass 는 §12.4 에서 비-gate 확정).
+
+| arm | 클라이언트 | 서버 FILLHASH |
+|---|---|---|
+| targets 8 / helpers 2 (§21.1) | 67/5120 = **1.3 %** | 171 |
+| **targets 1 / helpers 0** | **271/2560 = 10.6 %** | **562** (cell1 134 + cell2 428) |
+
+⇒ 서버 동시성(멀티타깃·helper offload)은 **원인도 조건도 아니다.** 단일 target·offload 없음에서
+오히려 5배 심해졌다(부하가 한 xstream 에 집중되어 노출이 커진 것으로 해석). 서명 동일
+(`t4` 의 chunk0 이 `t2 r1 off 4194304` 데이터로, foreign=524288).
+
+## 22.3 남은 차이 축 (우선순위 재정렬)
+
+| 축 | 우리(손상) | 34.x(정상) | 평가 |
+|---|---|---|---|
+| **논리 섹터** | **4096 B** (실 PASCARI) | **512 B** (QEMU) | ★ 최우선. blob cluster/정렬 산술이 4K 에서만 깨질 수 있음. §21.2 의 kdev EINVAL 도 4K 정황 |
+| **디바이스 수** | 8 | 2 | ★ blob 이 여러 디바이스에 걸칠 때만? |
+| **bdev_roles** | 없음(ram SCM + nvme data 분리) | `[wal,meta,data]` MD-on-SSD | ★ 메타데이터 위치가 다름 = VOS/blob 레이아웃 상이 |
+| disable_vfio | false(VFIO) | **true(UIO)** | 중. SPDK DMA 매핑 경로 상이 |
+| 하드웨어 | 베어메탈 실 NVMe | VM 가상 NVMe | 중(가상 디스크가 결함을 감출 수 있음) |
+| DAOS 빌드 | source `841487de8` | RPM `exastor.402.g64a818563` | 중. 커밋 미확인(로컬 트리에 없음 — fetch 필요) |
+| targets/helpers | 8/2 | 1/0 | **배제(§22.2)** |
+| provider | ofi+tcp | ofi+verbs;ofi_rxm | **배제(§15.5)** |
+| oclass | RP_2G4/RP_2G1 | RP_2G1 | **배제(§12.4)** |
+| SPDK 버전 | v26.01 | v26.01 | **동일** |
+
+## 22.4 다음 실험 순서
+
+1. **`bdev_roles: [wal,meta,data]` + 디바이스 2개**로 34.x 레이아웃 모방(우리 하드웨어).
+   clean 이면 "메타데이터 위치/디바이스 수" 축, 계속 손상이면 하드웨어(4K/실NVMe)로 좁혀진다.
+2. **`disable_vfio: true`(UIO)** 단일변수.
+3. **4K vs 512B**: 우리 SSD 를 512 B 포맷으로 재구성(`nvme format --lbaf`)하거나, 34.x 에
+   4K 가상 디스크를 붙여 재현 시도 — 이 축이 남으면 사실상 결정적.
+4. exastor RPM 커밋 `64a818563` fetch 후 `841487de8` 와 bio/vos/vea diff.
+
+환경 현재: **targets 1 / helpers 0, RP_2G1 컨테이너**로 두었다(손상률 10.6 % 로 재현이 빨라
+후속 A/B 에 유리). 8/2 복귀는 `/root/daos_server.yml.nvme-arm` 백업 참조.
+
+## 22.5 34.x 저장 레이아웃 모방 실측 — 이 축도 배제 (오히려 24 %)
+
+§22.4-1 실행: 우리 하드웨어에 34.x 의 레이아웃을 맞췄다 — **디바이스 2개**(0000:02·03:00.0),
+**`bdev_roles: [wal, meta, data]`**(MD-on-SSD), `control_metadata`, **scm_size 4**,
+targets 1 / helpers 0 유지.
+
+| arm | 클라이언트 손상 | 서버 FILLHASH |
+|---|---|---|
+| targets 8/helpers 2, 8dev, 롤 없음(ram SCM+nvme data) | 67/5120 = 1.3 % | 171 |
+| targets 1/helpers 0, 8dev, 롤 없음 | 271/2560 = 10.6 % | 562 |
+| **targets 1/helpers 0, 2dev, MD-on-SSD 롤** | **618/2560 = 24.1 %** | **1680** (644+1036) |
+
+서명 동일(`t12` chunk5 ← `t10 r0 off 25165824`, foreign=524288, retry STILL WRONG).
+
+⇒ **저장 레이아웃(디바이스 수·메타데이터 위치/롤)도 원인이 아니다.** 34.x 구성을 하나씩 맞출
+때마다 손상률이 **1.3 % → 10.6 % → 24.1 %** 로 올라갔다 — 즉 34.x 가 통과하는 이유는
+**소프트웨어 구성이 아니다.** (구성을 좁힐수록 노출이 커지는 방향이므로, 34.x 의 통과는 구성이
+아닌 다른 요인 덕이다.)
+
+### 소프트웨어 구성 축 소진 — 남은 것은 하드웨어/빌드
+
+| 축 | 상태 |
+|---|---|
+| targets/helpers, 디바이스 수, bdev_roles/메타 위치, oclass, provider, SPDK 버전, bio class(kdev 시도) | **전부 배제 또는 무관** |
+| **논리 섹터 4096 B vs 512 B** | ★ 미검증 — 최우선 |
+| **실 NVMe vs QEMU 가상 NVMe** | ★ 미검증 (가상 디스크가 결함을 감출 가능성) |
+| disable_vfio(UIO) | 미검증 (SPDK DMA 매핑 경로) |
+| DAOS 빌드 `exastor.402.g64a818563` vs `841487de8` | 미검증 (커밋 로컬에 없음) |
+
+### 다음 실험 (개정)
+1. **`disable_vfio: true`(UIO)** — 가장 값싼 남은 단일변수(yml 한 줄, 재포맷 불필요할 수도).
+2. **512 B 재포맷**: `nvme format -l <lbaf_512>` 로 데이터 SSD 1~2개를 512 B 로 바꿔 A/B.
+   PASCARI 가 512 B lbaf 를 지원하는지 `nvme id-ns` 로 먼저 확인. **디스크 내용 파기됨**.
+3. exastor RPM 커밋 fetch 후 bio/vos/vea diff (그 빌드에 수정이 들어있을 가능성).
+4. 34.x 에 **4 KiB 가상 디스크**를 추가해 거기서 재현되는지 — 역방향 검증으로 가장 결정적.
+
+환경: **targets 1/helpers 0, 2dev, MD-on-SSD, RP_2G1, pool 206 GB** 유지(손상률 24 % 로 A/B 가
+가장 빠름). 이전 arm 백업 `/root/daos_server.yml.nvme-arm`(8dev/8targets), `/root/daos_server.yml.t1arm`.
+
+---
+
+# 23. ★★ 역방향 검증: 34.x 를 4 KiB 섹터로 바꿔도 통과 — 섹터 크기 배제 (2026-09-02)
+
+§22.5 의 §22.4-4("34.x 에 4 KiB 디스크를 붙여 재현 시도")를 실행했다. **우리 장비를 파괴적으로
+재포맷할 필요가 없었다**: 34.31 의 QEMU NVMe 가 `LBA Format 4 = 4096 B` 를 지원해 그 자리에서
+바꿀 수 있었다.
+
+## 23.1 절차 (재현용)
+
+```bash
+# 34.31 (root/gluesys!!, dev 박스 직결). 두 데이터 디바이스 = 0000:00:03.0/04.0 = nvme0/1
+nvme id-ns /dev/nvme0n1 -H | grep "LBA Format"   # lbaf 4 = 4096B 지원 확인
+nvme format /dev/nvme{0,1}n1 --lbaf=4 --force    # 512B -> 4096B (내용 파기)
+cat /sys/block/nvme0n1/queue/logical_block_size   # 4096 확인
+```
+기동 함정 4건: ① `ib0` 에 IPv4 없음 → `fabric_iface: ens19`(10.10.34.31), provider 는
+§15.5 로 비-gate 이므로 `ofi+tcp` 로 대체 ② `/var/run/daos_server` 디렉터리 필요
+③ nohup/setsid 로는 ssh 종료 시 죽음 → `systemd-run --unit=... --collect`
+④ 34.31 은 daos-devel 없음 → cell1 의 `/var/daos-stockfull/include` 를 복사하고
+`libuuid-devel` 설치, `.so` 심볼릭 없어 `libdaos.so.2`·`libgurt.so.4`·`libdaos_common.so`
+직접 링크.
+
+구성: `class: nvme`(SPDK), 디바이스 2개 **4096 B**, `bdev_roles:[wal,meta,data]`,
+targets 1 / helpers 0, `disable_vfio: true`, pool `p4k` 63 GB, 컨테이너 SX(단일 rank).
+
+## 23.2 결과 — 4 KiB 에서도 통과
+
+| arm | 결과 |
+|---|---|
+| 34.31, 4 KiB 섹터, 16×20 ×3 | **0/960** |
+| 34.31, 4 KiB 섹터, 16×40 ×4 | **0/2560** |
+
+⇒ **논리 섹터 크기는 원인이 아니다.** §22.5 의 최우선 가설 기각. (§21.2 의 kdev EINVAL 은
+별개의 구성 문제였을 뿐 손상과 무관.)
+
+## 23.3 남은 차이 축 — 두 개로 좁혀졌다
+
+소프트웨어 구성(§22.2·§22.5)과 섹터 크기(§23.2)가 모두 배제된 뒤 남은 것:
+
+| 축 | 우리(손상 1.3~24 %) | 34.x(0/3520) | 비고 |
+|---|---|---|---|
+| **DAOS 빌드** | source `841487de8`(upstream) | RPM **`exastor.402.g64a818563`** | 커밋이 우리 트리에 없음 → **그 빌드에 수정이 들어있을 가능성** |
+| **하드웨어/플랫폼** | 베어메탈, 실 PASCARI NVMe ×2~8, EPYC 다중 NUMA | **KVM VM**, QEMU 가상 NVMe, 단일 NUMA | 가상 디스크가 결함을 감출 수 있음(타이밍·큐 깊이·DMA 경로) |
+| disable_vfio | false(VFIO) | **true(UIO)** | 아직 미검증 — 값싼 단일변수 |
+
+## 23.4 다음 실험 (개정, 값싼 순)
+
+1. **우리 클러스터에 `disable_vfio: true`(UIO)** — yml 한 줄. clean 이면 VFIO/IOMMU DMA 경로가
+   조건(플랫폼 축과 연결).
+2. **exastor 커밋 `64a818563` 확보** — `git fetch gitlab`(exastor/daos) 후
+   `841487de8` 와 `src/{bio,vos,vea,object}` diff. 수정이 있으면 그것을 우리 소스빌드에
+   cherry-pick 해 A/B → 확정되면 상류 제출은 "이미 고쳐진 버그" 로 프레임이 바뀐다.
+3. **34.x 에 우리 빌드 투입**(반대 방향): 34.31 에 `/var/daos-stockfull` 서버를 올려
+   같은 VM 에서 재현되는지. 재현되면 **빌드 차이가 원인**으로 확정, 안 되면 플랫폼 축.
+
+3번이 가장 결정적이다 — 같은 VM·같은 디스크에서 빌드만 바꾸는 단일변수다.
+
+## 23.5 34.x 환경 상태 (원복 필요 항목)
+- **두 QEMU NVMe 를 4096 B 로 재포맷했다**(원래 512 B). 원복: `nvme format --lbaf=0`.
+- 추가한 것: `/etc/daos/daos_server_4k.yml`, `/etc/daos/daos_agent_4k.yml`,
+  transient 유닛 `daos-srv4k`·`daos-agent4k`(둘 다 실행중), pool `p4k`, 컨테이너 `ci_obj`,
+  `/root/{obj_integrity,obj_integrity.c,dh/}`, `libuuid-devel` 설치.
+- 사용자의 원본 `daos_server_nvme_blob.yml`·`daos_control_nvme_blob.yml` 은 **그대로 보존**.
+
+---
+
+# 24. 빌드 축 배제 — 34.x 의 커밋에 수정은 없다 (2026-09-02)
+
+§23.4-2 실행. `git fetch gitlab` 로 34.x RPM 의 커밋 **`64a818563b`**("ci(flexa): RPM 버전
+가드가 set -e 로 죽던 회귀 수정 (#400)")을 확보했다. 우리 빌드(`841487de8`) 대비
+**81 커밋 앞**(우리가 16 앞 — 분기 관계).
+
+## 24.1 데이터패스 diff
+
+| 경로 | 우리 → 34.x |
+|---|---|
+| **`src/bio`** | **완전 동일** (0 변경) |
+| **`src/vea`** | **완전 동일** (0 변경) |
+| `src/vos` | 15 files, 793+/56− |
+| `src/object` | 11 files, 398+/22− |
+| `src/common` | 5 files, 152+/1− |
+
+**§19 가 손상을 확정한 채움 경로(`bio_buffer.c`·`bio_bulk.c`·`vea_alloc.c`)는 두 빌드가
+바이트 동일하다.**
+
+vos/object 변경의 실체(커밋 로그 + diff 육안 확인):
+- **프로젝트 쿼터(Lustre projid)** 기능 일습 — `ic_projid`/`ic_proj_held` 추가,
+  `vos_update_begin()` 시그니처에 projid 추가, `ds_obj_reproject_handler()` 신규,
+  `DAOS_PROP_CO_SPACE_LIMIT/SPACE_AMP` 컨테이너 속성.
+- **flat-dkey 존재확인 fetch 크래시 가드**(`iod_nr == 0` 일 때 `ic_iods[0]` 역참조 방지) —
+  우리 워크로드는 항상 `iod_nr == 1` 이므로 무관.
+- DTX 커밋 블롭 ENOSPC 폴백 수정.
+
+데이터 이동 키워드(`biov|bio_iod|dma|bulk|blob|cluster`) 검색 결과 4건은 전부 주석 또는
+DTX 커밋 블롭(쿼터/ENOSPC) 문맥 — **fetch 데이터 흐름 변경 0건.**
+
+## 24.2 판정
+
+> **34.x 가 통과하는 이유는 빌드가 아니다.** 그 빌드는 손상 경로를 우리와 동일한 코드로
+> 갖고 있고, 추가된 것은 쿼터·크래시가드·DTX ENOSPC 뿐이다. "이미 고쳐진 버그" 프레임은
+> 성립하지 않으며, 상류 제출은 그대로 유효하다.
+
+## 24.3 남은 축은 하나 — 플랫폼
+
+§22(구성)·§23(섹터)·§24(빌드)가 모두 배제됐다. 남은 차이:
+
+| | 우리(손상 1.3~24 %) | 34.x(0/3520) |
+|---|---|---|
+| 플랫폼 | 베어메탈 EPYC, 다중 NUMA | **KVM VM, 단일 NUMA** |
+| 디스크 | 실 PASCARI NVMe(4 K/512 무관 — §23) | **QEMU 가상 NVMe** |
+| DMA 바인딩 | VFIO | **UIO (`disable_vfio: true`)** |
+
+**다음 실험 순서(개정)**
+1. **`disable_vfio: true`(UIO)** 를 우리 클러스터에 — 남은 축 중 유일하게 값싼 단일변수.
+   clean 이면 **VFIO/IOMMU DMA 매핑 경로**가 조건 → 상류 이슈의 재현 조건이 크게 좁혀진다.
+2. **34.31 에 우리 stockfull 서버 투입**(§23.4-3) — 이제 빌드가 배제됐으니 이 실험의 의미는
+   "같은 VM 에서 우리 빌드도 clean 인가" 확인(플랫폼 축 확정용 음성 대조).
+3. 실 NVMe vs 가상: 우리 클러스터에 `class: file`(sparse file) 로 가상 디스크 흉내 → clean 이면
+   실 NVMe 하드웨어/드라이버 상호작용으로 좁혀진다.
+
+---
+
+# 25. UIO arm 시도 — 우리 하드웨어에서 구조적으로 불가 (2026-09-02)
+
+§24.3-1 실행: `disable_vfio: true`(UIO) 단일변수.
+
+## 25.1 진행과 벽
+
+1. yml 에 `disable_vfio: true` 추가 → 기동 실패:
+   `code = 614 "disable_vfio: true in config while running as non-root user with NVMe devices"`.
+   ⇒ **UIO 는 daos_server 를 root 로 돌려야 한다**(34.x 는 수동 root 실행이었다).
+2. systemd drop-in 에 `User=root/Group=root` 추가 → **UIO 바인딩 성공**
+   (`uio_pci_generic` 2개, vfio 0개).
+3. 그러나 포맷 시 `EAL: Bus (pci) probe failed` →
+   `NVMe SSDs [0000:02:00.0 0000:03:00.0] not found`.
+
+## 25.2 원인 — MSI-X
+
+```
+lspci -vv 0000:02:00.0 → Capabilities: MSI-X: Count=257
+modinfo uio_pci_generic → "Generic UIO driver for PCI 2.3 devices"
+```
+`uio_pci_generic` 은 **PCI 2.3 legacy INTx 전용**이라 MSI-X 257 벡터를 쓰는 PASCARI NVMe 를
+DPDK 가 probe 하지 못한다. DPDK 로 MSI-X 장치를 UIO 로 쓰려면 `igb_uio`(out-of-tree)가
+필요한데 이 커널엔 없다. 34.x 의 QEMU 가상 NVMe 는 MSI-X 요구가 가벼워 통과했던 것.
+
+⇒ **UIO 축은 우리 하드웨어에서 시험 불가**(실 NVMe + in-tree 커널 조합의 구조적 제약).
+"VFIO 가 조건인가"는 여전히 미검증이며, **34.x 의 UIO 통과는 하드웨어(가상 NVMe) 덕이라
+UIO 자체의 공로로 볼 근거도 없다.**
+
+## 25.3 환경 원복
+`/root/daos_server.yml.vfio-arm` 복원, drop-in 의 root 오버라이드 제거, VFIO 재바인딩,
+재포맷 → 양 rank Joined(2 디바이스, MD-on-SSD, targets 1/helpers 0 = 24 % arm 유지).
+
+## 25.4 다음 실험 (남은 것)
+
+1. **34.31 에 우리 stockfull 서버 투입** — 같은 VM·같은 가상 디스크에서 **빌드만 우리 것**으로.
+   §24 로 빌드가 배제됐으니 예상은 clean 이고, 그러면 **플랫폼(가상 NVMe/VM)이 조건**으로 확정.
+   34.31 에 이미 헤더·재현기·systemd 유닛 절차가 준비돼 있어 값이 싸다.
+2. **우리 클러스터에 `class: file`** (sparse file bdev) — 실 NVMe 를 파일로 대체해 SPDK
+   userspace 경로는 유지하되 하드웨어를 제거. clean 이면 **실 NVMe 드라이버/디바이스 상호작용**
+   으로 좁혀지고, 손상되면 **SPDK blobstore 로직 자체**로 좁혀진다. §21.2 의 kdev 와 달리
+   file bdev 는 4 K 섹터 제약이 없어 성립할 가능성이 높다.
+3. 실 NVMe 축이 남으면: 다른 모델/다른 서버의 실 NVMe 에서 재현 시도(하드웨어 일반성 확인).
+
+2번이 가장 정보량이 크다 — "SPDK 로직 vs 실 하드웨어"를 우리 장비 안에서 가른다.
+
+---
+
+# 26. ★★★ 빌드 스왑 결정 실험 — 우리 빌드도 34.x VM 에서 깨끗: 플랫폼이 조건 (2026-09-02)
+
+§25.4-1 실행. **같은 VM·같은 가상 디스크·같은 구성에서 서버 빌드만 우리 것으로** 바꾸는
+단일변수 실험. §24 에서 빌드가 배제됐으므로 이건 플랫폼 축을 확정하는 음성 대조다.
+
+## 26.1 절차
+
+1. cell1 `/var/daos-stockfull`(519 MB, tar 177 MB) → dev 박스 경유 → 34.31 `/var` 에 전개.
+   **FILLHASH 계측 포함 확인**(`libobj.so` 에 문자열 2건), `daos_server_helper` setuid 복원.
+2. 그들 유닛(`daos-srv4k`) 정지 → `/etc/daos/daos_server_ourbuild.yml`(그들 4K 구성 복사 +
+   경로만 분리 + `FILLHASH_DEBUG=1`) 로 우리 서버를 `systemd-run --unit=daos-ours` 로 기동.
+3. 함정 2건: ① 이전 arm 들의 tmpfs 3개(`/mnt/daos{0,1,_nvme_blob0}`)가 RAM 을 잡아
+   `MemAvailable 3.3 GiB < 3.6 GiB` 로 포맷 거부 → umount + drop_caches 로 9 GiB 확보.
+   ② `scm_size: 2` 는 최소값 미달(code 730) → 4 유지.
+4. 포맷 → rank 0 Joined, pool `pours` 63 GB, 컨테이너 `ci_obj`(SX), 재현기를 우리 lib 로 재링크.
+
+## 26.2 결과
+
+| 서버 빌드 | 플랫폼 | 결과 |
+|---|---|---|
+| 34.x exastor RPM `64a818563` | 34.31 VM, 가상 NVMe | 0/3520 (§23) |
+| **우리 stockfull `841487de8` + fillhash** | **34.31 VM, 같은 가상 NVMe** | **0/960 → 0/3520, FILLHASH 0건** |
+| 우리 stockfull `841487de8` + fillhash | **cell1/cell2 베어메탈, 실 NVMe** | **1.3 % → 24 %**, FILLHASH 171~1680건 |
+
+⇒ **빌드는 완전히 무죄다.** 같은 소스·같은 바이너리가 VM 에서는 3520 읽기 무손상, 베어메탈
+에서는 최대 24 % 손상. **차이는 플랫폼(가상 NVMe/VM) 뿐이다.**
+
+## 26.3 이로써 확정된 재현 조건
+
+지금까지의 배제를 합치면 재현 조건이 하나로 수렴한다:
+
+| 축 | 판정 |
+|---|---|
+| DAOS 빌드(upstream/exastor/GDS/WSD) | **무관** (§18·§24·§26) |
+| 클라이언트 전체(API·캐시·버퍼·프로세스) | **무관** (§15.2) |
+| provider / 전송(UCX RDMA·ofi+tcp) | **무관** (§15.5) |
+| oclass·복제·chunk 정렬·컨테이너 신선도 | **무관** (§12.4·§13.5) |
+| VOS aggregation | **무관** (§12.8) |
+| targets/helpers 동시성, 디바이스 수, bdev_roles/메타 위치 | **무관** (§22) |
+| 논리 섹터 크기(512 B/4 KiB) | **무관** (§23) |
+| server BIO bulk-handle cache | **무관** (§15.3) |
+| **실 NVMe 하드웨어 + VFIO/IOMMU DMA 경로(베어메탈)** | **★ 조건** |
+
+즉 이 결함은 **SPDK userspace NVMe 드라이버가 실제 NVMe 컨트롤러(MSI-X 257, 4 KiB)에
+VFIO/IOMMU 를 통해 DMA 할 때만** 나타난다. QEMU 가상 NVMe 로는 재현되지 않는다.
+
+## 26.4 남은 실험과 상류 제출 프레임
+
+1. **`class: file`**(sparse file bdev, 우리 베어메탈): SPDK blobstore 로직은 유지하되 실 NVMe
+   를 제거. **clean 이면 "실 NVMe DMA 경로" 로 최종 확정**, 손상되면 SPDK blobstore 로직으로.
+   → 남은 단 하나의 값싼 분기. 다음 세션 1순위.
+2. 다른 모델 실 NVMe(다른 서버)에서 재현 — 하드웨어 일반성(PASCARI 고유인지) 확인.
+3. IOMMU 관련: `iommu=pt` 유무, `intel_iommu`/`amd_iommu` 옵션, ATS/PRI 설정 A/B.
+
+**상류 제출 시 반드시 명시할 것**: "VM/가상 NVMe 에서는 재현되지 않고, 베어메탈 실 NVMe +
+VFIO 에서만 재현된다. 따라서 상류 CI(대부분 VM)가 이 결함을 잡지 못한다." — 이것이
+§14.2 에서 "같은 서명의 보고가 없다"는 사실과 정확히 맞물린다.
+
+---
+
+# 27. ★★★ 최종 확정: `class: file` 은 깨끗 — 조건은 "실 NVMe 를 통한 SPDK DMA" (2026-09-02)
+
+§26.4-1 실행. **같은 베어메탈·같은 서버 빌드·같은 구성(targets 1/helpers 0, 2 디바이스,
+`bdev_roles:[wal,meta,data]`, RP_2G1, ofi+tcp)에서 백엔드만 `class: nvme` → `class: file`**
+(sparse file bdev, `/var/daos/bdevfiles/nvme{0,1}.img` 60 GB) 로 바꾼 단일변수 실험.
+
+## 27.1 결과 — 실 NVMe 를 빼면 손상이 사라진다
+
+| 백엔드 (모든 조건 동일) | raw object | DFS | 서버 FILLHASH |
+|---|---|---|---|
+| `class: nvme` (실 PASCARI NVMe ×2, VFIO) | **618/2560 = 24.1 %** | 손상 | **1680** |
+| **`class: file` (sparse file ×2, 실 NVMe 미사용)** | **0/2560** | **0/2560** | **0** |
+
+SPDK userspace blobstore·VOS·bio DMA 버퍼 로직은 **그대로 사용**하면서(파일 bdev 도 SPDK
+`bdev_aio`/blobstore 경유) 실 NVMe 컨트롤러만 제거했을 때 손상이 **완전히** 사라졌다.
+
+## 27.2 최종 판정
+
+> **손상은 SPDK blobstore/VOS/bio 의 순수 소프트웨어 로직이 아니라, SPDK userspace 드라이버가
+> 실제 NVMe 컨트롤러에 VFIO/IOMMU 로 DMA 할 때만 발생한다.**
+
+이로써 §19(채움 단계에서 발생)와 결합해 결함 위치가 최종적으로 좁혀진다:
+**`nvme_rw()` → SPDK NVMe 드라이버 → VFIO/IOMMU → 실 NVMe 컨트롤러 DMA** 구간.
+
+배제된 것 총정리(§12~§27): DAOS 빌드 전체, 클라이언트 전체, 전송/provider, oclass·복제,
+chunk 정렬, aggregation, bulk-handle cache, targets/helpers, 디바이스 수, bdev_roles·메타
+위치, 논리 섹터 크기, **그리고 SPDK blobstore/bio/VOS 소프트웨어 로직(§27)**.
+
+## 27.3 남은 후보 (모두 "실 NVMe DMA" 안쪽)
+
+1. **SPDK NVMe 드라이버의 큐/PRP 처리** — 4 MiB 요청이 PRP 리스트로 쪼개질 때의 경합.
+   파일 bdev 는 이 경로를 안 탄다(aio → 커널). 가상 NVMe 는 큐 깊이·MSI-X 규모가 작다.
+2. **VFIO/IOMMU DMA 매핑** — IOVA 재사용/무효화 타이밍. §25 에서 UIO 대조는 하드웨어 제약으로
+   불가했으므로 이 축은 여전히 미분리.
+3. **NVMe 컨트롤러/펌웨어**(PASCARI XX208, MSI-X 257) — 다중 큐 동시 read 에서의 컨트롤러측
+   문제. 다른 모델에서의 재현 여부가 이 축을 가른다.
+
+### 다음 세션 우선순위
+1. **다른 모델 실 NVMe 로 재현 시도** — 2·3 을 가른다. 재현되면 SPDK/VFIO(범용), 안 되면
+   PASCARI 고유(펌웨어/컨트롤러) → 상류 이슈의 성격이 완전히 달라진다.
+2. `iommu=pt` 제거/추가, ATS/PRI 토글 A/B (2번 축).
+3. SPDK 자체 도구로 우리 NVMe 직접 검증: `spdk_nvme_perf`/`nvme_manage` 로 태그 데이터를
+   4 MiB 다중 큐 read 하며 검증 — DAOS 를 완전히 제거한 최소 재현기. **가장 결정적이고
+   상류(SPDK) 제출까지 이어질 수 있다.**
+
+## 27.4 상류 제출 프레임 (수정)
+
+DAOS 상류 이슈로는 여전히 유효하나 **성격이 바뀐다**: "DAOS 가 특정 실 NVMe + VFIO 조합에서
+fetch 채움 데이터를 조용히 오염시킨다. VM/가상 NVMe·파일 bdev 에서는 재현되지 않아 상류 CI 가
+구조적으로 잡을 수 없다." 3번(SPDK 최소 재현기)이 성공하면 **SPDK 프로젝트 이슈**가 더 정확한
+제출처가 된다.
+
+## 27.5 환경 상태
+현재 **`class: file` arm** 으로 떠 있다(양 rank Joined, pool gdspool 100 GB, 컨테이너
+ci_obj·ci_m28, 손상 0). 실 NVMe arm 복귀: `/root/daos_server.yml.nvme2dev`(2 디바이스 24 % arm)
+또는 `/root/daos_server.yml.nvme-arm`(8 디바이스 원본) 복원 후 VFIO 재바인딩·재포맷.
+34.31 에는 우리 빌드 서버(`daos-ours`)가 여전히 실행중 — 그들 구성 복귀는 `daos-srv4k` 유닛.
+
+---
+
+# 28. ★★★ DAOS 없는 SPDK 최소 재현기 — 깨끗함. 결함은 DAOS 의 SPDK 사용 방식에 있다 (2026-09-02)
+
+§27.3-3 실행. **DAOS 를 완전히 제거하고** SPDK userspace NVMe 드라이버로 같은 디바이스에
+직접 태그 I/O 를 하는 최소 프로그램을 작성했다 (`tests/spdk_nvme_tagio.c`).
+
+## 28.1 재현기 설계
+
+- SPDK `spdk_nvme_probe/attach` → 원시 namespace, 큐페어 워커당 1개,
+  `spdk_nvme_ns_cmd_write/read` 로 **4 MiB(=DAOS DFS chunk) 단위 I/O**.
+- 버퍼는 `spdk_zmalloc(..., SPDK_MALLOC_DMA)` 4 KiB 정렬 — DAOS 의 DMA chunk 와 같은 성격.
+- 페이로드는 DAOS 재현기와 같은 자기술 태그 `(region<<48)|(round<<40)|offset`,
+  목적지는 0xA5 로 poison, 워커마다 자기 LBA 영역(겹침 없음).
+- 빌드(cell1, DAOS 번들 SPDK 빌드 트리 사용) — 링크 조합이 까다로웠다:
+  `libspdk_{nvme,env_dpdk,util,log,json,jsonrpc,rpc,sock,trace,vfio_user,keyring,dma,thread}.a`
+  + DPDK `librte_{eal,ring,mempool,mbuf,pci,bus_pci,kvargs,telemetry,log,mempool_ring}.a`
+  + `-lisal`(crc). **`libspdk_nvmf` 는 넣지 말 것**(bdev/accel 의존을 끌어온다).
+
+## 28.2 결과 — 순수 SPDK 는 손상되지 않는다
+
+| 계층 | 디바이스 | 결과 |
+|---|---|---|
+| **순수 SPDK**(DAOS 없음), 8 큐 × 20 라운드 | 0000:02:00.0 | 0/160 |
+| **순수 SPDK**, 16 큐 × 40 라운드 ×3 | 0000:02:00.0 | **0/1920** |
+| **순수 SPDK**, 16 큐 × 40 라운드 | 0000:03:00.0 | **0/640** |
+| **DAOS**(같은 두 디바이스, 직후 복원해 측정) | 0000:02·03:00.0 | **172/1280 = 13.4 %** |
+
+sector 4096 정상 인식, I/O 오류 0. 즉 **같은 하드웨어·같은 SPDK 드라이버·같은 VFIO 경로에
+같은 크기(4 MiB) 다중 큐 read 를 해도 SPDK 단독으로는 깨끗**하고, 그 위에 DAOS 를 올리면
+13 % 가 깨진다.
+
+## 28.3 판정 — §27 의 해석을 정정한다
+
+§27 은 "`class:file` 이 깨끗 ⇒ 실 NVMe DMA 구간의 결함"이라 했다. §28 은 그 결론을 **좁힌다**:
+
+> **실 NVMe + SPDK + VFIO 자체는 무결하다. 결함은 DAOS 가 그 위에서 하는 것 —
+> blobstore/bio 가 실 NVMe 경로에서만 드러내는 무언가 — 에 있다.**
+
+두 사실을 함께 놓으면:
+- `class:file`(SPDK aio bdev) 깨끗, `class:nvme`(SPDK nvme bdev) 손상 → **bdev 계층 아래
+  nvme 전용 경로**가 조건.
+- 순수 SPDK nvme 드라이버 직접 사용 깨끗 → **드라이버 자체가 아니라 DAOS 의 사용 방식**.
+
+⇒ 남은 후보가 아주 좁아졌다: **SPDK *blobstore*(`spdk_blob`)가 nvme bdev 위에서 하는
+cluster 매핑/IO 분할**, 그리고 그것을 쓰는 **DAOS bio 의 blob I/O 경로**
+(`bio_blob_rw`/`nvme_rw` → `spdk_blob_io_read`). 파일 bdev 에서는 같은 blobstore 코드가
+깨끗하므로 "blobstore + nvme bdev(4 MiB·다중 큐·큰 cluster)" 조합에 국소화된다.
+
+## 28.4 다음 실험 (개정)
+
+1. **SPDK blobstore 계층 최소 재현기** — `spdk_bs_init/spdk_blob_io_read` 로 blob 을 만들어
+   4 MiB 태그 I/O(다중 채널). DAOS 없이 **blobstore 만** 시험한다. 손상되면 **SPDK 프로젝트
+   이슈로 확정**(제출처 변경), 깨끗하면 DAOS bio 의 blob 사용 방식으로 최종 확정.
+   → `hello_blob` 예제가 이미 빌드 트리에 있어 골격 재활용 가능.
+2. `bdev_nvme` 계층(`bdevperf` + 검증 옵션)으로 중간 계층 확인.
+3. DAOS 측: `nvme_rw()` 에 요청 LBA/길이/blob 오프셋 로깅을 넣어 손상 chunk 의 blob→LBA
+   매핑이 다른 blob 과 겹치는지 직접 확인(§19 계측의 확장).
+
+## 28.5 환경
+현재 **실 NVMe 2 디바이스 DAOS arm 복원**(양 rank Joined, pool gdspool 100 GB,
+컨테이너 ci_obj, 13 % 재현 확인). SPDK 재현기는 cell1 `/tmp/spdk_nvme_tagio`(소스는 레포
+`tests/spdk_nvme_tagio.c`). SPDK 단독 실행 시 DAOS 를 정지해야 한다(디바이스 배타 점유).
+
+---
+
+# 29. ★★★ blobstore 계층도 깨끗 — SPDK 전 계층 무죄, 결함은 DAOS 의 blob 사용 (2026-09-02)
+
+§28.4-1 실행. **DAOS 를 제거하고 SPDK blobstore 만** 시험하는 재현기를 작성
+(`tests/spdk_blob_tagio.c`, 빌드 `tests/spdk_blob_tagio.build.sh`).
+
+## 29.1 재현기 설계 (DAOS bio 형태 모방)
+
+- `spdk_bs_init()` on **nvme bdev**(`bdev_nvme_attach_controller` JSON) — 즉 §27 에서
+  손상이 나던 그 조합(blobstore + nvme bdev)을 DAOS 없이 재현.
+- 워커당 blob 1개(=VOS blob per target), 워커당 `spdk_bs_alloc_io_channel()` 1개,
+  `spdk_blob_io_write/read` 로 **4 MiB(=DFS chunk) I/O**, 전 워커 동시 진행.
+- `spdk_zmalloc(SPDK_MALLOC_DMA)` 4 KiB 정렬 버퍼, 0xA5 poison, 같은 자기술 태그.
+- SPDK app framework(단일 reactor, 비동기 상태기계) 사용 — blobstore 호출은 SPDK 스레드에서만.
+
+빌드/실행 함정 4건: ① `-R` 은 SPDK 예약 옵션 → 라운드 플래그를 `-N` 으로.
+② `spdk_bs_unload()` 는 blob 이 열려 있으면 거부 → teardown 에서 blob 을 순차 close 하고,
+**판정 출력은 unload 전에** 한다(teardown 실패가 측정을 가리지 않게). ③ accel 이
+isal_crypto·lz4 를 요구 → `-lisal_crypto -llz4` 추가. ④ 비정상 종료 시
+`/var/tmp/spdk_cpu_lock_*` 이 남아 다음 실행이 코어 락 실패 → 삭제 필요.
+
+## 29.2 결과 — 깨끗
+
+```
+blobstore: page=4096 cluster=1048576 free_clusters=3648520 | workers=16 rounds=40 io=4MiB
+PASS: 0/640   PASS: 0/640
+```
+
+| 계층 (같은 디바이스 0000:02:00.0) | 결과 |
+|---|---|
+| DAOS (class:nvme, 실 NVMe) | **13~24 % 손상** (§27·§28) |
+| **SPDK blobstore + nvme bdev** (DAOS 없음), 16 blob × 40 라운드 ×2 | **0/1280** |
+| SPDK NVMe 드라이버 직접 (§28) | 0/2560 |
+| DAOS class:file (blobstore + aio bdev) (§27) | 0/2560 |
+
+## 29.3 판정 — SPDK 전 계층 무죄
+
+> **NVMe 드라이버·bdev_nvme·blobstore 모두 무결하다. 4 MiB 다중 blob·다중 채널 동시
+> read 를 같은 하드웨어에서 해도 깨끗하다. 결함은 DAOS 가 blobstore 를 쓰는 방식에 있다.**
+
+이제 §19(손상은 `bio_iod_prep()` 반환 시점에 이미 존재 = NVMe→DMA 채움 구간)와 결합하면
+용의 코드가 **DAOS bio 의 blob I/O 경로**로 확정된다:
+
+```
+nvme_rw()            src/bio/bio_buffer.c   — 영역별 blob I/O 발행
+ └ bio_blob_rw()/spdk_blob_io_read(ov)
+    - blob 오프셋 계산: bio_iov 의 ba_off → blob page/cluster
+    - SGL 경로: spdk_blob_io_readv 사용 시 iov 배열 구성
+    - 채널: 엔진 xstream 당 blob io_channel 공유
+```
+
+**§27 의 class:file 이 깨끗한 이유도 여기서 설명된다**: 같은 DAOS 코드라도 aio bdev 는
+동기적 완료·단일 큐라 경합 창이 없고, nvme bdev 는 다중 큐/비동기라 DAOS 측 계산·수명 오류가
+드러난다. 즉 **DAOS 버그이며, nvme bdev 에서만 노출된다.**
+
+## 29.4 다음 실험 (최종 좁히기)
+
+1. **`nvme_rw()` 계측**: 발행하는 (blob, blob_offset, length, buffer_addr) 를 로깅하고,
+   §19 의 FILLHASH 가 잡은 손상 chunk 의 요청 파라미터가 **다른 blob 의 영역과 겹치는지**
+   직접 확인. 겹치면 DAOS 의 오프셋 계산 오류로 **원인 확정**.
+2. `spdk_blob_io_readv`(SGL) 대 `spdk_blob_io_read`(단일 버퍼) 경로 확인 — DAOS 가 어느 쪽을
+   쓰는지, iov 구성에 오류가 없는지.
+3. 확정 후 상류 제출: **DAOS 이슈**(SPDK 아님)로, 재현기 3종(DAOS 레벨·SPDK blobstore 음성
+   대조·SPDK 드라이버 음성 대조)을 함께 첨부하면 "우리 계층 아님"을 선제적으로 차단할 수 있다.
+
+## 29.5 환경
+DAOS 는 정지 상태이고 0000:02:00.0 은 SPDK(vfio)에 바인딩돼 blobstore 재현기가 그 위에
+blobstore 를 새로 만들었다(**디바이스 내용 파기됨 — DAOS 재사용 시 재포맷 필요**).
+DAOS arm 복귀: `/root/daos_server.yml.nvme2dev` 유지 상태이므로 서버 기동 → 재포맷 → pool·컨테이너
+재생성. 재현기: cell1 `/tmp/spdk_blob_tagio`(+`/tmp/blob_nvme.json`), `/tmp/spdk_nvme_tagio`.
+
+---
+
+# 30. `nvme_rw()` blob I/O 계측 — 요청은 정상, 데이터만 틀리다 (2026-09-02)
+
+§29.4-1 실행. stock 트리 `nvme_rw()` 에 발행 파라미터 로깅을 추가
+(`BLOBIO_DEBUG=1` gate, `BLOBIO R/W blob= ch= payload= io_off= io_cnt=`).
+FILLHASH(§19)와 같은 엔진 로그에 남으므로 손상 시점과 직접 대조된다.
+
+## 30.1 수집
+
+한 런(16×15, 클라 24/240 손상)에서: **4 MiB blob read 887건**, FILLHASH 2건.
+손상 직전 6건의 4 MiB 읽기:
+
+```
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203020200000 io_off=12994487 io_cnt=1024
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203020200000 io_off=13038519 io_cnt=1024
+blob=0x7fd604575c60 ch=0x7fd5d839eba0 payload=0x203015400000 io_off=13035447 io_cnt=1024
+...
+FILLHASH ... exp_tid=4 ... foreign=524288, first bad at 0 val t3 r7 off 8388608
+```
+
+## 30.2 관측 — 그리고 배제
+
+1. **DMA 버퍼 재사용은 원인이 아니다.** 같은 payload 주소가 서로 다른 io_off 에 재사용되는
+   패턴이 **887건 중 882건**(정상 풀 동작). 손상은 24건뿐이므로 재사용 자체와 상관없다.
+   최대 61개의 서로 다른 io_off 가 한 payload 주소를 공유한다 — 정상.
+2. **모든 요청이 같은 blob·같은 채널**(`blob=0x...c60`, `ch=0x...eba0`). 즉 DAOS 는 타깃
+   xstream 의 단일 blob/채널로 읽고 있고, **요청 파라미터에 다른 blob 이 섞이지 않는다.**
+3. **손상 데이터는 "다른 객체의 다른 오프셋"**: FILLHASH 는 t4 의 버퍼에 `t3 r7 off 8388608`
+   데이터가 들어왔다고 말한다. 클라이언트 기록도 같은 형태(`t11` chunk0 ← `t0 r0 off 0`,
+   `t12` ← `t0 r1 off 4194304`).
+
+## 30.3 판정 — 남은 두 갈래
+
+DAOS 는 **정상적인 blob 오프셋으로 요청**하는데 **다른 데이터가 채워진다**. 요청 파라미터
+오류(§29.3 의 1순위 가설)는 **기각**된다. 남은 것:
+
+| 갈래 | 내용 | 다음 확인 |
+|---|---|---|
+| **A. blob→LBA 매핑** | DAOS 요청 io_off 는 맞지만 그 blob 의 cluster 매핑이 다른 객체 데이터를 가리킴(= blob 할당/확장 시점의 문제) | 손상 chunk 의 io_off 를 `spdk_blob_get_clusters`/ddb 로 LBA 로 환산해 다른 blob 과 겹치는지 |
+| **B. 완료 매칭** | 요청은 맞고 데이터도 맞게 읽혔으나 **완료 콜백이 다른 요청의 버퍼에 귀속**(rw_completion ↔ biod 연결) | 요청마다 고유 태그를 심어 완료 시 대조(다음 계측) |
+
+§29 에서 **동일 shape 의 blobstore 단독 시험이 깨끗**했음을 감안하면 B(완료/버퍼 귀속)가 더
+유력하다 — blobstore 자체는 요청↔완료를 정확히 처리했기 때문이다. DAOS 측에서 그 매칭을
+어긋나게 하는 것은 `bio_desc`(biod) 재사용·`bd_inflights` 회계·`drain_inflight_ios()` 의
+동시성이다.
+
+## 30.4 다음 계측 (원인 확정용)
+
+`rw_completion()` 에 **완료된 요청의 (blob, io_off, payload)** 를 로깅하고 발행 로그와
+1:1 대조한다. 발행/완료 쌍이 어긋나면 **B 확정**(DAOS 의 요청-완료 귀속 버그). 일치하면
+**A**로 넘어가 blob cluster 매핑을 덤프한다.
+
+현재 계측 상태: cell1/cell2 `/var/daos-stockfull` = upstream + FILLHASH + BLOBIO 로깅.
+소스는 cell1 `/var/daosbuild/daos-stock`(원본 백업 `/tmp/bio_buffer.c.pre-bloblog`,
+`/tmp/srv_obj.c.orig`). 로그 폭증 주의 — 4 MiB 읽기당 1줄.
+
+## 30.5 완료 계측 결과 — 갈래 B(완료 귀속)도 기각
+
+`rw_completion()` 에도 로깅 추가(`BLOBIO DONE biod= err= inflights_left= type=`).
+발행 측에는 thread-local 시퀀스 번호를 붙였다. (빌드 함정: `rw_completion()` 이 헬퍼
+정의보다 앞서므로 **파일 스코프 전방 선언 필수** — 함수 본문 안에 넣으면
+`invalid storage class` 로 실패한다.)
+
+손상 50/192 를 유도한 런에서:
+
+| 지표 | 값 |
+|---|---|
+| 4 MiB read 발행 | 817 |
+| 완료 콜백 | 3616 (대부분 WAL/체크포인트의 `io_cnt=1` 소형 I/O) |
+| `inflights_left=0` 비율 | 4807/4823 |
+| 한 `biod` 주소당 발행/완료 | 24 / 176 — **주소 재사용** |
+
+시간순 추적 결과 **발행과 완료가 정확히 1:1 로 교대**한다(`W` → `DONE inflights_left=0`).
+`biod` 주소가 176회 등장하는 것은 **구조체 풀의 순차 재사용**이지 귀속 오류가 아니다.
+
+⇒ **§30.3 의 갈래 B(완료가 다른 요청의 버퍼에 귀속) 기각.** 요청도 정상, 완료 매칭도 정상,
+그런데 버퍼 안의 데이터만 다른 객체 것이다.
+
+### 남은 것은 갈래 A — blob→LBA 매핑
+
+DAOS 가 올바른 blob 오프셋으로 요청하고 완료도 올바르게 매칭되는데 내용이 다른 객체의 것이라면,
+**그 blob 오프셋이 물리적으로 다른 객체의 데이터를 가리키고 있다**는 뜻이다. 즉 blob 의
+cluster 할당/매핑이 어긋나 있다. 이는 §29 의 blobstore 단독 시험이 깨끗했던 것과도 모순되지
+않는다 — 그 시험은 **blob 을 새로 만들어 한 번만 쓴** 반면, DAOS 는 **VOS 가 blob 안에서
+공간을 할당·재사용**(VEA)하기 때문이다.
+
+⇒ **최종 용의자: VEA(=DAOS 의 blob 내부 공간 할당자)가 서로 다른 객체에 겹치는 extent 를
+내주는 것.** §17.4 의 S2 가설로 되돌아왔고, 이제 다른 모든 갈래가 배제되어 단독으로 남았다.
+
+### 다음 (원인 확정)
+1. `vea_reserve()`/`vea_free()` 에 (blk_off, blk_cnt, 소유 객체) 로깅 → 손상 chunk 의
+   io_off 를 blk_off 로 환산해 **다른 객체의 예약과 겹치는지** 직접 확인. 겹치면 **확정**.
+2. `ddb` 로 손상 후 VOS 트리를 덤프해 두 객체의 extent 가 같은 blk 를 가리키는지 확인(정적 증거).
+3. 확정되면 상류 이슈는 **VEA 할당자 버그**로, 재현기 4종(§28·§29 음성 대조 포함) 첨부.
+
+---
+
+# 31. VEA 계측 — 할당자도 결백. 모든 계층이 "정상"인데 데이터만 틀리다 (2026-09-02)
+
+§30.5 가 남긴 마지막 갈래(VEA 가 겹치는 extent 를 내준다)를 계측했다.
+`vea_reserve()`/`vea_free()` 에 로깅 + **라이브 예약 테이블 기반 겹침 즉시 판정**
+(`VEALOG_DEBUG=1`, `tests` 외부: cell1 `/var/daosbuild/daos-stock/src/vea/vea_api.c`,
+원본 `/tmp/vea_api.c.pre-log`).
+
+## 31.1 결과 (손상 25/192 유도 런)
+
+| 지표 | 값 |
+|---|---|
+| `VEALOG OVERLAP` (겹치는 예약) | **0** |
+| `VEALOG RESERVE` | 1344 (**전부 `cnt=1024`=4 MiB, offset 전부 고유**) |
+| `VEALOG FREE` | **0** (런 중 재사용 없음) |
+| 4 MiB blob read 발행 | 731 |
+| FILLHASH(채움 직후 손상) | 18 |
+| **읽기 io_off 가 자기 예약 범위 안에 있는 비율** | **731 / 731 (100 %)** |
+
+VEA blk 와 blob io unit 이 모두 4096 B 라 직접 비교했다. **모든 읽기가 유효한 예약 안이고,
+어떤 두 예약도 겹치지 않는다.**
+
+## 31.2 판정 — 갈래 A 도 기각, 모순 상태에 도달
+
+§30 과 합치면 지금까지 확인된 것은:
+
+| 단계 | 상태 |
+|---|---|
+| VEA 예약 | 겹침 없음, 전부 고유 (§31.1) |
+| DAOS 가 요청하는 blob 오프셋 | 자기 예약 안, 정상 (§31.1) |
+| blob I/O 요청 파라미터(blob·채널·범위) | 정상 (§30.2) |
+| SPDK blobstore/bdev/드라이버 | 무결 (§27·§28·§29) |
+| 완료 콜백 귀속 | 1:1 정상 (§30.5) |
+| **채움 직후 버퍼 내용** | **다른 객체 데이터 (§19·§31.1)** |
+
+즉 **"올바른 blob 의 올바른 오프셋을, 겹치지 않는 영역에서, 올바르게 완료된 요청으로 읽었는데
+다른 객체의 데이터가 들어 있다."** 남은 가능성은 좁고 구체적이다:
+
+1. **쓰기 측 오배치** — 손상은 read 가 아니라 **write** 에서 발생했을 수 있다. 지금까지의 계측은
+   전부 read 경로였다. 객체 A 의 데이터가 객체 B 의 blk 에 기록됐다면, B 를 정확히 읽어도 A 의
+   데이터가 나온다. **§19 의 "at-rest 는 대체로 정상"과 상충하는 듯하지만, at-rest 검증은
+   손상 이후 재기록된 상태를 본 것일 수 있다.**
+2. **VOS extent → blob offset 변환** — VEA 예약은 정상이나 `vos_io` 가 biov 에 채워 넣는
+   `ba_off` 가 다른 객체의 예약을 가리킬 수 있다(예약 자체는 고유해도 **매핑 단계**에서 뒤바뀜).
+3. SPDK blobstore 의 **cluster 매핑**(blob 오프셋→LBA)이 두 blob 에서 겹침 — §29 의 단독
+   시험은 blob 을 한 번만 확장했으므로 이 경로를 충분히 흔들지 못했을 수 있다.
+
+## 31.3 다음 (가장 값싼 순)
+
+1. **쓰기 경로 FILLHASH** — `bio_iod_post()`(update 완료) 직전에 DMA 버퍼를 감사해, 기록되는
+   내용이 그 객체 것인지 확인. 손상이 쓰기 측이면 여기서 잡힌다. **1순위**: read 측 계측이
+   전부 "정상"인 지금, 가장 큰 미탐색 영역이다.
+2. **`ba_off` 로깅** — `nvme_rw()` 에서 `rg->brr_off`(=blob offset)와 그 IOD 의 객체(OID)를
+   함께 남겨, **같은 blob offset 을 서로 다른 OID 가 읽는지** 직접 확인. 겹치면 §31.2-2 확정.
+3. `spdk_blob_get_clusters()` 로 손상 시점 두 blob 의 cluster 맵 덤프(§31.2-3).
+
+## 31.4 현재 계측 상태
+cell1/cell2 `/var/daos-stockfull` = upstream + FILLHASH(srv_obj) + BLOBIO(bio_buffer) +
+VEALOG(vea_api). 원본 백업: `/tmp/srv_obj.c.orig`, `/tmp/bio_buffer.c.pre-bloblog`,
+`/tmp/bio_buffer.c.pre-compl`, `/tmp/vea_api.c.pre-log`.
+로그량 주의: VEALOG 는 예약당 1줄, BLOBIO 는 I/O 당 1줄.
+
+---
+
+# 32. 쓰기 경로 계측 — 페이로드 쓰기도 결백 (2026-09-02)
+
+§31.3-1 실행. `bio_iod_post()` 의 `dma_rw()`(=미디어로 내려보내기) **직전**에 DMA 버퍼를
+감사(`WRAUDIT_DEBUG=1`). 재현기 페이로드는 워드마다 `(tid,round,offset)` 태그를 가지므로,
+내려갈 버퍼는 **하나의 tid·하나의 round** 여야 한다.
+
+## 32.1 결과 (손상 63/192 유도 런)
+
+| 항목 | 값 |
+|---|---|
+| **4 MiB 페이로드 쓰기 `WRAUDIT OK`** | **1344** |
+| **4 MiB 페이로드 쓰기 `WRAUDIT MIXED`** | **0** |
+| 작은 버퍼(4 KiB~256 KiB) MIXED | 52 |
+| FILLHASH(읽기 채움 손상) | 104 |
+
+52건의 MIXED 는 전부 **len 4096~262144 의 소형 버퍼**이고 `tid0=0 round0=0` 이다 — VOS
+메타데이터/WAL 버퍼가 우연히 태그 형태로 해석된 **오탐**(감사기가 "태그처럼 보이는" 버퍼만
+검사하므로 소형 메타 버퍼를 걸러내지 못했다). 실제 객체 페이로드인 **4 MiB 쓰기는 1344건
+전부 무결**하다.
+
+## 32.2 판정 — 쓰기도 결백, 모순이 굳어졌다
+
+> **디스크로 내려가는 쓰기 버퍼는 정확하다.** 따라서 "A 의 데이터가 B 의 blk 에 기록된다"는
+> §31.2-1 가설은 **기각**이다.
+
+이로써 전 구간이 개별적으로는 정상으로 측정됐다:
+
+| 구간 | 상태 | 근거 |
+|---|---|---|
+| 쓰기 버퍼(미디어 직전) | 정상 | §32.1 |
+| VEA 예약(겹침/범위) | 정상 | §31.1 |
+| 읽기 요청 파라미터 | 정상 | §30.2 |
+| 완료 콜백 귀속 | 정상 | §30.5 |
+| SPDK 드라이버/bdev/blobstore | 무결 | §27·§28·§29 |
+| **읽기 채움 직후 버퍼** | **오염** | §19·§31 |
+
+## 32.3 남은 가능성 (좁고 구체적)
+
+1. **쓰기 버퍼는 맞지만 착지 위치가 틀리다.** WRAUDIT 는 *내용*만 봤고 *목적지 blk* 는
+   기록만 했다. `blk_off` 를 그 IOD 의 객체와 함께 남겨 **두 객체가 같은 blk 에 쓰는지**
+   확인해야 한다(§31 은 VEA *예약*만 봤지, biov 가 실제로 그 예약을 쓰는지는 안 봤다).
+   ⇒ **1순위**: `nvme_rw()` 에서 write 시 `(OID, blk_off, len)` 로깅 후 중복 검사.
+2. **읽기 시 blob→LBA 변환이 다른 예약을 가리킨다** — §31.1 은 blob 오프셋이 예약 안에
+   있음을 봤지만, 그 예약이 **그 객체의 것인지**는 확인하지 않았다(예약 소유자 미기록).
+   ⇒ 예약 시 OID 를 함께 기록하면 1·2 를 동시에 판정할 수 있다.
+3. SPDK blobstore cluster 맵이 두 blob 에서 겹침(§31.2-3, 여전히 미확인).
+
+**1·2 는 같은 계측으로 해결된다: "누가 어느 blk 를 쓰고 읽는가" 를 OID 와 함께 기록하는 것.**
+지금까지의 계측은 각 계층을 따로 봤을 뿐, **소유권**을 한 번도 추적하지 않았다 — 그것이 남은
+구멍이다.
+
+## 32.4 다음 계측 (설계)
+`bio_iov` 에서 `bio_iov2raw_off()` 로 blk 를 얻고, `biod` 에서 상위 OID 를 얻어
+(`bio_desc` 에는 OID 가 없으므로 `vos_io` 계층 또는 `srv_obj` 에서 내려줘야 한다)
+`OWNER blk=... oid=... op=R/W` 를 남긴 뒤, 같은 blk 를 서로 다른 oid 가 만지는지 집계한다.
+FILLHASH 가 이미 srv_obj 에서 OID 를 갖고 있으므로, 그 지점에서 IOD 의 biov 목록을 함께
+덤프하는 것이 가장 값싸다.
+
+---
+
+# 33. ★ 소유권 계측 — 이것도 정상. DAOS 계층 추적의 종착점 (2026-09-02)
+
+§32.4 설계대로, FILLHASH 가 이미 OID 를 갖고 있는 `srv_obj` 지점에서 IOD 의 biov 를 덤프해
+**어느 객체가 어느 미디어 블록을 만지는지**(`OWNER blk=<off>+<cnt> op=R|W oid=<OID>`)를
+읽기·쓰기 양쪽에서 기록했다.
+
+## 33.1 결과 (손상 13/160 유도 런)
+
+| 검사 | 결과 |
+|---|---|
+| OWNER 항목 | 1704 |
+| **두 개 이상의 OID 가 만진 블록** | **0** |
+| 쓰인 블록 / 읽힌 블록 | 1,146,880 / 552,960 |
+| **읽었지만 이 구간에서 쓰인 적 없는 블록** | **0** |
+| **읽은 블록의 writer OID ≠ reader OID** | **0** |
+
+⇒ **모든 읽기는 자기 객체가 쓴 바로 그 블록을 읽는다.** 소유권 혼선은 없다.
+
+## 33.2 DAOS 계층 추적의 종착점
+
+§19 부터 §33 까지, 손상 경로의 **모든 단계를 개별 계측으로 확인**했고 전부 정상이다:
+
+| 단계 | 계측 | 결과 |
+|---|---|---|
+| 쓰기 버퍼(미디어 직전) | WRAUDIT | 4 MiB 쓰기 1344/1344 정상 |
+| 객체→블록 소유권(쓰기) | OWNER W | 중복 0 |
+| VEA 예약 | VEALOG | 겹침 0, 전부 고유 |
+| 객체→블록 소유권(읽기) | OWNER R | writer≠reader 0 |
+| 읽기 요청 파라미터 | BLOBIO R | blob·채널·범위 정상, 예약 내 100 % |
+| 완료 콜백 귀속 | BLOBIO DONE | 발행:완료 1:1 |
+| SPDK 드라이버/bdev/blobstore | 단독 재현기 | 무결(0/2560, 0/1280) |
+| **채움 직후 버퍼 내용** | FILLHASH | **다른 객체 데이터** |
+
+**모든 메타데이터·제어 경로가 정확한데 데이터만 틀리다.** 이는 "DAOS 가 잘못된 것을
+요청한다"는 모든 가설의 부정이며, 남은 해석은 두 가지뿐이다:
+
+1. **DAOS 가 옳게 요청한 I/O 에 대해 장치/스택이 잘못된 데이터를 반환한다** — 단, §28·§29 의
+   단독 재현기가 같은 장치·같은 크기·같은 다중 큐에서 깨끗했으므로, **DAOS 가 만드는 특정
+   I/O 패턴에서만** 그렇다는 뜻이 된다(예: 동시 read/write 혼합, 특정 큐 깊이, 특정 시점의
+   blob 확장 등 — 단독 재현기가 재현하지 못한 조건).
+2. 계측 자체가 놓치는 경로가 있다 — 예컨대 **checkpoint/aggregation 등 백그라운드 I/O**
+   (OWNER/WRAUDIT 는 클라이언트 IOD 경로만 본다)가 같은 블록을 건드리는 경우.
+
+**2 번이 유력하다.** §12.5 에서 이미 aggregation 이 자체 checksum 검증에 실패하는 것을 봤고
+(그때는 "원인 아님"으로 §12.8 에서 기각됐으나 그건 *발생률* 기준 판정이었다), MD-on-SSD 의
+**checkpoint** 는 WAL→data blob 으로 데이터를 옮기는 별도 경로다. 지금까지의 계측은
+**이 경로를 한 번도 보지 않았다.**
+
+## 33.3 다음 (남은 유일한 미계측 경로)
+1. **checkpoint/WAL 경로 계측** — `bio_wal_*`/checkpoint 가 data blob 에 쓰는 (blk, 내용)을
+   WRAUDIT 와 같은 방식으로 감사. 손상 블록이 checkpoint 대상과 겹치는지 확인. **1순위.**
+2. `DAOS_IO_BYPASS=wal_commit`(§17.3 에서 확인한 기존 노브)으로 WAL 을 끄고 A/B —
+   구성 변경만으로 checkpoint 축을 시험할 수 있다. **값이 가장 싸다.**
+3. aggregation 완전 정지(`reclaim:disabled`, §12.8 에서 이미 인프라 존재) + checkpoint 만 남기는
+   조합으로 축 분리.
+
+**2 번을 먼저 하는 것이 합리적이다** — 코드 수정 없이 checkpoint/WAL 축을 즉시 시험한다.
+
+---
+
+# 34. ★★ 손상은 "포맷 직후 첫 런"에서만 일어난다 (2026-09-02)
+
+§33.3 의 WAL/checkpoint 축을 시험하려다, **그보다 훨씬 큰 것**을 발견했다.
+이 절은 지금까지의 모든 A/B 를 다시 읽게 만든다.
+
+## 34.1 `DAOS_IO_BYPASS=wal_commit` 은 쓸 수 없다 (무효)
+
+가장 싼 수로 제안했던 노브는 **엔진을 죽인다**. arm B 로 부팅한 뒤 pool create 하면:
+
+```
+EMRG src/common/dav_v2/heap.c:205 heap_zinfo_init()
+     Assertion 'z0->header.zone0_zinfo_size == alloc_size' failed
+*** received signal 6 (Aborted) *** / signal 11 (Segmentation fault)
+dmg: pool create failed: dRPC recv chunk 0: EOF
+```
+
+첫 크로스오버(A B B A B A A B)에서 **B 4런이 전부 빈 결과**였는데, 이는 면역이 아니라
+**풀 생성 자체가 실패**한 것이었다. 출력을 버렸다면 "wal_commit 을 끄면 손상이 사라진다"는
+완전히 틀린 결론을 냈을 것이다. 이 축은 이 노브로는 시험 불가.
+
+## 34.2 대신 발견한 것 — 포맷 경계
+
+checkpoint 는 **풀 속성**(`checkpoint:disabled|timed|lazy`)이라 재기동 없이 A/B 가 된다.
+그렇게 8런을 돌렸더니 **양쪽 arm 모두 0/160, 총 1280 검사에서 손상 0건**이었다.
+그런데 같은 날 오전 wal_ab 의 arm A 는 8·3·3·27 /160 이었다. 두 하네스의 구조적 차이는
+단 하나 — **런마다 재기동+포맷을 했는가**.
+
+직접 갈랐다. 포맷 1회 후 같은 부팅에서 3런 연속(런마다 풀은 새로 생성):
+
+| | 결과 |
+|---|---|
+| **포맷 직후 1런** | **FAIL 58/160 (36.3 %)** |
+| 같은 부팅 2런 | PASS 0/160 |
+| 같은 부팅 3런 | PASS 0/160 |
+
+누적하면:
+
+| 조건 | 손상 / 검사 | 비율 |
+|---|---|---|
+| **포맷 직후 첫 런** (wal_ab A 4런 + 위 1런) | **99 / 800** | **12.4 %** |
+| 첫 런 이후 (ck_ab 8 + ck_ab2 8 + 위 2런) | 1 / 2880 | 0.03 % |
+
+**약 350 배.** 손상은 산발적 확률 사건이 아니라 **포맷 경계에 묶인 결정적 현상**이다.
+
+## 34.3 이것이 뒤집는 것
+
+1. **재현 레시피가 바뀐다.** "동시 읽기를 오래 돌린다"가 아니라 **"포맷하고 한 번 돌린다"**
+   이다. 업스트림 보고서의 재현 절차를 이 형태로 다시 써야 한다.
+2. **과거 A/B 의 재해석이 필요하다.** 런마다 포맷한 하네스는 모든 arm 이 "첫 런"이라
+   비교 자체는 공정했다. 그러나 포맷 없이 반복한 측정은 **신호가 없는 구간을 측정**한 것이라
+   "이 축은 무관"이라는 판정의 검정력이 사실상 0 이었을 수 있다. §12·§20·§21 계열 중
+   포맷 경계를 통제하지 않은 것은 재검토 대상이다.
+3. **§33 의 소유권 계측이 왜 깨끗했는지 설명될 수 있다.** 그 런은 13/160 으로 손상이 있었고
+   OWNER 는 깨끗했다 — 그렇다면 남는 해석은 **클라이언트 IOD 경로 바깥**, 즉 포맷 직후에만
+   활성인 무언가다.
+
+## 34.4 포맷 직후에만 다른 것은 무엇인가
+
+- **blobstore/VEA 가 한 번도 쓰이지 않은 클러스터를 처음 할당한다.** 두 번째 런부터는
+  이전 런이 이미 기록한 영역을 재사용한다.
+- **NVMe 의 미기록(deallocated) 블록.** 포맷 후 처음 읽는 LBA 는 장치가 임의 데이터를
+  돌려줄 수 있는 유일한 구간이다 — 단 §33 은 읽기 전에 쓰기가 있었음을 보였으므로,
+  쓰기와 읽기 사이의 **경합**이 아니면 설명되지 않는다.
+- **WAL 이 비어 있는 상태에서의 첫 checkpoint.** 첫 런에서만 WAL→data blob 첫 이동이 일어난다.
+
+세 번째가 §33.3 의 가설과 정확히 맞물린다. 그래서 checkpoint A/B 를 **런마다 포맷**하도록
+고쳐 재실행 중이다(§35).
+
+## 34.5 방법론 교훈 (세 번째 반복)
+
+이 조사에서 잘못된 arm 비교가 나온 것이 이번이 세 번째다(§20 발생률, §22 kdev, 그리고 이번).
+매번 원인이 같았다: **arm 이 실제로 의도한 조건이었는지 검증하지 않았다.** 이번에 추가한 가드 —
+풀 속성을 되읽어 요청값과 다르면 그 런을 채점하지 않고 `ABORT` 로 기록 — 는 두 번째 하네스에서
+즉시 값을 했다. `--force` 가 아니라 `--recursive` 였던 탓에 destroy 가 조용히 실패했고,
+8런이 전부 1런의 풀을 재사용하고 있었다. 가드가 없었다면 이것도 데이터로 둔갑했을 것이다.
+
+**검증되지 않은 런은 0 으로 채점하지 말고 버려야 한다.**
+
+---
+
+# 35. checkpoint 축 — 복제 실패. 확정하지 않는다 (2026-09-02)
+
+§34.3 의 checkpoint 크로스오버를 순서를 뒤집어(B A A B A B B A) 복제했다.
+
+| | A `timed` (기본) | B `disabled` | 평균차 | 정확 순열 p |
+|---|---|---|---|---|
+| 복제 1 (A B B A B A A B) | 47, 24, 23, 28 → **19.06 %** | 20, 19, 15, 9 → **9.84 %** | +14.75 | **0.029** |
+| 복제 2 (순서 반전) | 17, 56, 18, 10 → 15.78 % | 22, 7, 31, 14 → 11.56 % | +6.75 | **0.714** |
+| **합산 (arm 당 8런)** | 223/1280 = 17.42 % | 137/1280 = 10.70 % | +10.75 | **0.114** |
+
+**복제 실패다.** 복제 1 의 완전 분리(p=0.029, n=4 대 n=4 의 최소값)는 재현되지 않았고,
+합산 p = 0.114 는 어떤 기준으로도 통과하지 못한다.
+
+## 35.1 판정
+
+**checkpoint 축은 입증되지 않았다.** §33.3 에서 "1순위"로 지목했던 가설은 현재 근거로
+지지되지 않는다. 이 조사에서 arm 비교가 뒤집힌 **네 번째** 사례다(§20 발생률, §22 kdev,
+§34.1 wal_commit, 그리고 이번).
+
+단, 두 복제 모두 **방향은 A > B 로 일치**한다(19.1>9.8, 15.8>11.6). 효과가 없다는 증명도
+아니다 — 런 단위 분산이 워낙 커서(A 는 10~56, B 는 7~31) 검정력이 부족할 뿐이다.
+관측 효과크기(+10.75/런, 런 SD ≈ 15)를 80 % 검정력으로 잡으려면 **arm 당 약 34 런**,
+즉 3~4 시간이 필요하다. 그 비용을 쓸 가치가 있는지는 별개 판단이다.
+
+## 35.2 부수 소득 — §34 는 오히려 강해졌다
+
+두 복제는 런마다 포맷하는 구조라 **16 런 전부가 "포맷 직후 첫 런"** 이었다.
+그리고 **16 런 전부 손상이 났다**(최소 7, 최대 56, 합 360/2560 = 14.1 %).
+
+포맷 경계 통계를 갱신하면:
+
+| 조건 | 손상 런 / 전체 런 | 손상 / 검사 | 비율 |
+|---|---|---|---|
+| **포맷 직후 첫 런** | **21 / 21** | 459 / 3360 | **13.7 %** |
+| 첫 런 이후 | 1 / 18 | 1 / 2880 | 0.03 % |
+
+**21런 전부 손상, 18런 중 1런.** §34 의 발견은 이제 이 조사에서 가장 견고한 사실이며,
+동시에 **가장 유용한 재현 레시피**다.
+
+## 35.3 다음
+1. **포맷 직후에만 다른 것을 직접 계측한다.** §34.4 의 세 후보 중 checkpoint 는 약해졌으니,
+   남은 둘 — 처음 할당되는 blobstore 클러스터, 미기록 NVMe LBA — 로 좁힌다. 구체적으로는
+   **첫 런에서 읽히는 블록이 그 런에서 처음 할당된 클러스터인지**를 VEA/blob 할당 시각과
+   함께 기록한다. §33 의 OWNER 계측에 "이 blk 가 이번 포맷 이후 처음 쓰인 것인가"를 더하면 된다.
+2. 업스트림 티켓은 **§34 레시피로 지금 쓸 수 있다** — 21/21 은 어떤 리포트에도 충분하다.
+   checkpoint 는 언급하되 미확정으로 남긴다.
+
+---
+
+# 36. 첫-쓰기 계측 — 축은 무의미했으나, 배제 하나와 결정적 단서 하나 (2026-09-02)
+
+§35.3 대로 OWNER 계측에 **블록별 쓰기 이력**을 추가했다. 엔진은 포맷 때 재시작하므로
+"엔진 기동 이후"는 곧 "포맷 이후"다. 4 KiB 블록마다 포화 카운터 1 바이트를 두고,
+쓰기 때 증가시키며 읽기 때 되묻는다(`OWNER ... firstw= never= once=`,
+`FILLHASH blk=..+.. never= once=`).
+
+## 36.1 첫 런 안에서는 대조가 성립하지 않는다
+
+손상 36/160 이 난 런에서:
+
+| | |
+|---|---|
+| 쓰인 블록 1,146,880 중 **포맷 이후 첫 쓰기** | 1,146,880 (**100 %**) |
+| 읽힌 블록 677,888 중 **한 번만 쓰인 것** | 677,888 (**100 %**) |
+
+첫 런에서는 정의상 모든 것이 새것이라 **손상/정상을 가르지 못한다.** 이 축의 대조는
+런 사이에만 존재하고, 그건 §34 가 이미 측정한 것이다.
+
+## 36.2 배제 — "미기록 LBA 를 읽어서"가 아니다
+
+손상 영역 38 개, 각 1024 블록(= 4 MiB, 청크 크기와 일치):
+
+| | |
+|---|---|
+| 손상 영역 중 **한 번도 쓰인 적 없는 블록** | **0 (0.00 %)** |
+| 손상 영역 중 정확히 한 번 쓰인 블록 | 38,912 (**100 %**) |
+
+§34.4 의 후보 두 번째 — **미기록 NVMe LBA 가 임의 데이터를 돌려준다** — 는 **배제된다.**
+손상된 읽기는 예외 없이 *이미 기록된* 블록을 읽는다.
+
+## 36.3 ★ 결정적 단서 — 쓴 놈과 읽는 놈이 같은데 내용은 남의 것
+
+손상 블록을 OWNER 기록과 교차 조회한 결과:
+
+| | |
+|---|---|
+| 손상 영역 중 **쓴 OID == 읽는 OID** | **38 / 38 (전부)** |
+| 쓴 OID 가 모든 읽는 OID 와 다름 | 0 |
+| 쓴 기록이 없음 | 0 |
+
+그런데 그 블록의 **내용은 다른 객체의 것**이다:
+
+```
+oid=...3237998095.0.2  expected tid=15  payload says tid=3  round=1
+oid=...3237998088.0.2  expected tid=8   payload says tid=2  round=2
+oid=...3237998088.0.2  expected tid=8   payload says tid=13 round=2
+oid=...3237998082.1.2  expected tid=2   payload says tid=7  round=2
+```
+
+같은 객체가 같은 블록을 두 번 읽어 **매번 다른 남의 tid** 를 받는 경우까지 있다(tid 2, 13).
+
+**정리하면: X 가 blk B 에 썼고, X 만 B 에 썼고, X 가 B 를 읽는데, 나온 내용은 Y 의 것이다.**
+소유권·예약·요청 파라미터·완료 귀속이 모두 정확한 상태에서 이것이 성립하려면 남는 것은 둘뿐:
+
+1. **X 의 쓰기가 애초에 Y 의 데이터를 실었다** (쓰기 경로 오염).
+2. **읽기가 요청한 물리 위치가 아닌 곳의 데이터를 받았다** (요청은 맞고 반환이 틀림).
+
+## 36.4 §32 의 쓰기 경로 감사를 재검증해야 한다
+
+§32 는 WRAUDIT 로 "4 MiB 쓰기 1344/1344 정상"이라며 1 번을 배제했다.
+그러나 **§34 이후 그 판정은 신뢰할 수 없다** — 그 런이 포맷 직후 첫 런이었는지,
+즉 애초에 손상이 발생한 런이었는지 기록되어 있지 않다. 손상이 없던 런에서
+"쓰기 버퍼가 깨끗하다"는 것은 아무것도 배제하지 못한다.
+
+**다음: WRAUDIT 를 손상이 확인된 첫 런에서 다시 돌리되, `blk` 와 함께
+`버퍼에 실제로 담긴 tid` 를 기록한다.** 그러면 FILLHASH 가 손상으로 지목한 바로 그 blk 에
+대해 "쓸 때 이미 Y 였는가, 쓸 때는 X 였는데 읽을 때 Y 가 되었는가"가 한 번에 갈린다.
+이것이 §36.3 의 두 갈래를 직접 가르는 유일한 측정이다.
+
+---
+
+# 37. 쓰기 경로 재검증 — 결백 확정, 그리고 갈래가 하나로 좁혀졌다 (2026-09-02)
+
+§36.4 대로 WRAUDIT 를 **손상이 확인된 첫 런**(FAIL 44/160)에서 다시 돌렸다.
+코드 수정은 필요 없었다 — WRAUDIT 는 이미 `blk_off` 와 `tid` 를 찍고 있었고,
+빠져 있던 것은 **그 tid 를 쓰는 객체와 대조하는 조인**이었다(§32 의 실제 결함).
+OWNER 의 `oid.lo = 0xC0FFEE00 + tid` 로 쓰는 객체의 tid 를 얻어 조인했다.
+
+## 37.1 결과 — 쓰기는 결백하다 (이번엔 신호가 있는 상태에서)
+
+| | |
+|---|---|
+| 쓰는 OID 와 버퍼 tid 를 모두 아는 블록 | 1,146,880 |
+| **버퍼 tid ≠ 쓰는 객체** | **0** |
+| 손상으로 지목된 읽기 영역의 블록 | 10,240 |
+| **그중 버퍼 tid ≠ 쓰는 객체** | **0** |
+
+§32 의 판정은 **재검증을 통과했다.** X 의 쓰기는 언제나 X 의 데이터를 실었다.
+§36.3 의 갈래 1(쓰기가 남의 데이터를 실었다)은 **배제**된다.
+
+### WRAUDIT MIXED 59 건은 오탐이다
+
+이 런에서 `WRAUDIT MIXED` 가 59 건 나왔고 §32 의 0 건과 달라 보였으나, 전수 확인 결과
+**전부 `blk_off` 2~2668, `tid0=0 round0=0`** 이었다. 데이터 청크는 `blk_off` 13,352,887 까지
+뻗어 있다. 즉 이들은 블롭 앞쪽 **메타데이터 영역**이며, 0 으로 시작하는 버퍼가 WRAUDIT 의
+"페이로드처럼 생겼는가"(`t0<64 && r0<64`) 필터를 통과한 것이다. 태그 페이로드가 아니다.
+손상으로 지목된 블록과 겹치는 것도 **0/59** 다.
+
+## 37.2 정정 — 한 블록은 매번 *같은* 남의 데이터를 준다
+
+§36.3 에서 "같은 객체가 같은 블록을 두 번 읽어 매번 다른 tid 를 받는다"고 적었으나
+이는 오독이었다. 같은 OID 의 **서로 다른 블록**이었다. 전수 확인 결과:
+
+| | |
+|---|---|
+| 서로 다른 손상 blk | 5 |
+| **두 가지 이상의 남의 페이로드를 돌려준 blk** | **0** |
+
+`blk=12562359` 는 두 번 모두 tid=6 을 돌려줬다. **손상은 안정적이다** —
+읽을 때마다 흔들리는 값이 아니라, 그 블록에 결부된 고정된 남의 데이터다.
+이 정정은 방향을 바꾼다: 불안정했다면 전달 경로를 가리켰겠지만, 안정적이라는 것은
+**주소 대응 자체가 어긋나 있음**을 가리킨다.
+
+## 37.3 남은 갈래는 하나뿐이고, 두 형태다
+
+확정된 사실을 나란히 놓으면:
+
+- blk B 에 대한 **쓰기 버퍼는 X 의 데이터였다** (§37.1)
+- blk B 를 쓴 것은 **X 뿐이다** (§33, §36.3)
+- blk B 를 읽으면 **Y 의 데이터가 안정적으로 나온다** (§37.2)
+
+세 가지가 동시에 참이려면 **논리 주소와 물리 위치의 대응이 어긋나야 한다.** 두 형태:
+
+1. **빗나간 쓰기** — Y 의 쓰기가 Y 의 블록과 **B 에도** 내려앉았다. B 의 물리 내용이 실제로 Y 다.
+2. **빗나간 읽기** — B 의 물리 내용은 X 인데, B 를 읽으려는 요청이 **Y 의 블록에서** 가져온다.
+   주소 계산이 결정적으로 틀리면 반복 읽기에서도 같은 Y 가 나오므로 §37.2 와 모순되지 않는다.
+
+## 37.4 다음 — 물리 내용을 DAOS 밖에서 확인한다
+
+두 형태를 가르는 측정은 하나다: **손상된 blk B 의 물리 내용을 DAOS 를 거치지 않고 읽는다.**
+`tests/spdk_blob_tagio.c` 의 blobstore 리더로 런 종료 후 B 를 직접 읽어,
+
+- B 가 실제로 **Y** 를 담고 있으면 → **빗나간 쓰기** (형태 1)
+- B 가 실제로 **X** 를 담고 있으면 → **빗나간 읽기** (형태 2)
+
+더 싼 선행 측정도 있다: **정지 상태 재읽기.** 런이 끝나 동시성이 사라진 뒤 같은 객체를
+다시 읽어, 여전히 Y 가 나오면 미디어/대응이 지속적으로 어긋난 것이고, X 가 나오면
+손상이 동시성 창에 묶인 현상이라는 뜻이다. 이쪽을 먼저 한다.
+
+---
+
+# 38. ★★ 정지 상태 재읽기 — 손상은 미디어에 남는다. 빗나간 *쓰기*다 (2026-09-02)
+
+§37.4 의 선행 측정. `obj_integrity.c` 에 `-A <round>` 감사 모드를 추가했다:
+워크로드를 건너뛰고 **별도 프로세스에서 단일 스레드로 직렬 재읽기**만 수행해,
+동시성이 완전히 사라진 뒤에도 마지막 라운드 태그가 남아 있는지 본다.
+
+## 38.1 결과
+
+| | |
+|---|---|
+| 손상 런 | **FAIL 33/160** |
+| 정지 상태 감사 (별도 프로세스, 직렬, 동시성 0) | **AUDIT-FAIL 4/16 객체가 여전히 틀림** |
+
+```
+AUDIT t4  first bad at 4194304 (chunk-aligned): t5 r9 off 0        foreign-obj=524288
+AUDIT t5  first bad at 0       (chunk-aligned): t4 r9 off 4194304  foreign-obj=1048576
+AUDIT t8  first bad at 20971520(chunk-aligned): t4 r9 off 20971520 foreign-obj=524288
+AUDIT t15 first bad at 20971520(chunk-aligned): t8 r9 off 20971520 foreign-obj=524288
+```
+
+**손상은 미디어에 지속된다.** 동시성이 없는 상태에서, 다른 프로세스로, 직렬로 읽어도
+같은 남의 데이터가 나온다. 읽기 창에 묶인 일시적 현상이 아니다.
+
+## 38.2 서명이 드러났다 — 청크가 서로 자리를 바꿨다
+
+무작위 오염이 아니다. 두 가지 구조가 보인다.
+
+**상호 교환 (t4 ↔ t5):**
+
+| 객체 | 논리 오프셋 | 실제로 담긴 것 |
+|---|---|---|
+| t4 | 4 MiB | **t5** 의 **0** 오프셋 데이터 |
+| t5 | 0 | **t4** 의 **4 MiB** 오프셋 데이터 |
+
+**두 청크가 목적지를 맞바꿨다.**
+
+**동일 오프셋 사슬 (t4 → t8 → t15):**
+
+| 객체 | 논리 오프셋 | 실제로 담긴 것 |
+|---|---|---|
+| t8 | 20971520 | t4 의 **20971520** (같은 오프셋) |
+| t15 | 20971520 | t8 의 **20971520** (같은 오프셋) |
+
+**같은 논리 오프셋을 쓰는 객체들끼리** 목적지가 한 칸씩 밀렸다.
+모두 **마지막 라운드(r9)** 의 데이터이고, 모두 **청크 정렬**이다.
+
+## 38.3 §37.3 의 갈래가 결정됐다 — 형태 1
+
+§37.3 은 두 형태를 남겼다. 정지 상태에서도 틀리므로:
+
+- ~~형태 2: 빗나간 읽기~~ — **배제.** 읽기가 문제라면 미디어는 옳고, 부하 없는 재읽기는
+  올바른 데이터를 돌려줬어야 한다.
+- **형태 1: 빗나간 쓰기 — 확정.** 데이터가 물리적으로 잘못된 곳에 **영구히** 놓였다.
+
+§37.1 과 합치면 결론은 하나다: **버퍼의 내용은 옳았고, 그것이 내려간 주소가 틀렸다.**
+동시에 진행되는 두 쓰기가 목적지를 맞바꾼다. 이 조사가 처음부터 쫓던 "읽기 손상"은
+사실 **쓰기 시점에 이미 벌어진 일**이었고, 읽기는 정직하게 그 자리에 있는 것을 돌려준 것뿐이다.
+
+## 38.4 계측이 왜 이걸 못 봤는지도 설명된다
+
+OWNER 와 WRAUDIT 는 **같은 `bio_iov` 의 주소를 읽는다**. 주소 배정 자체가 이미 어긋나 있다면
+두 계측 모두 "일관되게 옳다"고 보고한다 — X 의 버퍼에 X 의 데이터가 있고, 그 biov 가 가리키는
+blk 를 X 의 것으로 기록한다. 어긋남은 그 아래가 아니라 **주소가 정해지는 지점**에 있다.
+§33 의 "쓴 OID == 읽는 OID" 도 같은 이유로 참이면서 무의미하다.
+
+## 38.5 다음
+1. **주소가 정해지는 지점을 좁힌다** — VOS 가 recx→extent 를 배정하는 경로(`vos_obj_update`
+   → `vos_reserve_*` → biov 채우기)에서 **dkey/recx 와 배정된 blk 를 함께** 기록해,
+   두 객체가 서로의 오프셋을 받는 순간을 잡는다. §31 의 VEA 계측은 예약의 *겹침*만 봤을 뿐
+   **어느 요청에 어느 예약이 돌아갔는지**는 보지 않았다 — 그것이 정확히 이 구멍이다.
+2. 재현 레시피 확정: 포맷 → 1 회 실행 → `-A` 감사. 손상이 **영구적이며 검증 가능**하므로
+   업스트림 보고가 훨씬 강해진다(읽기 경합이 아니라 **데이터 유실/오배치**).
+
+---
+
+# 39. VOS 주소 배정 계측 — 여기도 깨끗하다. 창이 두 함수 사이로 좁혀졌다 (2026-09-02)
+
+§38.5 대로 주소가 정해지는 지점을 계측했다. `srv_obj` 는 RPC 의 `orw_dkey` 를 갖고 있고
+재현기는 dkey 를 청크 인덱스(uint64)로 쓰므로, OWNER 로그에 dkey 를 붙이면
+**`(객체, 논리 청크) → 물리 블록` 대응이 쓰기·읽기 양쪽에서 그대로 드러난다.**
+(`OWNER blk=.. op=R|W oid=.. dkey=.. firstw=..`)
+
+## 39.1 결과 — 배정에 결함이 없다
+
+손상 런(FAIL 15/160)의 로그에서:
+
+| 검사 | 결과 |
+|---|---|
+| 쓰기 키 `(oid,dkey)` | 112 (= 16 객체 × 7 청크, 정확히 일치) |
+| **두 개 이상의 `(oid,dkey)` 에 배정된 블록** | **0** |
+| **그 키가 쓴 적 없는 블록으로 해석된 읽기** | **0** |
+| 감사 패스에서도 중복 배정 | 0 |
+
+**논리→물리 대응은 완전히 일관적이다.** 앨리어싱도 없고, 읽기가 엉뚱한 블록으로
+해석되는 일도 없다. 형태 1 을 "VOS 가 주소를 잘못 준다"로 읽었던 §38.5 의 1 번은
+**성립하지 않는다.**
+
+## 39.2 그래서 창이 두 함수 사이로 좁혀졌다
+
+확정된 사실을 다시 정렬하면:
+
+| 지점 | 계측 | 확인된 것 |
+|---|---|---|
+| VOS 배정 | OWNER + dkey (§39.1) | `(X, 청크 c) → blk B`, B 는 X 만의 것 |
+| `bio_iod_post` 직전 | WRAUDIT (§37.1) | biov 의 버퍼에 **X 의 데이터**가 들어 있다 |
+| 미디어 | 정지 상태 감사 (§38) | blk B 에 **Y 의 데이터**가 영구히 있다 |
+
+세 지점이 모두 참이므로, 어긋남은 **`bio_iod_post` 에서 SPDK 호출까지의 구간**에 있다.
+즉 `dma_rw()` → DMA 매핑 → blob I/O 사이에서 **버퍼와 목적지의 짝이 뒤바뀐다.**
+§38.2 의 상호 교환(t4↔t5) 서명은 정확히 이 형태다 — 두 개의 동시 쓰기가 짝을 맞바꾼다.
+
+## 39.3 §30 도 재검증 대상이다
+
+§30 은 `nvme_rw()` 를 계측해 "blob·채널·범위 정상, 예약 내 100 %, 발행:완료 1:1" 로
+이 구간을 배제했다. 그러나 **§32 와 똑같은 결함이 있다** — 그 런이 포맷 직후 첫 런이었는지,
+애초에 손상이 난 런이었는지 기록이 없다. 그리고 §30 은 `io_off` 가 *예약 범위 안*인지만
+봤을 뿐, **그 `payload` 에 담긴 데이터가 그 `io_off` 의 주인 것인지**는 보지 않았다.
+§32 가 "버퍼 내부 일관성만 보고 소유자와 대조하지 않은" 것과 같은 종류의 구멍이다.
+
+## 39.4 다음 — 짝을 직접 확인한다
+
+`nvme_rw()` 안에서 **`io_off` 와 그 순간 `payload` 에 실린 tid 를 함께** 기록한다.
+그러면 §37.1(bio_iod_post 에서는 옳았다)과 조인해 한 번에 갈린다:
+
+- nvme_rw 가 **(X 의 blk, Y 의 데이터)** 로 호출된다 → 짝이 **DAOS 안에서** 뒤바뀌었다
+  (`dma_rw` 경로). DAOS 버그로 확정.
+- nvme_rw 가 **(X 의 blk, X 의 데이터)** 로 호출된다 → 짝은 옳았고 SPDK/장치가
+  잘못 내려앉혔다. §28·§29 의 단독 재현기가 깨끗했던 것과 정면으로 충돌하므로,
+  그 재현기가 재현하지 못한 조건(동시 read/write 혼합 등)을 특정해야 한다.
+
+---
+
+# 40. nvme_rw 짝 계측 — SPDK 호출까지 전부 옳다. 손상은 *발행 이후*에 생긴다 (2026-09-02)
+
+§39.4 대로 `nvme_rw()` 안, `spdk_blob_io_write()` 직전에 **그 순간 `payload` 에 실린 tid** 를
+목적지 블록과 함께 기록했다(`PAIR blk= cnt= tid= round= off0= foreign=`).
+`pg_idx` 는 OWNER 의 `blk` 와 같은 주소 공간이라 직접 조인된다.
+
+## 40.1 짝은 옳다
+
+손상 런 FAIL 70/160, 영구 손상 6/16 객체.
+
+| 검사 | 결과 |
+|---|---|
+| PAIR 레코드 중 VOS 배정과 조인 가능 | **1120** (= 16 객체 × 7 청크 × 10 라운드, 정확히 일치) |
+| **payload tid ≠ VOS 가 그 블록을 준 tid** | **0** |
+| `io_off` 가 두 개 이상의 `pg_idx` 에서 도달됨 | 0 |
+| `io_off / pg_idx` 비율 | 1.0 (단일값) |
+
+**DAOS 가 SPDK 에 건네는 것은 주소도 데이터도 전부 옳다.**
+
+## 40.2 지목 추적 — 올바른 블록에 올바른 데이터를 보냈는데 남의 것이 남는다
+
+영구 손상된 t7 의 청크 0 을 끝까지 따라갔다:
+
+| 단계 | 관측 |
+|---|---|
+| VOS 배정 (t7, 청크0, r9) | `blk 13245367` |
+| SPDK 호출 시 payload | **tid=7 round=9 off0=0 foreign=0** (옳음) |
+| 정지 상태 감사의 읽기 해석 | `blk 13245367` (같은 블록, 옳음) |
+| 감사가 실제로 받은 내용 | **t4 의 r9 청크0** |
+
+그리고 t4 의 r9 청크0 은 `blk 13244343` 으로 갔다 — **정확히 1024 블록(한 청크 4 MiB) 앞**,
+배정 순서도 연속(seq 1704 → 1705)이다. 즉 **연속 배정된 인접 청크 사이에서** 내용이 밀렸다.
+
+## 40.3 데이터 영역을 떠받치는 DMA 버퍼는 16 개뿐이다
+
+`BLOBIO` 로그에서 데이터 영역(io_off ≥ 10⁶)의 I/O 에 쓰인 **서로 다른 payload 버퍼는 16 개**이며,
+**16 개 전부가 여러 io_off 에 재사용**된다. 즉 DMA 청크 풀이 매우 공격적으로 재활용된다.
+발행 시점의 내용은 옳으므로, **발행 이후에 그 버퍼가 다른 데이터로 덮이면** 장치가 뒤늦게
+읽어 갈 때 남의 데이터를 옮기게 된다 — §38.2 의 상호 교환과 §40.2 의 인접 청크 밀림이
+모두 이 형태다.
+
+### 다만 "완료 전 재사용" 수치는 철회한다
+
+이 로그로 "이전 I/O 가 완료되기 전에 버퍼가 재발행된 사건 70 건"을 셌으나, **`biod` 포인터가
+재활용된다**(같은 주소가 나중에 다른 biod 로 다시 등장). `BLOBIO DONE` 은 `biod` 로만
+식별되므로 완료 여부를 포인터 동일성으로 판정할 수 없다. **그 수치는 근거가 없어 철회한다.**
+버퍼 재사용 자체(16/16)는 사실이지만, 그것이 *완료 전*이었는지는 이 계측으로 알 수 없다.
+
+## 40.4 남은 두 가지와, 그것을 가르는 방법
+
+- **발행 이후 버퍼가 덮인다** (조기 재활용) — DAOS 버그.
+- **짝은 끝까지 옳았고 SPDK/장치가 잘못 내려앉힌다** — §28·§29 의 단독 재현기가 깨끗했던 것과 충돌.
+
+포인터 동일성 추론을 버리고 **내용을 직접 재확인**하면 갈린다:
+**`rw_completion()` 에서 각 영역의 payload 를 다시 스캔해, 발행 시점에 기록해 둔 tid 와 비교한다.**
+발행 때 tid=7 이었는데 완료 때 tid=4 라면 **조기 재활용이 직접 증명된다** —
+포인터가 재활용되든 말든 무관하다. 발행 시점 tid 를 영역별로 보관하려면
+`struct bio_rsrvd_region` 에 디버그 필드 하나를 더하면 된다.
+
+---
+
+# 41. 완료 시점 재스캔 — 조기 재활용도 아니다. 결함은 SPDK API 아래에 있다 (2026-09-02)
+
+§40.4 대로 포인터 동일성 추론을 버리고 **내용을 직접 재확인**했다.
+`struct bio_rsrvd_region` 에 발행 시점 tid/round 를 새기고(`nvme_rw`),
+`rw_completion()` 에서 그 영역의 payload 를 4 KiB 페이지마다 다시 훑어 비교한다
+(`RESCAN OK` / `RESCAN CHANGED`).
+
+## 41.1 결과
+
+손상 런 FAIL 23/160, 영구 손상 1/16 객체.
+
+| 영역 | RESCAN OK | RESCAN CHANGED |
+|---|---|---|
+| **데이터 (blk ≥ 10⁶)** | **1120** | **0** |
+| 메타데이터/WAL (blk < 10⁶) | 1902 | 166 |
+
+**데이터 영역에서 payload 는 발행과 완료 사이에 단 한 번도 바뀌지 않았다.**
+(메타데이터의 166 건은 WAL 버퍼가 정상적으로 다시 채워지는 것이다.)
+
+⇒ **§40.3 이 제기한 조기 버퍼 재활용은 배제된다.**
+
+## 41.2 이제 DAOS 쪽 경로는 전부 소진됐다
+
+| 지점 | 계측 | 결과 |
+|---|---|---|
+| VOS 주소 배정 | OWNER + dkey (§39) | `(X,청크)→blk B`, B 는 X 만의 것 |
+| `bio_iod_post` 직전 버퍼 | WRAUDIT (§37) | X 의 데이터 |
+| SPDK 호출 시 짝 | PAIR (§40) | 주소 X 의 것, 데이터 X 의 것 |
+| **SPDK 완료 시 버퍼** | **RESCAN (§41)** | **여전히 X 의 데이터** |
+| 미디어 (정지 상태) | 감사 (§38) | **Y 의 데이터, 영구히** |
+
+DAOS 는 옳은 주소에 옳은 데이터를 건넸고, 장치가 그것을 읽어 갈 때까지 버퍼도 옳았다.
+그런데 그 블록은 남의 데이터를 담고 있다. **결함은 `spdk_blob_io_write()` 의 API 계약 아래**,
+즉 SPDK blobstore/bdev/드라이버 또는 장치에 있다.
+
+## 41.3 §28·§29 와의 충돌을 해소해야 한다
+
+이 결론은 §28(SPDK 드라이버 단독 재현기 0/2560)·§29(blobstore 단독 재현기 0/1280)와
+정면으로 충돌한다. 따라서 **그 재현기들이 갖지 못한 조건**이 원인이어야 한다.
+가장 두드러진 구조적 차이는 하나다:
+
+> 단독 재현기는 **하나의 blob** 에만 I/O 했다.
+> DAOS MD-on-SSD 는 **같은 blobstore 위의 여러 blob**(WAL, meta, data)에 동시에 I/O 한다.
+
+§41.1 의 숫자가 이 방향을 강하게 시사한다 — 메타데이터/WAL 영역에서는 버퍼가 실제로
+활발히 재사용되고 있고(166 건 변경), 그 트래픽이 데이터 blob 트래픽과 **같은 blobstore·같은
+채널**을 공유한다. §40.2 의 "연속 배정된 인접 청크 사이 밀림"도 blob 내부 오프셋 변환
+(`page2io_unit`) 이 blob 별 클러스터 맵을 거친다는 점과 맞물린다.
+
+## 41.4 다음 (우선순위)
+1. **다중 blob 단독 재현기.** `tests/spdk_blob_tagio.c` 를 확장해 **같은 blobstore 에 두 개 이상의
+   blob** 을 만들고, 한쪽에 작은 쓰기를 지속적으로 흘리면서 다른 쪽에 4 MiB 태그 쓰기를 병행한다.
+   §28·§29 가 놓친 조건을 정확히 재현하는 것이며, 성공하면 **DAOS 없이 SPDK 버그를 증명**한다.
+   가장 값이 크다.
+2. **물리 내용 직접 확인.** DAOS 정지 후 그 blobstore 를 단독으로 붙여 손상 blk 를 읽어,
+   빗나간 쓰기(내용이 Y)인지 빗나간 읽기(내용이 X)인지 최종 확정한다.
+3. **blob 클러스터 맵 덤프** — 두 blob 의 클러스터 맵이 겹치는지 확인(§31.2-3 의 미결 항목).
+
+---
+
+# 42. 다중 blob 단독 재현기 — 여전히 깨끗하다. §41.3 의 전제는 틀렸다 (2026-09-02)
+
+## 42.1 먼저 정정 — 재현기는 이미 다중 blob 이었다
+
+§41.3 은 "단독 재현기는 하나의 blob 에만 I/O 했다"를 근거로 다중 blob 을 1 순위로 놓았다.
+**틀렸다.** `tests/spdk_blob_tagio.c` 는 처음부터 **워커마다 별도 blob**(기본 8 개)을 만들고
+각자의 io_channel 로 동시에 4 MiB I/O 를 한다. §29 는 이미 다중 blob 조건을 포함했다.
+
+## 42.2 그래서 실제로 빠져 있던 조건을 넣었다
+
+코드를 읽고 DAOS 와의 실제 차이를 찾아 네 가지를 추가했다:
+
+| 옵션 | 넣은 조건 | 왜 |
+|---|---|---|
+| `-Y MiB` | blob 용량을 키우고 **라운드마다 다른 비-0 오프셋**에 쓴다 | 기존 버전은 blob 을 I/O 하나 크기로 만들고 **항상 오프셋 0** 에 썼다. §40.2 가 가리키는 클러스터 맵 오프셋 변환을 전혀 건드리지 않는다 |
+| `-K n` / `-k KiB` | **WAL 형 blob** 에 작은 쓰기를 지속적으로 흘린다 | MD-on-SSD 는 WAL·meta·data blob 을 한 blobstore 에서 동시에 돌린다. 균일한 4 MiB I/O 로는 재현되지 않는 조건 |
+| `-X` | 모든 blob 이 **io_channel 하나를 공유** | DAOS 는 xstream 당 채널 하나를 여러 blob 이 공유한다 |
+| 태그 | 페이로드 태그에 **blob 바이트 오프셋**을 포함 | 같은 blob 의 다른 오프셋에서 밀려온 데이터도 남의 blob 만큼 정확히 지목 |
+
+## 42.3 결과 — 전부 깨끗하다
+
+| arm | 조건 | 결과 |
+|---|---|---|
+| A | 원래 형태 (오프셋 0, WAL 없음, blob 별 채널) | **PASS 0/160** |
+| B | 회전 오프셋, 용량 128 MiB, WAL 없음 | **PASS 0/160** |
+| C | 회전 오프셋 + WAL blob 1 개 (작은 쓰기 1607 회) | **PASS 0/160** |
+| D | 회전 오프셋 + WAL blob 4 개 + 공유 채널 (8818 회) | **PASS 0/160** |
+| E | 워커 16, 라운드 40, 용량 **4 GiB**, WAL 4, 공유 채널 | **PASS 0/640** |
+| F | 워커 16, 라운드 40, 용량 **16 GiB**, WAL 4, 공유 채널 | **PASS 0/640** |
+
+같은 장비, 같은 드라이브(`0000:02:00.0`), 같은 SPDK 빌드에서 **2320 회 검사 중 손상 0 건**이다.
+같은 드라이브 위의 DAOS 는 포맷 직후 첫 런에서 읽기의 **약 14 %** 가 손상된다.
+
+## 42.4 부수적으로 배제된 것
+
+§40.3 이 제기했던 "두 biod 가 같은 DMA 청크 영역을 공유한다"도 이 조사로 배제된다.
+공유라면 X 의 완료 시점 재스캔이 Y 의 데이터를 봤어야 하는데(§41 의 RESCAN),
+데이터 영역 1120 건 전부 `RESCAN OK` 였다. 청크 메모리는 공유되지 않는다.
+
+## 42.5 ★ 진짜 문제는 다른 데 있다 — §34 이전의 모든 "배제"가 의심스럽다
+
+이 조사에서 계층별 계측은 모두 깨끗하고, DAOS 없는 재현기도 모든 조건에서 깨끗하다.
+그런데 DAOS 는 같은 하드웨어에서 재현성 21/21 로 손상된다. 두 가지 중 하나다.
+
+1. 아직 모방하지 못한 조건이 남아 있다.
+2. **§34 이전에 "무관"으로 판정한 축들이 실제로는 검정력 0 이었다.**
+
+**2 번이 훨씬 유력하고, 지금 가장 값싼 재검이다.** §34 는 손상이 *포맷 직후 첫 런*에만
+존재함을 보였다. 그런데 §12·§20·§21·§24·§30·§32 는 그 사실을 모르는 상태에서 측정됐고,
+그중 포맷 경계를 통제하지 않은 것들은 **신호가 없는 구간을 비교한 것**이다.
+§32(쓰기 경로)와 §30(nvme_rw)은 §37·§40 에서 재검증했지만, **구성 축들은 아직 하지 않았다.**
+
+현재 증거가 가리키는 재검 1 순위는 **`bdev_roles` / 역할 배치**다.
+DAOS 는 한 장치를 WAL·meta·data 역할로 쪼개 쓰는데(§41.1 의 RESCAN 이 메타/WAL 영역에서만
+166 건 변경을 보인 그 구조), 역할 오프셋 변환이 틀리면 정확히 **"blob 오프셋은 옳고 물리
+위치는 틀리다"** 가 된다. 이 축은 §24 계열에서 "배제"됐으나 **포맷 경계 통제 없이** 였다.
+
+## 42.6 다음
+1. **`bdev_roles` A/B 재검** — 역할을 여러 장치로 분리한 구성 대 한 장치에 모은 구성,
+   **런마다 포맷**하는 §35 하네스로. 코드 수정 불필요. **1 순위.**
+2. 물리 내용 직접 확인(§41.4-2) — 여전히 유효한 최종 확정 수단.
+3. 그래도 안 갈리면 재현기를 `daos_server` 가 만든 blobstore 옵션(클러스터 크기,
+   md 페이지 수, 역할)과 **동일하게** 맞춘다.
+
+---
+
+# 43. SPDK 버전 축 — 범프 직전(v24.09)도 손상된다. 배제 (2026-09-02)
+
+## 43.1 문제 제기가 옳았다 — 우리가 쓰던 SPDK 는 갓 올라간 것이었다
+
+`daos-stock` 이 고정한 SPDK 와 실제 빌드는 **v26.01 로 일치**한다. 그러나 그 핀 자체가 새것이다:
+
+```
+c872e2dd8  DAOS-18943 build: Upgrade SPDK dependency to v26.01 (#18172)   2026-05-22
+8f8b9578c  DAOS-17207 build: upgrade to SPDK 24.09 (#16774)              ← 그 전 핀
+```
+
+우리 트리 HEAD 는 2026-06-26, **범프 5주 후**다. 범프 커밋은 스스로 "significant changes and
+new features … required multiple compatibility fixes across the build system and codebase" 라고
+적고 있다(`spdk_pci_device_get_socket_id()` → `get_numa_id()`, SPDK 패치 제거,
+ISA-L Crypto 2.25→2.26 동반 상향).
+
+게다가 §13·§18 의 "2.8 에서도 재현된다"는 결론은 **교란돼 있었다** — `daos-gds`(2.8-wsd)
+트리도 `spdk=v26.01` 을 고정한다. 즉 시험한 것은 "2.8 코드 + 갓 범프된 SPDK" 였고,
+2.8 릴리스가 쓰는 v24.09 는 그때까지 **한 번도 시험하지 않았다.**
+
+## 43.2 범프 직전 커밋을 그대로 빌드했다
+
+핀만 되돌리면 API 호환 수정 때문에 빌드가 깨진다. 그래서 범프 직전 커밋
+`6cc78c444`(= `c872e2dd8^`, `spdk=v24.09`)를 worktree 로 떼어 **격리된 PREFIX**
+(`/var/daos-prebump`)로 전체 빌드했다.
+
+| | |
+|---|---|
+| 범프 직전 빌드의 SPDK | **24.9.0** |
+| 스톡 빌드의 SPDK | 26.1.0 |
+| DAOS 버전 | 양쪽 2.9.100 |
+
+빌드 중 걸린 것들: SPDK 24.09 는 `pip` 을 요구한다(v26.01 이 `uv` 로 바꾼 그 부분) — `pip3`
+심링크로 해결. 실패한 부분 빌드가 남으면 scons 가 "spdk already has a build directory" 로
+재빌드를 건너뛴다 — prebump 경로만 지우고 재개. `systemd-run` 에 `HOME` 이 없어 Go
+컨트롤 플레인 빌드가 실패 — `--setenv=HOME=/root`. 기동 시 `/usr/bin/daos_server_helper`
+(RPM 2.8.0)를 집어 버전 불일치 — 스톡과 같은 방식으로 drop-in 에 `Environment=PATH=` 를
+앞세워 해결.
+
+## 43.3 결과 — 24.09 도 똑같이 손상된다
+
+포맷 직후 첫 런(§34 조건)으로 4 회:
+
+| 런 | SPDK 24.09 |
+|---|---|
+| 1 | **FAIL 38/160** |
+| 2 | FAIL 10/160 |
+| 3 | FAIL 11/160 |
+| 4 | FAIL 17/160 |
+| **합계** | **76 / 640 = 11.9 %** |
+
+서명도 동일하다 — 청크 정렬, 4 MiB 통째로 남의 객체 데이터, `retry=STILL WRONG`:
+
+```
+CORRUPT t7 r7 first bad word at 20971520 (chunk-aligned): t9 r7 off 20971520
+CORRUPT t4 r8 first bad word at 8388608  (chunk-aligned): t1 r8 off 0
+CORRUPT t8 r9 first bad word at 4194304  (chunk-aligned): t3 r9 off 4194304
+```
+
+v26.01 arm 의 첫-런 비율은 §34·§35 누적 13.7 % 였다. **11.9 % 대 13.7 % — 차이가 없다.**
+
+## 43.4 판정
+
+**SPDK 버전 축은 배제된다.** v26.01 범프는 이 결함을 만들지 않았다. 결함은 **v24.09 시절부터
+존재**하며, 따라서:
+
+- 2.8 릴리스 계열(v24.09 고정) 사용자도 **영향을 받는다.** 이건 새 회귀가 아니다.
+- §13·§18 의 교란은 해소됐다 — 결론("업스트림도 재현")은 이제 **올바른 SPDK 로도** 성립한다.
+- 업스트림 보고 시 "최신 SPDK 범프 때문"이라는 손쉬운 기각을 미리 막을 수 있다.
+
+## 43.5 남은 것
+§42.6 의 1 순위였던 **`bdev_roles`/역할 배치 재검**이 그대로 다음이다.
+그리고 §42.5 의 지적 — **§34 이전에 "무관"으로 판정한 구성 축 전체**가 검정력 0 이었을
+가능성 — 이 여전히 가장 값싼 재검 묶음이다. 이번 절은 그 목록에서 SPDK 버전 하나를,
+이번엔 신호가 있는 조건에서 제대로 지웠다.
+
+---
+
+# 44. `bdev_roles` 재검 — 역할을 물리 분리해도 손상된다. 배제 (2026-09-02)
+
+§42.6 의 1 순위. 이번에는 **포맷 경계를 통제**하고(런마다 재기동+포맷) 돌렸다.
+
+기존 구성은 디바이스 2 개(`0000:02:00.0`, `0000:03:00.0`)에 `bdev_roles: [wal, meta, data]`
+— 즉 **세 역할이 같은 디바이스들을 공유**한다. §41.1 의 재스캔이 메타/WAL 영역에서만
+버퍼 변경 166 건을 본 그 구조이고, 역할 영역 오프셋 변환이 틀리면 정확히
+"blob 오프셋은 옳고 물리 위치는 틀리다" 가 된다.
+
+| arm | 구성 |
+|---|---|
+| A | nvme 티어 1 개, `bdev_roles: [wal, meta, data]` (두 디바이스 공유) |
+| B | nvme 티어 2 개 — `[wal, meta]` → `02:00.0`, **`[data]` → `03:00.0`** (물리 분리) |
+
+## 44.1 결과
+
+| arm | 런별 손상 | 합계 |
+|---|---|---|
+| A 역할 공유 | 25, 11, 31, 9 | **76/640 = 11.88 %** |
+| B 역할 분리 | 20, 33, 30, 5 | **88/640 = 13.75 %** |
+
+평균차 −3.00/런, 정확 순열검정 **p = 0.743**. 차이 없음.
+그리고 **채점된 8 런 전부 손상됐다**(최소 A 9, B 5).
+
+**핵심은 p 값이 아니다.** arm B 에서 데이터 디바이스(`03:00.0`)는 **오직 data 역할만** 갖는다 —
+그 디바이스에는 WAL 도 meta 도 없다. 그런데도 손상률이 그대로다.
+⇒ **역할 영역 간 간섭은 원인이 아니다.** `bdev_roles` 축은 이제 **신호가 있는 조건에서**
+제대로 배제됐다.
+
+## 44.2 가드가 또 값을 했다
+
+첫 시도(`roles_ab.sh`)에서 yml 편집 정규식이 틀렸다 —
+`re.sub(r'  - class: nvme\n(?:    .*\n)+', ...)` 는 arm B 가 티어를 2 개로 만든 뒤
+**첫 티어만** 치환해서 티어 수가 매 런 배로 늘었다(2 → 4 → 8).
+"arm 이 실제로 의도한 구성인지 되읽어 확인하고, 아니면 채점하지 않는다"는 가드가
+`ABORT_yml_shape ntier=4 want=2` 로 4 런을 즉시 버렸다. 가드가 없었다면
+**티어 8 개짜리 엉뚱한 구성의 손상률이 arm A/B 데이터로 둔갑**했을 것이다.
+정규식 치환을 버리고 **ram 티어까지만 담은 pristine base 에서 매번 재생성**하도록 바꿨다.
+
+§35.1 에 이어 이 가드가 값을 한 두 번째 사례다. 이 조사에서 잘못된 arm 비교의 원인은
+언제나 같았다 — **arm 이 정말 그 조건이었는지 확인하지 않은 것.**
+
+## 44.3 배제 목록 갱신 (§34 이후, 신호가 있는 조건에서 재검한 것)
+
+| 축 | 재검 절 | 결과 |
+|---|---|---|
+| 쓰기 경로 (버퍼 내용 대 소유자) | §37 | 결백 |
+| SPDK 호출 시 주소·데이터 짝 | §40 | 결백 |
+| 완료 시점 버퍼 (조기 재활용) | §41 | 결백 |
+| VOS 주소 배정 `(oid,dkey)→blk` | §39 | 결백 |
+| checkpoint 모드 | §35 | 미입증 (복제 실패) |
+| **SPDK 버전 (24.09 대 26.01)** | **§43** | **배제** |
+| **`bdev_roles` 역할 배치** | **§44** | **배제** |
+
+## 44.4 남은 것
+§34 이전에 판정된 축 중 아직 재검하지 않은 것들이 남았다 — 특히
+**oclass/복제(§12)**, **VOS aggregation(§12.8)**, **targets/helper 동시성**, **디바이스 수**.
+모두 구성 축이므로 §44 하네스에 arm 정의만 바꿔 끼우면 되고, 코드 수정이 필요 없다.
+가장 값이 큰 것은 **복제 없는 oclass(S1/SX)** 다 — RP_2G1 은 복제본이 2 개이므로,
+복제 경로가 관여하는지 아닌지는 손상 서명(§38.2 의 상호 교환)의 해석을 크게 바꾼다.
+
+---
+
+# 45. oclass 재검 — S1 도 손상된다. 복제는 필요조건이 아니다 (2026-09-02)
+
+§44.4 의 1 순위. 이 축은 이력이 나쁘다 — §20 에서 "S1 면역(0/2560)"이라 했다가
+§20 후반 2/1920 로 철회했고, 둘 다 **포맷 경계를 모르던 시절**의 측정이다.
+복제 경로가 관여하는지는 §38.2 의 상호 교환 서명 해석을 바꾸므로 제대로 정리했다.
+
+서버 구성은 양쪽 동일(단일 nvme 티어, 세 역할), 컨테이너의 객체 클래스만 바꾼다.
+런마다 재기동+포맷, 순서 균형.
+
+| arm | 컨테이너 |
+|---|---|
+| A | `RP_2G1` + `rd_fac:1` — 복제본 2 개 |
+| B | `S1` + `rd_fac:0` — 사본 1 개, 복제 경로 없음 |
+
+## 45.1 결과
+
+| arm | 런별 손상 | 합계 |
+|---|---|---|
+| A `RP_2G1` | 25, 10, 16, 25 | **76/640 = 11.88 %** |
+| B `S1` | 4, 12, 12, 12 | **40/640 = 6.25 %** |
+
+정확 순열검정 p = 0.114 (평균차 +9.00/런). **그리고 두 arm 모두 4/4 런에서 손상됐다.**
+런 종료 후 `daos cont get-prop` 으로 arm B 컨테이너가 `rd_fac = 0` 임을 확인했다.
+
+## 45.2 판정 — §20 의 "S1 면역"은 확정적으로 죽었다
+
+**복제는 필요조건이 아니다.** S1 은 사본이 하나뿐이고 복제 경로를 전혀 타지 않는데도
+4 런 전부 손상됐다(최소 4/160). 따라서 §38.2 의 상호 교환(t4↔t5)은
+**복제본 간 혼선이 아니다** — 단일 사본 경로에서도 같은 일이 일어난다.
+
+비율 차이(11.88 % 대 6.25 %, 1.90 배)는 **복제 특이 기전으로 읽어서는 안 된다.**
+`RP_2G1` 은 청크마다 두 랭크에 쓰므로 **랭크당 쓰기 volume 이 2 배**다(읽기 검사 횟수는
+양쪽 160 회로 동일). 손상 확률이 디바이스당 동시 쓰기 volume 에 비례한다면 정확히 2 배가
+기대되고, 관측된 1.90 배가 그것이다. 즉 이 차이는 **부하 스케일링으로 충분히 설명되며**,
+p = 0.114 도 그 이상을 주장할 근거가 없다.
+
+## 45.3 부수적으로 강해진 것
+
+"손상률이 랭크당 동시 쓰기 volume 에 비례한다"는 읽기는, §34 의 포맷 경계 의존성과
+합쳐 하나의 그림을 만든다 — 손상은 **갓 포맷된 미디어에 동시 쓰기가 몰릴 때** 나타나고,
+쓰기 volume 이 절반이면 절반으로 준다. 이는 산발적 비트 오류가 아니라
+**동시 쓰기 경로의 결정적 결함**이라는 해석을 지지한다.
+
+## 45.4 남은 재검 목록
+| 축 | 상태 |
+|---|---|
+| VOS aggregation (§12.8) | 미재검 |
+| targets / nr_xs_helpers 동시성 | 미재검 |
+| 디바이스 수 (1 개 대 2 개) | 미재검 |
+| 청크 크기 (손상 영역 크기와 연동, §12) | 미재검 |
+
+§45.2 의 volume 해석 때문에 **targets 동시성**과 **디바이스 수**가 다음으로 값이 크다 —
+둘 다 랭크당 동시 쓰기 volume 을 직접 바꾸므로, "volume 에 비례"가 맞는지
+독립적으로 확인할 수 있다(양성 대조 역할).
+
+---
+
+# 46. ★★ targets 동시성 — 10.8 배 증폭. 이 조사 최초의 유효한 양성 대조 (2026-09-02)
+
+§45.4 대로, 랭크당 동시 쓰기를 직접 늘려 "volume 에 비례" 가설을 시험했다.
+서버 구성은 `targets` 만 다르고(양쪽 단일 nvme 티어, 세 역할, 디버그 로깅 끔),
+런마다 재기동+포맷, 순서 균형. 두 배치(A B B A B A A B / B A B A B A)를 합산했다.
+
+## 46.1 결과
+
+| arm | 런별 손상 | 합계 |
+|---|---|---|
+| A `targets: 1` (pool ntarget=2) | 9, 5, 6, 9, 14, 10 | **53/960 = 5.52 %** |
+| B `targets: 4` (pool ntarget=8) | 88, 90, 84, 122, 92 | **476/800 = 59.50 %** |
+
+- 평균차 −86.37/런, 정확 순열검정 **p = 1/462 = 0.0022** (달성 가능한 최소값)
+- **완전 분리** — A 최대 14, B 최소 84
+- 비율 **10.8 배** (targets 4 배에 대해)
+
+`dmg pool query` 의 `ntarget=2` / `ntarget=8` 로 arm 이 실제로 적용됐음을 매 런 확인했다.
+
+## 46.2 이것이 이 조사에서 갖는 의미
+
+**처음으로 손상률을 크게, 재현성 있게, 예측한 방향으로 움직이는 노브를 찾았다.**
+§20·§22·§34.1·§35 에서 뒤집힌 arm 비교들과 달리 이번은 효과크기 10 배에 완전 분리다.
+이것은 세 가지를 준다.
+
+1. **양성 대조.** 지금까지 "이 축은 무관"이라고 판정한 모든 측정에 대해,
+   그 하네스가 애초에 차이를 감지할 수 있었는지 검증할 기준이 생겼다.
+   §43(SPDK 버전)·§44(bdev_roles)·§45(oclass)의 "차이 없음"은 이제 훨씬 신뢰할 만하다 —
+   같은 하네스가 targets 축에서는 p=0.002 로 10 배 차이를 잡아냈으므로.
+2. **훨씬 강한 재현기.** 업스트림 보고는 `targets: 4` 로 써야 한다 — 읽기의 **59.5 %** 가
+   손상된다. 지금까지의 모든 측정은 `targets: 1`, 즉 **가장 덜 손상되는 구성**에서 했다.
+3. **기전에 대한 제약.** 4 배 동시성에 10.8 배 — **초선형**이다. 순수한 volume 비례라면
+   4 배 근처여야 한다. §45.2 의 "volume 에 비례" 해석은 **부정확했다**:
+   손상은 쓰기 *양* 보다 **동시에 진행되는 쓰기 스트림 수**에 더 민감하다.
+   이는 랭크당 xstream 이 늘 때 공유되는 자원 — DMA 청크 풀, blobstore io_channel,
+   VEA/blob 할당 경로 — 에서의 **경합**을 가리킨다.
+
+## 46.3 §45.2 정정
+
+§45.2 는 RP_2G1 대 S1 의 1.90 배를 "쓰기 volume 2 배로 설명된다"고 읽었다.
+§46 의 초선형 관계에 비추면 그 설명은 **우연히 맞은 수치**였을 수 있다.
+다만 §45 의 **판정(복제는 필요조건이 아니다)** 은 그대로 유효하다 — S1 이 4/4 런 손상됐다는
+사실은 비율 해석과 무관하다.
+
+## 46.4 하네스 사고 두 건 (둘 다 가드가 잡았다)
+
+1. **중첩 이스케이프.** 티어 텍스트를 ssh 명령 문자열 안의 heredoc 으로 쓰자
+   `bdev_list: [\"0000:02:00.0\"…]` 가 리터럴 백슬래시로 남아 서버가 설정을 거부했다
+   (`unable to parse "\"0000:02:00.0\""`). **arm A 까지 전부 `ABORT_not_joined`** 로
+   떨어져 즉시 드러났다 — 작동하던 arm 이 같이 죽는 것이 오히려 신호였다.
+   §44 에서 통한 `printf '%s\n' | ssh` 방식으로 교체하고, 가드에
+   **백슬래시-쿼트 검출**을 추가했다(단순 티어 개수 확인만으로는 이 오류를 통과시킨다).
+2. `targets: 4` 에서 `daos cont create` 가 180 초를 넘겨 2 런이 `ABORT_cont_create` 로
+   버려졌다 — 타임아웃을 300 초로 올려 보강 배치를 돌렸다. 버려진 런은 0 으로 채점되지 않았다.
+
+## 46.5 다음
+1. **`targets: 4` 로 핵심 계측을 다시 돌린다.** §37·§39·§40·§41 의 계측은 모두
+   손상률 5 % 대의 `targets: 1` 에서 "결백" 판정을 냈다. 59.5 % 조건에서 같은 계측이
+   여전히 결백한지 확인해야 한다 — **특히 §41 의 완료 시점 재스캔.** 1 순위.
+2. `targets` 를 1·2·4·8 로 스윕해 초선형 관계의 형태를 본다(경합 기전 특정에 유용).
+3. 업스트림 티켓의 재현 절차를 `targets: 4` + 포맷 후 1 회 실행 + `-A` 감사로 갱신.
+
+---
+
+# 47. `targets: 4` 에서 계측 재검 — 10 배 증폭에서도 전부 결백 (2026-09-02)
+
+§46.5 의 1 순위. §37·§39·§40·§41 의 "결백" 판정은 모두 손상률 5 % 대의 `targets: 1` 에서
+나왔다. 59.5 % 조건에서도 같은지 확인했다.
+
+계측 로깅을 켠 상태에서도 손상률이 유지된다: **FAIL 85/160 (53 %)**, 영구 손상 **7/16 객체**.
+(엔진 로그 356k 줄 — 로깅이 효과를 죽이지 않는다.)
+
+## 47.1 결과 — 네 계측 모두 여전히 결백
+
+| 계측 | targets:1 | **targets:4** |
+|---|---|---|
+| §41 완료 시점 재스캔 (데이터 영역) | OK 1120 / CHANGED 0 | **OK 1120 / CHANGED 0** |
+| §40 PAIR 짝 (payload tid 대 배정 tid) | 1120 조인, 불일치 0 | **1120 조인, 불일치 0** |
+| §39 VOS `(oid,dkey)→blk` 중복 배정 | 0 | **0** |
+| §39 키가 쓴 적 없는 블록으로 해석된 읽기 | 0 | **0** |
+| §36.3 손상 영역의 쓴 tid == 기대 tid | 38/38 | **335/335** |
+
+손상 영역 크기는 전부 1024 블록(= 4 MiB, 청크 크기) 그대로다.
+
+```
+tgt4 blk=3052782+1024 expected tid=4  got tid=12 round=0
+tgt4 blk=3053806+1024 expected tid=6  got tid=3  round=0
+tgt6 blk=3054830+1024 expected tid=12 got tid=13 round=0
+```
+
+**동시성을 10 배로 올려도 DAOS 는 옳은 주소에 옳은 데이터를 건네고, 장치가 읽어 갈 때까지
+버퍼도 옳고, 주소 대응도 단사(injective)다. 그런데 읽기의 절반이 남의 데이터를 돌려준다.**
+
+## 47.2 정정 — 처음에 잡았다고 생각한 두 신호는 내 집계 오류였다
+
+첫 집계에서 두 가지가 새로 보였다:
+
+- `(oid,dkey)` 두 개 이상에 배정된 블록 **358,400 개** (targets:1 에서는 0)
+- PAIR 불일치 **2 건** (targets:1 에서는 0)
+
+둘 다 **틀렸다.** `targets: 4` 에서는 **타깃마다 자기 blob 을 갖는다.** OWNER 가 찍는
+`blk` 은 그 타깃 blob 안의 오프셋이므로, 서로 다른 타깃의 같은 `blk` 숫자는
+**서로 다른 물리 위치**다. 나는 `blk` 만으로 키를 만들어 4 개 타깃의 주소 공간을 겹쳐 세었다.
+targets:1 에서는 blob 이 하나뿐이라 이 오류가 드러나지 않았다.
+
+엔진 로그 접두사 `DAOS[pid/tgt/ult]` 의 가운데 필드가 xstream/타깃 id 다(이 런에서는 3,4,5,6).
+키를 `(tgt, blk)` 로 고치자 **358,400 → 0**, **PAIR 불일치 2 → 0**, 그리고 PAIR 조인 수도
+420 → **1120**(= 16 객체 × 7 청크 × 10 라운드, 정확)으로 맞아떨어졌다.
+
+교훈: **`blk` 은 타깃 안에서만 의미가 있다.** §33·§36·§39·§40 의 targets:1 분석은
+blob 이 하나였으므로 유효하지만, 앞으로 다중 타깃 로그를 다룰 때는 항상 `(tgt, blk)` 로 키를
+잡아야 한다.
+
+## 47.3 그래서 지금 상태
+
+증폭기(§46)는 찾았지만 **그것이 계측 가능한 지점의 어느 것도 깨뜨리지 않는다.**
+동시성이 10 배여도 각 계층은 개별적으로 옳다. 이것은 결함이
+**여러 스트림이 공유하는 자원에서, 각 스트림의 관점으로는 정상으로 보이는 방식으로**
+일어난다는 뜻이다. §41 의 재스캔이 버퍼 내용을 지키고, §40 이 주소를 지키고,
+§39 가 매핑을 지키는데도 미디어 내용이 틀리다면, 남는 것은
+**DAOS 가 관측할 수 없는 계층에서 두 I/O 가 서로의 목적지를 침범하는 것**이다.
+
+## 47.4 다음
+1. **`targets: 4` 로 단독 SPDK 재현기를 다시 돌린다.** §42 는 워커 16·blob 16 GiB 까지
+   깨끗했지만, 그때 모방하지 못한 것이 있다 — DAOS 는 **타깃마다 별도 blob 에 별도
+   io_channel** 로 동시에 쓰고, 그 채널들이 **같은 bdev** 를 공유한다. §42 의 `-X`(채널 공유)
+   와는 반대 방향의 구성이며, targets:4 가 10 배 증폭하는 것이 정확히 이 축이다. **1 순위.**
+2. §46.5-2 의 targets 스윕(1·2·4·8)으로 초선형 곡선의 형태를 본다.
+3. 물리 내용 직접 확인(§41.4-2)은 여전히 최종 확정 수단으로 남아 있다.
+
+---
+
+# 48. 타깃별 blob + 스레드 형태의 단독 재현기 — 여전히 깨끗하다 (2026-09-02)
+
+§47.4 의 1 순위. §42 를 다시 읽으니 **결정적 누락이 있었다**: 그 재현기는 워커마다 blob 과
+io_channel 을 따로 쓰지만, SPDK app 프레임워크는 **단일 리액터 스레드**에서 돌기 때문에
+"동시" 쓰기가 모두 **한 스레드에서 직렬화**된다. DAOS 는 xstream(= OS 스레드)마다
+blob 과 채널을 갖고 동시에 발행하며, 그 타깃 수가 정확히 10 배 증폭축(§46)이다.
+
+## 48.1 추가한 것 — `-M`
+
+`spdk_thread_create()` 로 **blob 마다 자기 스레드를 자기 리액터 코어에** 만들고,
+io_channel 을 그 스레드에서 할당해(채널은 할당한 스레드의 것이다) 이후 모든 발행과 완료가
+그 스레드에서 일어나게 했다. 카운터는 메인 스레드 소유이므로 종료 시
+`spdk_thread_send_msg()` 로 넘긴다(`worker_retire()`).
+
+**가드**: 종료 시 `blob->core` 매핑을 출력한다. 코어가 전부 같으면 스레드 분리가 실제로는
+일어나지 않은 것이다 — 단일 코어 마스크에서는 경고까지 낸다.
+
+## 48.2 결과 — 전부 깨끗하다
+
+| arm | 스레드/코어 | 결과 |
+|---|---|---|
+| `-m 0x1 -M` (대조: 스레드는 있으나 리액터 1 개) | `0:0 1:0 … 8:0` | **PASS 0/160** |
+| `-m 0xff -M`, 8 blob | `0:0 1:1 2:2 … 7:7` | **PASS 0/160** |
+| `-m 0xffff -M`, 16 blob + 4 WAL | 16 코어에 분산 | **PASS 0/640** |
+| `-m 0xffffffff -M`, 24 blob + 8 WAL(4 KiB) | **32 코어 전부 분산** | **PASS 0/960** |
+
+`blob->core` 출력이 32 개 서로 다른 코어를 보여주므로 **다중 스레드 발행이 실제로 일어났다.**
+같은 장비, 같은 드라이브(`0000:02:00.0`), 같은 SPDK 빌드에서 누적 **0/2720**.
+같은 조건의 DAOS 는 `targets: 4` 에서 읽기의 **53 %** 가 손상된다.
+
+## 48.3 지금까지 단독 재현기가 모방한 것 / 못 한 것
+
+| DAOS 의 조건 | 재현기 | 결과 |
+|---|---|---|
+| blobstore over nvme bdev | §29 | 깨끗 |
+| 다중 blob | §29·§42 | 깨끗 |
+| 클러스터 맵을 타는 회전 오프셋 | §42 | 깨끗 |
+| WAL 형 작은 쓰기 병행 | §42 | 깨끗 |
+| 채널 공유(`-X`) | §42 | 깨끗 |
+| 큰 blob(16 GiB) | §42 | 깨끗 |
+| **blob·채널·스레드 분리(`-M`)** | **§48** | **깨끗** |
+| 4 MiB 태그 페이로드, 쓰기 후 즉시 검증 | 전부 | 깨끗 |
+
+**아직 모방하지 못한 것으로 남은 것:**
+1. **DAOS 의 blobstore 옵션** — 클러스터 크기, md 페이지 수, `bs_opts` 전반.
+   재현기는 기본값(클러스터 1 MiB, 페이지 4 KiB)이고 DAOS 는 자기 값을 쓴다.
+2. **역할 분할된 blobstore** — DAOS 는 한 장치를 WAL/meta/data 로 쪼개고 그 위에
+   blobstore 를 올린다(§44 로 역할 *배치* 는 배제됐지만, blobstore 를 그 형태로 만드는 것
+   자체는 재현기가 하지 않는다).
+3. **Argobots ULT 스케줄링** — DAOS 는 리액터 폴링이 아니라 ULT 협력 스케줄링 위에서
+   `bio_yield()` 로 양보하며 I/O 를 발행한다. `-M` 은 OS 스레드는 흉내냈지만
+   이 스케줄링 모델은 아니다.
+4. **`spdk_bs_load` 로 기존 blobstore 를 여는 경로** — 재현기는 매번 `spdk_bs_init` 으로
+   새로 만든다. §34 의 포맷 경계가 바로 "갓 만들어진 blobstore" 조건이므로,
+   DAOS 가 포맷 직후 **load** 하는 경로와는 다르다.
+
+## 48.4 다음
+1. **재현기의 blobstore 옵션을 DAOS 와 일치시킨다** — 엔진 로그/`bio` 소스에서
+   `spdk_bs_opts` 값(클러스터 크기, md 페이지, `max_channel_ops`)을 읽어 그대로 준다.
+   가장 값싸고 가장 그럴듯하게 남은 축이다. **1 순위.**
+2. 여전히 갈리지 않으면 **물리 내용 직접 확인**(§41.4-2)으로 빗나간 쓰기 대 빗나간 읽기를
+   최종 확정하고, **§34 레시피 + `targets: 4` (53 %)** 로 업스트림 티켓을 낸다.
+   단독 재현기가 없어도 21/21 재현성과 계층별 계측 결과만으로 충분히 강한 보고가 된다.
+
+---
+
+# 49. ★★ 체크섬은 이것을 잡는다 — 조용한 데이터 유실이 아니다 (2026-09-02)
+
+"실제 시스템에서 볼 수 있는가"에 답하기 위한 측정. 심각도가 여기서 갈린다:
+읽기가 **소리 내어 실패**하면 가용성 문제이고, **rc=0 으로 남의 데이터를 반환**하면
+조용한 데이터 유실이다.
+
+`targets: 4`(비율 ~53 %), 런마다 재기동+포맷, 순서 균형.
+
+| arm | 컨테이너 속성 |
+|---|---|
+| A | `rd_fac:1` (지금까지의 모든 측정) |
+| B | `rd_fac:1,cksum:crc32,srv_cksum:on,cksum_size:4096` |
+
+## 49.1 결과
+
+| 런 | arm | cksum | 조용한 손상 | 체크섬 오류 |
+|---|---|---|---|---|
+| 1 | A | off | **FAIL 62/160** | 0 |
+| 2 | B | crc32 | **PASS 0/91** | 7 × `rc=-2021` |
+| 3 | B | crc32 | **PASS 0/72** | 9 × `rc=-2021` |
+| 4 | A | off | **FAIL 94/160** | 0 |
+| 5 | B | crc32 | **PASS 0/90** | 7 × `rc=-2021` |
+| 6 | A | — | `ABORT_cont_create` (채점 제외) | — |
+| 7 | A | off | **FAIL 29/160** | 0 |
+| 8 | B | crc32 | **PASS 0/50** | 11 × `rc=-2021` |
+
+`-2021` 은 `DER_CSUM`("Checksum error")이다(헤더에서 수치 확인).
+
+**체크섬을 켠 arm 에서 조용한 손상은 0 건이다.** 손상된 읽기는 예외 없이
+`DER_CSUM` 으로 실패한다. 검사 횟수가 160 보다 작은 것은 재현기가 첫 오류에서
+그 스레드를 종료시키기 때문이다 — 완료된 읽기는 모두 정확했다.
+
+## 49.2 클라이언트와 서버 양쪽에서 탐지된다
+
+클라이언트 측(`dc_rw_cb_csum_verify`):
+```
+Checksum mismatch at index 0/1024 3296612425 != 1342095903
+Data corruption found for recx: [0-3fffff]. Calculated {nr: 1024, ...} != received {...}
+Data Verification failed (object: [CSUM]OBJ (…3237998091.1.2, [8]) shard 1,
+                          extent: [0-3fffff]): DER_CSUM(-2021)
+```
+서버 측은 RAS 이벤트를 올린다 — `RAS EVENT id: [obj_csum_error]` (엔진 로그 637 건).
+즉 **관리 도구로 감시 가능한 이벤트**로 표면화된다. `extent: [0-3fffff]` 는 정확히
+4 MiB, 손상 서명(청크 통째)과 일치한다.
+
+## 49.3 실제 시스템에 대한 답
+
+**노출된다:**
+- 완전 스톡 클라이언트 + 완전 업스트림 서버에서 재현(§18)
+- SPDK 버전 축 배제 — 2.8 릴리스가 쓰는 v24.09 에서도 11.9 %(§43). 릴리스 사용자도 노출
+- **프로덕션 설정이 더 나쁘다** — 우리 기본값 `targets: 1` 이 가장 덜 손상되는 구성이었고,
+  `targets: 4` 만으로 53~59 %(§46). 실제 배포는 엔진당 8~16 targets 이 흔하다
+- 구성이 평범하다 — MD-on-SSD, POSIX 컨테이너, 4 MiB 청크, RP_2G1/S1 무관(§45)
+
+**노출을 좁히는 것:**
+- **하드웨어 의존성.** VM/가상 NVMe 는 재현되지 않고, **다른 실물 클러스터(192.168.34.x)는
+  nvme blob 으로 통과**했다. 우리 드라이브는 Phison 5302(PASCARI). 즉 모든 DAOS 배포가
+  아니라 특정 드라이브/펌웨어 계열일 가능성이 크다 — 끝까지 규명하지 못한 축이다
+- **포맷 경계.** 첫 런 21/21 대 이후 1/18(§34)
+- **체크섬(이 절).** 켜 두면 조용한 유실이 아니라 `DER_CSUM` + RAS 이벤트가 된다
+
+**따라서 실무적 권고는 명확하다: `cksum:crc32` + `srv_cksum:on` 을 켜라.**
+버그를 없애지는 못하지만 **조용한 데이터 유실을 탐지 가능한 실패로 바꾼다.**
+DAOS 는 체크섬이 기본 off 이므로, 이 기본값이 곧 노출이다.
+
+## 49.4 아직 답하지 못한 것 (심각도에 직접 영향)
+
+§34 에서 우리가 실제로 측정한 것은 "첫 **워크로드**"가 아니라
+**"포맷 이후 한 번도 쓰이지 않은 블록에 쓸 때"** 다. 2 런에서도 풀은 새로 만들었고
+(새 VEA 공간) 손상이 없었다 — 차이는 **미디어가 이미 한 번 쓰였다**는 것뿐이었다.
+
+그렇다면 프로덕션에서 **풀이 처음 채워지는 동안에는 계속 처녀 블록을 건드린다.**
+100 TB 풀을 몇 주에 걸쳐 채운다면 그 기간 전체가 노출 창일 수 있다 —
+"첫 런만"보다 훨씬 넓다. **이것은 추론이고 측정이 아니다.**
+
+가르는 실험: **큰 풀을 순차로 계속 채우며 매번 새로운 미기록 영역에 써서**,
+손상이 "포맷 직후 1 회"인지 "미기록 미디어에 쓰는 동안 계속"인지 확인한다. 다음 1 순위.
+
+---
+
+# 50. ★★ 노출 창은 "첫 런"이 아니다 — 미기록 미디어를 소비하는 동안 계속된다 (2026-09-02)
+
+§49.4 의 미결. §34 는 "포맷 직후 첫 런" 21/21 대 "이후" 1/18 을 보였으나, 그때의
+2·3 런은 **풀을 파괴하고 다시 만들었다** — 새 풀의 blob 은 같은 장치 영역을 되받으므로
+1 런이 이미 밟아 놓은 땅 위에 쓴 것이었다. 두 가설을 가르지 못했다.
+
+이번에는 **포맷 1 회, 풀·컨테이너를 끝까지 유지**하고, 런마다 `-T` 로 tid 기저를 바꿔
+**매번 새 객체**를 만들었다. VEA 는 앞으로 할당해 나가므로 각 런은 포맷 이후 아무도
+건드리지 않은 블록을 소비한다. `targets: 4`, 체크섬 없음, 200 GB nvme 풀.
+
+## 50.1 결과 — 계속된다
+
+| 런 | tid 기저 | 손상 |
+|---|---|---|
+| 1 | 0 | **83/160** |
+| 2 | 16 | **34/160** |
+| 3 | 32 | **34/160** |
+| 4 | 48 | **68/160** |
+| 5 | 64 | **47/160** |
+| 6 | 80 | **12/160** |
+| 7 | 96 | PASS 0/160 |
+| 8 | 112 | **9/160** |
+
+**8 런 중 7 런에서 손상**, 합계 **287/1280 = 22.4 %**. 그 사이 포맷도, 풀 재생성도,
+컨테이너 재생성도 없었다(매 런 `ntarget=8, disabled=0` 확인).
+런 종료 시점 풀 사용량: nvme 400 GB 중 **324 GB 여유** — 즉 76 GB 를 소비하는 동안
+손상이 이어졌다.
+
+## 50.2 §34 의 프레임을 고쳐야 한다
+
+**트리거는 "포맷 직후 첫 워크로드"가 아니라 "포맷 이후 한 번도 쓰이지 않은 미디어에 쓰는 것"이다.**
+
+§34 의 "이후 런은 1/18" 은 여전히 사실이지만, 그 런들은 **이미 쓰인 영역을 덮어쓰고
+있었기 때문**이다. 풀을 파괴/재생성하면 같은 장치 영역을 되받는다는 점이 그때는 보이지 않았다.
+§34 의 관측 자체는 유효하고(이미 쓰인 미디어에서는 거의 사라진다),
+바뀌는 것은 **노출 창의 크기**다.
+
+## 50.3 실제 시스템에 대한 함의 — 심각도 상향
+
+§49.3 에서 "포맷 경계"를 노출을 좁히는 요인으로 꼽았다. **그 판단을 수정한다.**
+
+프로덕션에서 풀이 처음 채워지는 동안에는 **줄곧 처녀 블록을 건드린다.**
+100 TB 풀을 몇 주에 걸쳐 채운다면 **그 기간 전체가 노출 창**이고, 초기 데이터 적재 —
+즉 가장 대량으로, 가장 되돌리기 어렵게 쓰는 시점 — 이 정확히 그 창에 들어간다.
+"배포 직후 한 번"이 아니다.
+
+노출을 실제로 좁히는 것은 이제 두 가지만 남는다:
+1. **하드웨어 의존성** — VM 은 재현되지 않고 다른 실물 클러스터(192.168.34.x)는 통과했다.
+   우리 드라이브는 Phison 5302. 끝까지 규명하지 못한 축이며 **가장 중요한 미지수**다.
+2. **체크섬**(§49) — 켜 두면 조용한 유실이 아니라 `DER_CSUM` + RAS 이벤트가 된다.
+
+## 50.4 권고 정리 (실사용자 관점)
+
+| | |
+|---|---|
+| **반드시** | `cksum:crc32` + `srv_cksum:on`. DAOS 기본이 off 이므로 기본값이 곧 노출이다 |
+| **초기 적재 후** | 전량 재읽기 검증(`obj_integrity -A` 형태). 손상은 영구적이므로 나중에도 검출된다 |
+| **감시** | RAS `obj_csum_error` 이벤트 |
+| **완화** | targets 를 낮추면 비율이 내려간다(§46, 10.8 배 축) — 성능 대가가 크므로 임시 수단 |
+
+## 50.5 남은 것
+1. **하드웨어 축 규명** — 192.168.34.x 가 통과한 이유. 드라이브 모델/펌웨어/큐 특성 비교.
+   이제 이것이 "누가 영향을 받는가"를 결정하는 유일한 미지수다. **1 순위.**
+2. 업스트림 티켓 — §34 레시피 + `targets: 4`(53 %) + §50(초기 적재 전체가 창) +
+   §49(체크섬이 잡는다)로 심각도와 완화책을 함께 제시한다.
+
+---
+
+# 51. ★★ 하드웨어 축 — "통과한 실물 클러스터"는 실물이 아니었다 (2026-09-02)
+
+§50.5 의 1 순위. §22 이후로 "다른 실물 클러스터(192.168.34.x)는 통과했다"를
+노출을 좁히는 근거로 계속 인용해 왔다. **그 전제가 틀렸다.**
+
+## 51.1 확인
+
+```
+192.168.34.30  ExaCI4-3J        systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+192.168.34.31  FlexA_3433_1-A   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+192.168.34.32  FlexA_3433_1-B   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+```
+
+NVMe 도 실물이 아니다:
+```
+00:03.0 / 00:04.0  Red Hat, Inc. QEMU NVM Express Controller (rev 02)
+/dev/nvme0n1  QEMU NVMe Ctrl  107.37 GB  512 B  FW 8.0.2
+```
+
+세 대 모두 **KVM 게스트에 QEMU 에뮬레이션 NVMe** 다. 8 vCPU Xeon Silver 4210R.
+
+## 51.2 그래서 하드웨어 축은 붕괴한다
+
+"물리 하드웨어 의존성"이라는 축은 사실 **이미 알고 있던 것 하나로 환원된다**:
+**가상 NVMe 에서는 재현되지 않는다.** §34 에서 "업스트림 CI 가 못 잡는 이유"로 적었던
+그 사실이다.
+
+**어떤 실물 장비도 면역이라는 증거는 없다.** 통과한 시스템은 전부 가상화된 것이고,
+우리가 시험한 유일한 실물 장비(cell1/cell2, PASCARI XX208H023T84P324T0910)는
+모든 조건에서 손상된다.
+
+## 51.3 §49.3 · §50.3 정정
+
+두 절에서 노출을 좁히는 요인으로 "하드웨어 의존성 — 다른 실물 클러스터는 통과"를 들었다.
+**철회한다.** 남는 것은 이렇게 읽어야 한다:
+
+| 요인 | 이전 서술 | 정정 |
+|---|---|---|
+| 하드웨어 | "특정 드라이브/펌웨어 계열일 가능성" | **가상 NVMe 만 통과. 실물 면역 사례 없음** |
+| 포맷 경계 | "배포 직후 한 번" | **§50: 초기 적재 전체가 창** |
+| 체크섬 | 조용한 유실 → `DER_CSUM` | 유효(§49) |
+
+⇒ **노출을 실제로 좁히는 것은 이제 체크섬 하나뿐이다.**
+그리고 DAOS 는 체크섬이 기본 off 다.
+
+## 51.4 드라이브 통제 실험은 실패했다 (신호 없음)
+
+cell1 에 Samsung 980 PRO(`0000:43:00.0`, 512 B 섹터)가 유휴로 있어 같은 호스트에서
+PASCARI 와 비교하려 했다. 결과는 **6 런 전부 PASS 0/160 — 대조군(PASCARI)까지 포함**.
+즉 그 하네스는 신호가 없었고 드라이브에 대해 아무것도 말하지 않는다(§34/§35 의 함정).
+
+형태를 훑어 원인을 찾았다(모두 `targets: 4`, PASCARI):
+
+| 형태 | 결과 |
+|---|---|
+| 1 랭크 / 2 디바이스 / S1 | `ABORT_not_joined` (하네스 결함) |
+| 1 랭크 / 1 디바이스 / RP_2G1(rd_lvl:rank) | `ABORT_not_joined` (하네스 결함) |
+| 2 랭크 / 1 디바이스 / S1 | `ABORT_pool_create` |
+| **2 랭크 / 2 디바이스 / S1** | **FAIL 67/160** |
+
+손상에는 **2 랭크 + 랭크당 2 디바이스**가 필요해 보인다(§12 의 디바이스 수 축을
+신호 있는 조건에서 다시 봐야 한다는 뜻이기도 하다). 그런데 유휴 Samsung 은 **한 대뿐**이고
+cell2 의 유일한 Samsung 은 OS 디스크다. 따라서 **Samsung 만으로 2 디바이스 arm 을 만들 수
+없다** — 통제된 드라이브 비교는 현재 하드웨어로는 불가능하다.
+
+안전 가드는 작동했다: `0000:42:00.0`(OS 디스크, `/boot`·`/`·`/var`)이 설정에 들어가면
+즉시 중단하도록 했고, Samsung(`43:00.0`)은 파티션 테이블도 파일시스템 서명도 없음을
+사전 확인했다.
+
+## 51.5 남은 것
+1. **디바이스 수 축 재검** — §51.4 가 "2 디바이스 필요"를 시사한다. 신호 있는 조건에서
+   1 대 2 대 4 를 재보면 기전에 대한 제약이 하나 더 생긴다(공유 자원 경합 가설과 맞물린다).
+2. **업스트림 티켓.** 이제 낼 근거가 충분하고, 이번 절이 심각도 서술을 바꾼다 —
+   "특정 하드웨어 문제로 보인다"가 아니라 **"실물 NVMe 에서 재현되며, 통과 사례는
+   에뮬레이션 NVMe 뿐"** 이다. CI 가 못 잡는 이유까지 같은 문장으로 설명된다.
+
+---
+
+# 52. "NVMe 가 문제인가?" — 장치 자체를 지목할 근거는 없다 (2026-09-02)
+
+## 52.1 드라이브는 아무 오류도 보고하지 않는다
+
+PASCARI XX208H023T84P324T0910 (FW `X2WM40S4`):
+
+| | |
+|---|---|
+| `critical_warning` | 0 |
+| `media_errors` | 0 |
+| `num_err_log_entries` | **0** |
+| `percentage_used` | 0 % |
+| `data_units_written` | 48,984,145 |
+
+에러 로그 64 엔트리 전부 비어 있다. 손상이 "조용하다"는 것과 일관되지만,
+빗나간 쓰기는 애초에 오류로 보고되지 않으므로 **판별력은 없다.**
+
+## 52.2 MDTS 분할 가설 — 세워졌다가 두 번 죽었다
+
+컨트롤러 식별 정보에서 `mdts = 9` 를 발견했다 → 최대 전송 **2 MiB**.
+DAOS 는 청크당 4 MiB 를 한 번에 쓰므로 bdev 계층이 **여러 NVMe 명령으로 쪼갠다.**
+"쪼개진 자식 명령들이 서로를 침범한다"는 그럴듯한 기전이다.
+
+**첫 번째 반증:** QEMU 컨트롤러는 `mdts = 7` → **512 KiB** 다. 즉 가상 장치는 4 MiB 를
+**여덟 조각**으로 더 잘게 쪼개는데도 깨끗하다. 분할 자체는 판별자가 아니다.
+
+**두 번째 반증(직접 측정):** 청크 크기를 MDTS 아래로 내려 명령 분할을 없애도 손상된다.
+2 랭크 / 2 디바이스 / `targets: 4`, 순서 균형, 런마다 포맷:
+
+| 청크 | 런별 손상 | 합계 |
+|---|---|---|
+| 4 MiB (MDTS 초과) | 86, 108 | 194/320 = 60.6 % |
+| 2 MiB (MDTS 동일) | 107, 103 | 210/320 = 65.6 % |
+| **1 MiB (MDTS 이하, 명령 1 개)** | **37, 97** | **134/320 = 41.9 %** |
+
+**명령이 쪼개지지 않아도 손상된다.** MDTS 축은 배제된다.
+(손상 영역 크기는 여전히 청크 크기를 따라간다 — 4 MiB 는 4194304, 1 MiB 는 1048576
+오프셋에서 시작하고 모두 청크 정렬. §12 의 관측과 일치.)
+
+## 52.3 판정 — 소거로는 유일하게 남았지만, 입증되지 않았다
+
+**장치를 지목하는 쪽:**
+- DAOS/SPDK 가 관측할 수 있는 모든 지점이 결백하다 — VOS 주소 배정(§39),
+  발행 직전 버퍼(§37), SPDK 호출 시 주소·데이터 짝(§40), **완료 시점 버퍼**(§41).
+  10 배 증폭 조건에서도 같다(§47)
+- 그런데 미디어는 남의 데이터를 **영구히** 담고 있다(§38)
+- **실물 NVMe 에서만 재현된다.** 통과 사례는 전부 QEMU 에뮬레이션(§51)
+- `class:file`(aio bdev)은 깨끗하고 `class:nvme` 만 손상된다(§27) — 같은 blobstore 코드,
+  다른 백엔드
+
+**장치를 지목하기 어려운 쪽:**
+- **같은 드라이브를 단독 SPDK 로 두드리면 깨끗하다.** 다중 blob, 채널당/스레드당 분리,
+  회전 오프셋, WAL 형 작은 쓰기 병행, 32 코어 동시 발행까지 — 누적 **0/2720**
+  (§28·§29·§42·§48). 장치가 동시 쓰기를 잘못 커밋한다면 여기서 나와야 했다
+- 드라이브가 오류를 하나도 보고하지 않는다(§52.1)
+- 서명이 **깔끔하다.** 임의의 쓰레기가 아니라 *정확히 한 청크*가 *다른 객체의 같은 라운드*
+  데이터로 바뀌고, 두 청크가 **서로 자리를 맞바꾸기도** 한다(§38.2).
+  장치 수준 오배치라면 임의 LBA 로 흩어질 가능성이 더 크다
+- MDTS 분할 축 배제(§52.2)
+
+**가장 정합적인 읽기: 장치가 틀린 것이 아니라, 실물 NVMe 의 실제 DMA 타이밍이
+소프트웨어 경합을 드러내는 것이다.** 에뮬레이션은 그 타이밍을 만들지 못해 통과하고,
+`class:file` 도 통과한다. 단독 SPDK 재현기가 깨끗한 것은 그 경합이
+**DAOS 가 blobstore 를 쓰는 특정 방식**에서만 성립한다는 뜻이다 —
+아직 모방하지 못한 축은 §48.3 에 정리해 두었다(DAOS 의 `bs_opts`,
+역할 분할 장치 위의 blobstore, Argobots ULT 스케줄링, `spdk_bs_load` 경로).
+
+**따라서 "NVMe 가 문제다"라고 보고해서는 안 된다.** 정확한 서술은:
+> 실물 NVMe 에서만 재현되며, DAOS 가 SPDK 에 건네는 주소·데이터·버퍼는 완료 시점까지
+> 모두 정확한데 미디어 내용이 틀리다. 같은 장치를 SPDK 로 직접 두드리면 재현되지 않는다.
+
+## 52.4 남은 것
+- §48.3 의 미모방 축 중 **DAOS 의 `bs_opts` 일치**가 여전히 1 순위(§48.4)
+- 디바이스 수 축 재검(§51.5)
+- 업스트림 티켓 — §52.3 의 서술을 그대로 쓰면 "하드웨어 탓"으로 기각되지 않는다
+
+---
+
+# 53. ★★★ 드라이브 축 확정 — Samsung 실물 하드웨어는 깨끗하다 (2026-09-03)
+
+§51 에서 통제된 드라이브 비교가 불가능하다고 적었다(유휴 Samsung 이 cell1 에 한 대뿐).
+그 뒤 **`daos-1`~`daos-4`** 라는 별도 실물 클러스터를 쓸 수 있게 되어 실험이 성립했다.
+
+## 53.1 환경 — 두 번째 실물 클러스터
+
+| | daos-1 (rank 0) | daos-3 (rank 1) | daos-2 (client) |
+|---|---|---|---|
+| 플랫폼 | Supermicro SYS-222C-TN, `virt: none` | 동일 | 동일 |
+| RAM / 코어 | 502 GiB / 128 | 502 GiB / 96 | 502 GiB / 128 |
+| 데이터 NVMe | **SAMSUNG MZQL23T8HCLS-00A07** ×2 (`d9`, `da`) | 동일 ×2 (`da`, `db`) | — |
+| 펌웨어 / MDTS | `GDC5602Q` / 9 (2 MiB) | 동일 | — |
+| OS | Rocky 8.10 (cell1 과 동일) | 동일 | 동일 |
+| 네트워크 | `ofi+tcp` over `ens3907f0`, 10.100.230.x | 동일 | 동일 |
+
+**400G NIC 은 필요하지 않았다** — cell1/cell2 도 `ofi+tcp` 평범한 이더넷으로 돌고,
+전송·프로바이더 축은 §17·§18 에서 이미 배제됐다.
+
+우리 `/var/daos-stockfull` 빌드(SPDK v26.01, DAOS 2.9.100)를 그대로 rsync 배포해
+**소프트웨어를 완전히 동일**하게 맞췄다.
+
+## 53.2 결과 — 4 런 전부 깨끗하다
+
+`targets: 4`, 2 랭크 × 2 디바이스, RP_2G1, 런마다 재기동+포맷(= 매 런이 포맷 직후 첫 런),
+매 런 `ntarget=8` 확인:
+
+| 런 | 결과 | 정지 상태 감사 |
+|---|---|---|
+| 1 | **PASS 0/160** | AUDIT-PASS 0/16 |
+| 2 | **PASS 0/160** | AUDIT-PASS 0/16 |
+| 3 | **PASS 0/160** | AUDIT-PASS 0/16 |
+| 4 | **PASS 0/160** | AUDIT-PASS 0/16 |
+
+**0 / 640.** 같은 소프트웨어·같은 구성·같은 형태에서 PASCARI 는 **53~60 %** 가 손상된다
+(§46: 476/800 = 59.5 %; §52.2: 60.6 %). 단일 런만으로도 이미 결정적이다
+(0.47¹⁶⁰ ≈ 0), 4 런은 여지를 남기지 않는다.
+
+## 53.3 판정 — 드라이브 의존성이 실재한다
+
+| 하드웨어 | 결과 |
+|---|---|
+| PASCARI XX208H023T84P324T0910 (Phison, 4 KiB 섹터, FW `X2WM40S4`) | **손상 53~60 %** |
+| SAMSUNG MZQL23T8HCLS-00A07 (512 B 섹터, FW `GDC5602Q`) | **0/640** |
+| QEMU 에뮬레이션 NVMe | 0 (§51) |
+
+**§51.2 의 "실물 면역 사례 없음"은 철회한다.** 실물 Samsung 엔터프라이즈 NVMe 에서
+동일 소프트웨어·동일 워크로드가 완전히 깨끗하다. 손상은 **드라이브에 의존한다.**
+
+이것은 §52.3 의 판단("장치가 틀린 것이 아니라 실물 DMA 타이밍이 소프트웨어 경합을
+드러낸다")과 모순되지 않는다 — 두 읽기 모두 가능하다:
+1. PASCARI 고유의 결함(펌웨어/컨트롤러)
+2. PASCARI 의 타이밍·큐 특성만이 드러내는 DAOS/SPDK 경합
+
+**§52.3 의 반증 논거는 여전히 유효하다** — 같은 PASCARI 를 단독 SPDK 로 두드리면 0/2720 이다.
+장치 단독 결함이라면 그쪽에서도 나와야 했다. 그래서 2 번이 여전히 더 정합적이지만,
+**PASCARI 없이는 재현되지 않는다**는 사실이 이제 확정됐다.
+
+## 53.4 실사용자에 대한 함의 — 심각도 재조정
+
+§50.3 에서 노출 창을 "초기 적재 전체"로 넓혔고 §51.3 에서 하드웨어 좁힘을 철회했다.
+**§53 이 하드웨어 좁힘을 되살린다** — 다만 훨씬 구체적으로:
+
+| | |
+|---|---|
+| **영향 받는 것으로 확인** | PASCARI XX208H023T84P324T0910 / FW `X2WM40S4` |
+| **영향 없는 것으로 확인** | SAMSUNG MZQL23T8HCLS-00A07 / FW `GDC5602Q` |
+| 미확인 | 그 외 모든 모델 (DAPUSTOR DPRD3108 등) |
+| 노출 창 | 해당 드라이브에서는 초기 적재 전체(§50) |
+| 완화 | `cksum:crc32` + `srv_cksum:on` (§49) |
+
+즉 **"DAOS 전반의 문제"가 아니라 "특정 드라이브에서 DAOS 가 데이터를 조용히 손상시킨다"** 다.
+후자도 충분히 심각하지만 대응은 완전히 다르다 — 해당 드라이브 배포를 식별하고
+체크섬을 켜고, 초기 적재 후 전량 검증하는 것이 실무 조치다.
+
+## 53.5 배포 기록 (재현·재사용을 위해)
+
+daos-1/2/3 에 DAOS 를 올리며 필요했던 것들:
+- 시스템 패키지: `protobuf-c`, `libunwind`, `hwloc-libs`, `libatomic`, `libuuid-devel`
+  (`libipmctl.so.5` 는 리포에 없어 cell1 에서 복사)
+- **THP 비활성화** — DAOS 가 거부한다(`code = 623`).
+  `echo never > /sys/kernel/mm/transparent_hugepage/{enabled,defrag}`
+- **IOMMU 없음** → 비루트로 NVMe 사용 불가(`code = 602`). 유닛에 `User=root`
+- `pinned_numa_node` 를 감지값(1)에 맞춤
+- daos-1 의 Samsung 전부에 `zfs_member` 서명이 있어 DAOS 가 바인딩을 거부 →
+  사용할 **두 장치만** `wipefs`(OS 디스크 `nvme0n1` 은 명시적 가드로 제외)
+- 에이전트: `daos_agent -o … -s /var/run/daos_agent start` (`-d` 는 debug 플래그다)
+
+**중첩 이스케이프 함정이 이 절에서 두 번 더 발생했다** — `bdev_list` 에 리터럴 백슬래시,
+`override.conf` 가 개행 없이 한 줄. 둘 다 ssh 명령 문자열 안의 heredoc/`printf` 때문이다.
+**교훈: 다중 행 파일은 로컬에서 만들어 `scp` 로 옮긴다.** §46.4 에서 이미 배운 것을
+반복했다.
+
+## 53.6 남은 것
+1. **DAPUSTOR arm** — daos-4 에 DPRD3108 이 5 대 있다(MDTS 5 = 128 KiB). 다만 2 랭크를
+   만들려면 두 호스트에 각 2 대가 필요하고 daos-4 한 대에만 몰려 있어 현재 구성으로는
+   단일 랭크만 가능하다(§51.4 는 2 랭크가 필요해 보인다고 했다).
+2. **업스트림 티켓** — 이제 서술이 확정됐다: 특정 드라이브에서만 재현되고,
+   DAOS 가 SPDK 에 건네는 모든 것은 완료 시점까지 정확하며, 같은 드라이브를 SPDK 로
+   직접 두드리면 재현되지 않는다. 체크섬이 탐지하고, 노출 창은 초기 적재 전체다.
+3. Phison/PASCARI 벤더에 펌웨어 문의 — 이제 근거가 충분하다.
+
+---
+
+# 54. PASCARI 펌웨어·제조사 검토, 그리고 §53 의 교란 제거 (2026-09-03)
+
+## 54.1 드라이브 능력 정밀 조회
+
+PASCARI XX208H023T84P324T0910, FW `X2WM40S4`:
+
+| 필드 | 값 | 의미 |
+|---|---|---|
+| `mdts` | 9 | 최대 전송 2 MiB (§52.2 에서 축으로는 배제) |
+| `sgls` | `0xf0001` | SGL 지원 + bit bucket / byte-aligned / length-larger |
+| `maxcmd` | 1024 | 최대 미완료 명령 |
+| IO 큐 | **256 / 256** | 부족하지 않음 — 큐 공유 가설 불가 |
+| `awun`/`awupf` | 255 (1 MiB) | 원자 쓰기 단위. 단 `nawun`/`nawupf` = 0 |
+| `vwc` | `0x6` | VWC 비트(bit0) = 0 → 휘발성 쓰기 캐시 **없음** |
+| `dpc` / `dps` | `0x13` / 0 | E2E 보호(PI) 지원하나 **비활성** |
+| `flbas` | `0x2` | **4 KiB LBA** |
+| 펌웨어 슬롯 | `afi=0x2`, slot1/2 모두 `X2WM40S4` | **대체 이미지 없음** |
+| SMART | `critical_warning` 0, `media_errors` 0, 에러 로그 **0/64** | 장치는 아무 오류도 보고하지 않음 |
+
+## 54.2 공개된 알려진 이슈 검색 — 해당 없음
+
+Phison PASCARI X 시리즈 제품군(X200/X200Z/X201/X202Z)에 대한 공개 자료는 있으나
+**`XX208H023T84P324T0910` 모델이나 FW `X2WM40S4` 의 데이터 손상 관련 공지·권고는 찾지 못했다.**
+Phison 문서에는 컨트롤러의 wear-leveling·ECC 일반 설명만 있다.
+
+SPDK 쪽에서 관련성이 있는 것은 하나 나왔다 — **spdk/spdk#1738 "Data inconsistency for
+SPDK+UIO using NVMe"**: 100 GB 복사 시 MD5 불일치, XFS 메타데이터 손상.
+원인은 **NVMe 를 VFIO 대신 UIO 드라이버로 묶은 것**이고 권고는 "VFIO 를 쓰라"다.
+
+## 54.3 ★ 그 이슈가 §53 의 교란을 드러냈다
+
+#1738 을 읽고 두 클러스터의 바인딩 드라이버를 확인했더니:
+
+| | cell1 (PASCARI, 손상) | daos-1 (Samsung, 깨끗) |
+|---|---|---|
+| SPDK 바인딩 | **`vfio-pci`** | **`uio_pci_generic`** |
+| IOMMU | 97 그룹 | **0 (커널 인자 없음)** |
+
+**§53 은 드라이브만 다른 실험이 아니었다** — 바인딩 드라이버도 달랐다.
+"드라이브 의존성"이라는 결론이 교란된 상태였다.
+
+방향이 흥미롭다: 알려진 SPDK 데이터 불일치 이슈는 **UIO** 쪽인데, 우리에게는
+**UIO 클러스터가 깨끗한** 쪽이다. 그래서 #1738 이 우리 증상을 설명하지는 않는다.
+그러나 교란인 것은 분명하므로 제거해야 했다.
+
+PASCARI 를 UIO 로 옮기는 것은 불가능하다(MSI-X 전용, §25). 그래서 반대로 갔다.
+
+## 54.4 Samsung 을 VFIO 로 — 교란 제거 후 재측정
+
+`grubby --update-kernel=ALL --args="intel_iommu=on iommu=pt"` + 재부팅
+(daos-1: Xeon 6530P, daos-3: Xeon 6520P, 둘 다 유휴).
+
+| | 이전 | 이후 |
+|---|---|---|
+| IOMMU 그룹 | 0 | **124 / 125** |
+| 데이터 NVMe 바인딩 | `uio_pci_generic` | **`vfio-pci`** (cell1 과 동일) |
+
+이 상태로 4 런 (targets: 4, 2 랭크 × 2 디바이스, RP_2G1, 런마다 포맷):
+
+| 런 | 결과 | 정지 상태 감사 |
+|---|---|---|
+| 1~4 | **PASS 0/160** (4 런 전부) | AUDIT-PASS 0/16 (4 런 전부) |
+
+**0 / 640, 드라이버까지 동일한 조건에서.**
+
+⇒ **§53 의 결론은 교란을 제거한 뒤에도 성립한다.** VFIO·UIO 합산 **0/1280**.
+같은 소프트웨어·같은 드라이버·같은 형태에서 PASCARI 는 53~60 % 가 손상되고
+Samsung 은 0 이다. **드라이브 의존성이 확정됐다.**
+
+## 54.5 그래서 제조사 쪽 판단
+
+- **공개된 펌웨어 권고·리콜은 없다.** 대체 펌웨어 이미지도 드라이브에 없다(슬롯 2 개 모두 동일).
+- 장치는 **아무 오류도 보고하지 않는다** — SMART·에러 로그 전부 0.
+  즉 벤더 진단으로는 잡히지 않는 유형이다.
+- **단독 SPDK 로는 재현되지 않는다**(같은 드라이브, 0/2720, §28·§29·§42·§48).
+  따라서 "이 드라이브는 동시 쓰기를 잘못 커밋한다"로 단순화할 수 없다.
+- 남는 가장 정합적인 서술은 **§52.3 그대로**: 이 드라이브의 타이밍·완료 특성만이
+  DAOS 의 blobstore 사용 패턴에 있는 경합을 드러낸다.
+
+**Phison 문의 시 제시할 것**: 모델/FW, `targets: 4` 재현 절차,
+"동일 소프트웨어에서 Samsung MZQL2 는 0/1280, 본 드라이브는 53~60 %",
+그리고 SMART 가 깨끗하다는 점(장치 자체 진단으로는 탐지 불가).
+동시에 **업스트림 DAOS 티켓도 함께 내는 것이 맞다** — 경합이 DAOS 쪽에 있다면
+드라이브 교체는 회피책일 뿐이다.
+
+## 54.6 남은 것
+1. **섹터 크기 축** — PASCARI 는 4 KiB LBA(`flbas=0x2`), Samsung 은 512 B.
+   PASCARI 를 `nvme format --lbaf=0` 으로 512 B 로 바꿔 재측정하면
+   "벤더" 대 "섹터 크기"를 가를 수 있다. 같은 하드웨어에서 되는 **가장 값싼 다음 실험.**
+2. DAPUSTOR arm (daos-4, MDTS 5) — 세 번째 벤더 데이터점.
+3. 업스트림 티켓 + Phison 문의.
+
+---
+
+# 55. NVMe 슬라이싱 / 다중 컨트롤러 검토, 그리고 섹터 크기 축 (2026-09-03)
+
+"PASCARI 가 예전에 NVMe 슬라이싱을 한 적이 있다"는 제보를 확인했다.
+
+## 55.1 슬라이싱 능력은 실재한다 — Samsung 에는 없다
+
+| | PASCARI XX208H023T84P324T0910 | SAMSUNG MZQL23T8HCLS |
+|---|---|---|
+| `nn` (최대 네임스페이스) | **128** | 32 |
+| `oacs` bit3 (Namespace Management) | 지원 | 지원 |
+| `ctratt` | `0x290` → Endurance Groups, **Namespace Granularity**, UUID List | `0x80` |
+| `endgidmax` | **1** (엔듀런스 그룹 사용) | **0** (미사용) |
+| `nmic` (NS 다중 컨트롤러 공유) | **`0x1` — 공유 가능** | **`0`** |
+| NS 에 붙은 컨트롤러 수 | **2** (ID `0`, `0x9`) | 1 |
+| `nlbaf` | 4 (512B / 512B+8 / **4KiB(사용)** / 4KiB+8) | 2 (**512B(사용)** / 4KiB) |
+
+즉 이 드라이브는 네임스페이스 관리·엔듀런스 그룹·네임스페이스 세분화를 모두 갖춘
+**슬라이싱 가능 아키텍처**이고, Samsung 은 그렇지 않다. 제보와 부합한다.
+
+## 55.2 그러나 현재 슬라이싱은 적용돼 있지 않고, 디바이스 중복 노출도 없다
+
+| 검사 | 결과 |
+|---|---|
+| 활성 네임스페이스 | **1 개** (`0x1`) |
+| `nsze` = `ncap` | 전체 용량 (`0x37e3ee56`) |
+| `unvmcap` (미할당 용량) | **0** |
+| SR-IOV | `no_sriov` (VF 없음) |
+
+가장 중요한 확인 — **`0000:02:00.0` 과 `0000:03:00.0` 이 같은 드라이브의 두 컨트롤러인가?**
+
+```
+0000:02:00.0 -> /dev/nvme6   sn=A1E00NMW  cntlid=0
+0000:03:00.0 -> /dev/nvme15  sn=A1E00NMH  cntlid=0
+PASCARI 24 대 / 서로 다른 시리얼 24 개
+```
+
+**시리얼이 다르다.** 26 개 PCI NVMe 함수에 26 개 네임스페이스, 시리얼 전부 구별된다.
+즉 별개의 물리 드라이브이고, "컨트롤러 2 개"는 **드라이브당 dual-port U.2** 구성이다
+(호스트에 보이는 것은 각 드라이브당 하나).
+
+⇒ **"DAOS 가 2 개 디바이스로 여기는 것이 실은 한 드라이브였다"는 가설은 배제된다.**
+§51.4 의 "2 디바이스 필요"는 디바이스 중복 노출 때문이 아니다.
+
+다만 `nmic=1` · 컨트롤러 2 개 · 엔듀런스 그룹 사용은 **Samsung 과의 실재하는 구조적 차이**이며,
+FTL 이 추가 간접 계층을 거친다는 뜻이다. 우리가 검증할 수는 없으나 Phison 문의 시
+언급할 가치가 있다.
+
+## 55.3 섹터 크기 축 — 배제
+
+PASCARI 는 4 KiB LBA(`flbas=0x2`), Samsung 은 512 B(`flbas=0`)였다. 벤더와 섹터 크기가
+붙어 있었으므로 갈랐다. cell1·cell2 의 데이터 드라이브 4 대를 모두
+`nvme format /dev/nvmeXn1 --lbaf=0` 으로 **512 B 로 재포맷**(`flbas=0` 확인)하고
+동일 하네스를 돌렸다(2 랭크 × 2 디바이스, `targets: 4`, RP_2G1, 런마다 포맷).
+
+| 런 | 손상 |
+|---|---|
+| 1 | **87/160** |
+| 2 | **113/160** |
+| 3 | **110/160** |
+| 4 | **121/160** |
+| 합계 | **431/640 = 67.3 %** |
+
+4 KiB 일 때는 60.6 %(§52.2)였다. **512 B 로 바꿔도 손상되며, 오히려 더 높다.**
+⇒ **섹터 크기 축은 배제된다.** §53·§54 의 드라이브 의존성은 섹터 크기 차이가 아니다.
+
+(형식 주의: `nvme format` 은 컨트롤러 노드가 아니라 **네임스페이스 노드**에 걸어야 한다 —
+`/dev/nvme6` 은 `부적절한 ioctl` 로 실패하고 `/dev/nvme6n1` 은 성공한다.)
+
+## 55.4 정리 — 지금까지 드라이브 축에서 배제된 것
+
+| 후보 | 결과 |
+|---|---|
+| MDTS / 명령 분할 | 배제 (§52.2, 1 MiB 청크에서도 손상) |
+| 섹터 크기 4 KiB 대 512 B | **배제 (§55.3)** |
+| 네임스페이스 슬라이싱 적용 상태 | **배제 (§55.2, 활성 NS 1 개, unvmcap 0)** |
+| 두 디바이스가 실은 한 드라이브 | **배제 (§55.2, 시리얼 상이)** |
+| SR-IOV / VF | **배제 (§55.2, VF 없음)** |
+| SPDK 바인딩 드라이버(VFIO 대 UIO) | 배제 (§54.4, Samsung 을 VFIO 로 맞춰도 0/640) |
+| 펌웨어 공개 이슈 | 해당 없음 (§54.2) |
+| 드라이브 자체 진단 | 무증상 (SMART·에러 로그 전부 0) |
+
+**남은 것은 이 드라이브 계열의 내부 동작 특성이다** — `nmic=1`·dual-port 컨트롤러 2 개·
+엔듀런스 그룹을 쓰는 FTL 구조. 우리 계측으로는 더 좁힐 수 없다.
+
+## 55.5 다음
+1. **DAPUSTOR arm** (daos-4, DPRD3108, MDTS 5) — 세 번째 벤더 데이터점.
+   깨끗하면 "PASCARI 고유"가 강해지고, 손상되면 "실물 NVMe 전반"으로 다시 넓어진다.
+2. **업스트림 DAOS 티켓 + Phison 문의** — 양쪽 다 근거가 확정됐다.
+3. 참고: cell1·cell2 의 데이터 드라이브는 현재 **512 B 포맷**으로 남아 있다.
+   4 KiB 로 되돌리려면 `nvme format /dev/nvmeXn1 --lbaf=2`.
+
+---
+
+# 56. DAOS 에 NVMe 모델/제조사 support 항목이 있는가 — 없다 (2026-09-03)
+
+"DAOS 이슈에 NVMe 모델/제조사 support 항목이 있는지" 확인했다. 이는 업스트림 보고 시
+**"그 드라이브는 지원 목록에 없다"로 기각당할 수 있는지**를 결정한다.
+
+## 56.1 공개 support matrix — 검증된 NVMe 목록이 없다
+
+`docs.daos.io` 의 Support Matrix(v2.8)에는 **검증·지원 NVMe 모델이나 벤더 목록이 전혀 없다.**
+화이트리스트도 하드웨어 인증 목록도 없다. 관련 문장은 다음이 전부다:
+
+- "DAOS servers use NVMe disks for bulk storage, accessed in user space through the **SPDK** toolkit."
+  → 요구조건은 **"SPDK 가 지원하는 장치"** 뿐이다.
+- "It is strongly recommended that all DAOS engines in a DAOS system have identical NVMe
+  storage configurations."
+- 영구 메모리 구성: "all NVMe disks managed by a single DAOS engine must have identical
+  capacity (and it is **strongly recommended to use identical drive models**)."
+- "NVMe storage can be emulated by files … **This is not a supported configuration in a
+  production environment.**"
+
+⇒ **모델·벤더 단위의 지원 판정 개념이 DAOS 에 존재하지 않는다.**
+따라서 "PASCARI 는 미지원 하드웨어"라는 기각 논리는 성립할 수 없다.
+
+벤더별 특별 취급은 하나뿐이다 — **SMART 통계가 Intel 장치에만 벤더별로 표시**된다.
+
+## 56.2 그러나 문서가 요구하는 두 가지가 있고, 우리는 둘 다 충족한다
+
+`docs/admin/predeployment_check.md` 에서:
+
+1. **4 K 블록 포맷 권장** — "DAOS server performs NVMe I/O in 4K granularity so in order to
+   avoid alignment issues it is beneficial to format the SSDs … with a 4K block size."
+   우리의 손상 구성은 원래 4 KiB(`flbas=0x2`)였다 — **권장을 따른 상태에서 손상된다.**
+   §55.3 에서 512 B 로 바꿔 시험한 뒤(67.3 %) **4 KiB 로 되돌려 놓았다**
+   (cell1·cell2 4 대 전부 `flbas=0x2` 확인). 보고 구성이 문서 권장과 일치해야 하기 때문이다.
+2. **VFIO 필수, UIO 미지원** — "the use of VFIO on these distributions is a requirement
+   since UIO is not supported."
+   cell1/cell2 는 `vfio-pci` 다(§54.3). 그리고 §54.4 에서 깨끗한 Samsung 쪽도
+   **VFIO 로 맞춰** 재측정했으므로, 양쪽 모두 문서가 요구하는 구성에서 비교됐다.
+   (초기 Samsung 런은 UIO 였다 — 문서상 미지원 구성이었으므로 그 자체로는 근거가 약했고,
+   IOMMU 를 켜 VFIO 로 다시 돌린 것이 옳았다.)
+
+## 56.3 이슈 트래커 — 벤더별 손상 보고 없음
+
+- `daos-stack/daos` GitHub 은 사실상 **PR 트래커**다. `nvme corruption` 검색 결과 11 건이
+  모두 PR 이었다(테스트·복구·csum 관련). 버그는 **JIRA(`daosio.atlassian.net`)** 로 관리된다.
+- JIRA REST 는 비인증 접근이 막혀 있고(HTTP 410), 공개 검색으로도
+  **특정 NVMe 벤더/모델의 데이터 손상 이슈는 찾지 못했다.**
+- SPDK 쪽에서 관련된 것은 §54.2 의 `spdk/spdk#1738`(UIO 사용 시 데이터 불일치) 하나이고,
+  우리 증상과는 방향이 반대다.
+
+## 56.4 보고에 쓸 수 있는 근거 — DAOS 자신의 설계 목표
+
+DAOS VOS 설계 문서의 문장:
+
+> "The VOS layer must validate the integrity of all persisted object data to
+> **eliminate the possibility of silent data corruption**"
+
+체크섬이 **기본 off** 인 상태에서 우리가 관측한 것은 이 목표의 직접적 위반이다
+(§49 에서 체크섬을 켜면 `DER_CSUM` + RAS 이벤트로 탐지됨을 확인했다).
+즉 보고는 "특정 하드웨어에서 안 된다"가 아니라
+**"기본 구성에서 silent data corruption 이 발생하고, 설계 목표는 그것을 배제한다고 명시한다"**
+로 프레이밍할 수 있다.
+
+## 56.5 정리
+
+| 질문 | 답 |
+|---|---|
+| DAOS 에 NVMe 모델/벤더 지원 목록이 있는가 | **없다** |
+| 하드웨어 요구조건은 무엇인가 | "SPDK 가 지원", 엔진 내 동일 용량(동일 모델 권장), 에뮬레이션은 프로덕션 미지원 |
+| 벤더별 특별 취급 | Intel SMART 통계 표시뿐 |
+| 문서가 요구하는 구성 중 우리가 어긴 것 | **없음** (4 K 포맷·VFIO 둘 다 충족) |
+| 트래커에 유사 벤더 이슈 | **없음** |
+
+⇒ **"미지원 하드웨어"라는 회피 경로가 없다.** 업스트림 티켓을 낼 때 이 점을 명시하는 것이
+기각을 막는 데 유효하다.
+
+---
+
+# 57. 최종 정리 — 원인 판정과 업스트림 논지 (2026-09-03)
+
+## 57.1 최종 원인: **확정되지 않았다.** 정직하게 그렇다
+
+좁히기는 끝까지 했으나 결함 자체는 지목하지 못했다. 살아남은 해석은 둘이다.
+
+**(a) DAOS/SPDK 동시 쓰기 경로의 경합이, 이 드라이브의 타이밍에서만 드러난다**
+
+근거:
+- **초선형 동시성 의존** — `targets` 4 배에 손상 10.8 배(§46). 부하 비례가 아니라 경합의 서명
+- **서명이 너무 깔끔하다** — 정확히 한 청크가 *같은 라운드* 남의 데이터로 바뀌고,
+  두 청크가 **서로 자리를 맞바꾸기도** 한다(§38.2). 장치 수준 오배치라면 임의 LBA 로 흩어질 것
+- **`class:file`(aio bdev)은 깨끗하다**(§27) — 같은 blobstore 코드, 다른 백엔드
+- 메타데이터·제어 상태가 **완벽하게 일관**되다(§39·§40·§41·§47)
+
+**(b) 드라이브/펌웨어 결함이, DAOS 가 만드는 I/O 패턴에서만 드러난다**
+
+근거:
+- **하드웨어 의존이 확정적이다** — 동일 소프트웨어·동일 드라이버에서
+  PASCARI 53~67 %, Samsung MZQL2 **0/1280**(§53·§54)
+- **DAOS 가 SPDK 에 건네는 모든 것이 완료 시점까지 옳다**:
+  주소 배정 단사(§39), 발행 직전 버퍼(§37), 호출 시 주소·데이터 짝(§40),
+  **완료 시점 버퍼도 여전히 옳다**(§41). 그런데 미디어 내용이 틀리다(§38)
+
+**두 해석을 가르지 못한 이유**: (b) 를 지지하는 "DAOS 쪽은 전부 옳다"와
+(a) 를 지지하는 "같은 드라이브를 SPDK 로 직접 두드리면 **0/2720**"(§28·§29·§42·§48)이
+정면으로 충돌한다. 우리 단독 재현기가 모방하지 못한 축이 남아 있다(§48.3):
+DAOS 의 `bs_opts`, 역할 분할 장치 위의 blobstore, **Argobots ULT 스케줄링**,
+`spdk_bs_load` 경로.
+
+**따라서 "DAOS 버그" 도 "NVMe 버그" 도 확정 주장으로 써서는 안 된다.**
+정확한 서술은 이것이다:
+
+> 실물 PASCARI NVMe 에서 DAOS 가 데이터를 조용히·영구히 오배치한다.
+> DAOS 가 SPDK 에 건네는 주소와 데이터는 완료 콜백 시점까지 모두 정확하고,
+> 같은 드라이브를 SPDK 로 직접 구동하면 재현되지 않는다.
+> Samsung MZQL2 에서는 동일 소프트웨어로 0/1280 이다.
+
+## 57.2 확정된 사실 (업스트림에 그대로 제시할 것)
+
+| | |
+|---|---|
+| 증상 | 정확히 **한 청크**(컨테이너 chunk_size) 영역이 **다른 객체의 같은 라운드** 데이터로 대체. 청크 정렬. 상호 교환·동일 오프셋 사슬 관측 |
+| 영구성 | **미디어에 남는다.** 동시성 0, 별도 프로세스, 직렬 재읽기에서도 동일(§38) |
+| 오류 보고 | **없다.** rc=0, I/O 에러 없음, 드라이브 SMART·에러 로그 전부 0 |
+| 트리거 | **포맷 이후 한 번도 쓰이지 않은 미디어에 쓰기**. 첫 런 21/21, 이후 1/18(§34) — 단 §50: 미기록 영역을 계속 소비하면 **계속** 발생(7/8 런, 76 GB 소비 동안) |
+| 증폭 | `targets` 1→4 에서 **5.5 % → 59.5 %** (10.8 배, p=0.0022, 완전 분리) |
+| 재현 레시피 | 포맷 → 1 회 실행 → `-A` 감사. `targets: 4` 에서 53~67 % |
+| 탐지 | `cksum:crc32`+`srv_cksum:on` 이면 `DER_CSUM(-2021)` + RAS `obj_csum_error`(§49). **기본은 off** |
+| 하드웨어 | PASCARI XX208H023T84P324T0910 / FW `X2WM40S4` 손상. Samsung MZQL23T8HCLS / `GDC5602Q` 0/1280. QEMU 에뮬레이션 0 |
+
+**배제된 축** (모두 신호 있는 조건에서): 클라이언트 빌드·캐시·프로세스 구성, 전송·프로바이더
+(§17·§18), SPDK 버전 24.09/26.01(§43), `bdev_roles`(§44), oclass·복제(§45),
+MDTS·명령 분할(§52), 섹터 크기 4K/512B(§55), 네임스페이스 슬라이싱·디바이스 중복·SR-IOV(§55),
+VFIO/UIO(§54), DMA 버퍼 조기 재활용(§41), VOS 주소 배정(§39), 쓰기 페이로드(§37·§40).
+
+## 57.3 업스트림 논지 — 누가 결함 주인이든 DAOS 가 해야 할 것
+
+**1. 기본 구성에서 설계 목표가 깨진다.**
+DAOS VOS 문서는 "must validate the integrity of all persisted object data to
+**eliminate the possibility of silent data corruption**" 이라고 명시한다.
+그런데 체크섬은 **기본 off** 이고, 끄면 이 손상은 **100 % 조용하다**.
+→ 요청: 체크섬 기본 활성화, 최소한 MD-on-SSD 구성에서 off 일 때 경고.
+
+**2. 하드웨어 자격 검증 경로가 없다.**
+검증된 NVMe 모델·벤더 목록이 존재하지 않고 요구조건은 "SPDK 가 지원" 뿐이다(§56).
+즉 **SPDK 로는 잘 동작하는 드라이브가 DAOS 에서는 조용히 손상시킬 수 있고, 관리자가
+알 방법이 없다.**
+→ 요청: 포맷 시 정합성 자기검사 또는 문서화된 자격 검증 절차.
+우리 `obj_integrity -A` 가 40 줄짜리 템플릿이다.
+
+**3. 위험이 프로덕션 방향으로 커진다.**
+우리 초기 측정의 `targets: 1` 이 **가장 덜 손상되는 구성**이었다.
+실제 배포는 엔진당 8~16 targets 이 흔하고, `targets: 4` 만으로 이미 53~67 % 다.
+→ 테스트 구성이 위험을 **과소평가**하게 되어 있다.
+
+**4. CI 가 이것을 잡을 수 없다.**
+가상 NVMe 에서는 재현되지 않는다(§51, QEMU `mdts=7`, 3 대 모두 KVM).
+→ 요청: 실물 NVMe 정합성 테스트, 또는 최소한 에뮬레이션 백엔드로는 이 경로를
+검증할 수 없음을 명시.
+
+**5. 기각 경로를 미리 막는다.**
+- "최신 SPDK 범프 탓" → **아니다.** 2.8 릴리스가 쓰는 v24.09 에서도 11.9 %(§43)
+- "미지원 하드웨어" → **그런 개념이 DAOS 에 없다**(§56)
+- "우리 패치 탓" → **아니다.** 완전 스톡 클라이언트 + 완전 업스트림 서버(§18)
+- "구성 오류" → **아니다.** 4 K 포맷·VFIO 등 문서 요구를 모두 충족(§56.2)
+
+**6. 삽질을 넘겨준다.**
+계층별 계측 결과와 배제 목록(§57.2)을 그대로 제시하면 업스트림은 소거 작업 전체를
+건너뛰고 **`bio_iod_post` → 완료 콜백 구간의 동시 쓰기 경로**에서 시작할 수 있다.
+남은 미모방 축(§48.3, 특히 **Argobots ULT 스케줄링**)이 가장 유력한 출발점이다.
+
+## 57.4 Phison 문의 논지 (별건, 병행)
+
+- 모델 `XX208H023T84P324T0910` / FW `X2WM40S4`, dual-port·`nmic=1`·엔듀런스 그룹 구조
+- **동일 소프트웨어에서 Samsung MZQL2 는 0/1280, 본 드라이브는 53~67 %**
+- **드라이브 자체 진단으로는 탐지 불가** — SMART·에러 로그 전부 0
+- 단, **SPDK 직접 구동으로는 재현되지 않으므로** 단순 불량으로 단정하지 않는다.
+  DAOS 의 blobstore 사용 패턴(동시 다중 blob·ULT 스케줄링)과의 상호작용을 함께 조사 요청
+- 대체 펌웨어 이미지 유무 확인 요청(슬롯 2 개 모두 동일 이미지)
+
+## 57.5 실사용자 즉시 조치 (결함 주인 확정과 무관)
+
+1. **`cksum:crc32` + `srv_cksum:on`** — 조용한 유실을 `DER_CSUM` 으로 바꾼다
+2. **초기 적재 후 전량 재읽기 검증** — 손상은 영구적이므로 나중에도 검출된다
+3. **RAS `obj_csum_error` 감시**
+4. 해당 드라이브 배포 식별. 가능하면 검증된 다른 모델로 데이터 티어 교체
+5. 임시 완화로 targets 축소는 가능하나 성능 대가가 크다
+
+---
+
+# 58. ★★ dfuse / POSIX 경로에서도 재현된다 — 그리고 더 나쁘다 (2026-09-03)
+
+지금까지의 재현기는 `daos_obj_fetch`(raw object API)와 DFS API 였다.
+실사용자는 그렇게 쓰지 않는다 — **dfuse 로 마운트하고 `open`/`pwrite`/`pread`** 를 쓴다.
+`tests/posix_integrity.c` 를 새로 작성해 같은 태그 워크로드를 순수 POSIX 로 돌렸다.
+
+dfuse 와 커널 페이지 캐시가 읽기를 메모리에서 처리해 손상을 가릴 수 있으므로
+**`--disable-caching` 으로 마운트**하고, 감사는 쓰기 프로세스가 끝난 뒤 **별도 프로세스**에서
+수행했다.
+
+## 58.1 결과
+
+`targets: 4`, 2 랭크 × 2 PASCARI, RP_2G1, 청크 4 MiB, 포맷 직후 첫 런:
+
+| | |
+|---|---|
+| 실행 중 손상 | **FAIL 102/160 (63.8 %)** |
+| **정지 상태 감사** (별도 프로세스, 직렬, 캐시 없음) | **AUDIT-FAIL 10/16 파일이 여전히 틀림** |
+
+```
+CORRUPT t9  r0 first bad at 0 (chunk-aligned): t2 r0 off 1048576  foreign-file=917504
+CORRUPT t4  r0 first bad at 0 (chunk-aligned): t12 r0 off 0       foreign-file=131072
+AUDIT  t0  STILL WRONG at 0 (chunk-aligned): t3 r9 off 0          foreign-file=131072
+AUDIT  t3  STILL WRONG at 5242880:           t11 r9 off 4194304   foreign-file=262144
+```
+
+**보통의 POSIX 파일 쓰기·읽기로 재현되고, 파일 내용은 미디어에 영구히 틀린 채 남는다.**
+한 파일이 **다른 파일의 데이터**를 담는다(`foreign-file`).
+
+## 58.2 raw object 경로보다 오염이 더 어지럽다
+
+| | raw object (§47) | **POSIX/dfuse (§58)** |
+|---|---|---|
+| 손상률 | 53 % | **63.8 %** |
+| 오염 형태 | 정확히 한 청크가 통째로 남의 데이터 | **남의 파일 데이터 + `junk` 대량 혼재** |
+| 예 | `foreign=524288, junk=0` | `foreign-file=917504, junk=2752512` |
+
+raw object 경로에서는 청크 하나가 깔끔하게 치환됐지만, POSIX 경로에서는
+`junk`(어느 태그 규칙에도 맞지 않는 워드)가 대량으로 섞인다. dfuse/DFS 가
+파일 오프셋을 여러 객체·여러 dkey 로 분산시키므로 한 번의 오배치가
+**여러 논리 영역을 동시에 오염**시키는 것으로 보인다. 즉 상위 계층으로 올라갈수록
+피해가 확대된다.
+
+## 58.3 실사용 노출에 대한 함의
+
+이것이 §57.5 의 권고를 강화한다:
+
+- **평범한 파일 I/O 로 노출된다.** raw DAOS API 를 쓰지 않는 사용자도 영향을 받는다.
+  POSIX 컨테이너 + dfuse 는 DAOS 의 가장 일반적인 사용 형태다
+- **캐시가 가려주지 않는다.** `--disable-caching` 에서 재현되고, 캐시가 켜져 있다면
+  오히려 **읽는 시점에는 정상으로 보이다가 나중에 드러날** 수 있다 —
+  탐지가 더 늦어진다는 뜻이다
+- **파일 단위로 영구 손상** — 16 개 중 10 개 파일이 정지 상태에서도 틀렸다
+- 오염이 청크 하나에 국한되지 않고 파일 전반으로 번진다(§58.2)
+
+## 58.4 업스트림 논지 보강
+
+§57.3 에 다음을 추가한다:
+
+> 이 손상은 raw object API 에 국한된 것이 아니다. **dfuse 를 통한 일반 POSIX
+> `pwrite`/`pread` 로 63.8 % 의 읽기가 손상되고, 16 개 파일 중 10 개가 영구히 틀린 채
+> 남는다.** 즉 DAOS 의 가장 일반적인 사용 형태에서 사용자 파일이 조용히 파괴된다.
+
+또한 **재현 난이도가 매우 낮음**을 보여준다 — 특별한 API 도, 특별한 워크로드도 필요 없다.
+파일 16 개를 동시에 쓰고 다시 읽으면 된다.
+
+## 58.5 방법론 메모 (같은 실수 세 번째)
+
+첫 시도에서 `grep … | head -8` 이 `SIGPIPE` 로 재현기를 7 라운드에서 죽였고,
+감사가 존재하지 않는 라운드 9 를 기대해 "전 파일 오류"처럼 보였다.
+**§38.5 에서 이미 겪은 실수이고, §46.4 의 이스케이프 함정과 함께 세 번째 반복이다.**
+출력은 파일로 받고 나서 걸러야 한다 — 파이프에 `head` 를 붙이면 측정 대상이 죽는다.
+
+---
+
+# 59. "txt 파일은 안 깨지는데?" — 크기가 아니라 **동시성**이다 (2026-09-03)
+
+손으로 txt 파일을 쓰고 읽으면 멀쩡한 이유를 측정으로 답했다.
+`posix_integrity.c` 에 KiB 단위 크기(`-S`/`-K`)와 외부 반복(`-L`)을 추가했다
+(라운드는 태그의 8 비트라 255 를 넘길 수 없으므로, 작은 파일이 비슷한 바이트를 쓰려면
+반복이 필요하다).
+
+## 59.1 크기 스윕 — 작은 파일도 깨진다
+
+`targets: 4`, 2 랭크 × 2 PASCARI, 16 스레드, 형태별로 포맷 후 1 회, dfuse `--disable-caching`:
+
+| 파일 / 청크 | 쓴 양 | 손상된 읽기 |
+|---|---|---|
+| 28 MiB / 4 MiB | 280 MiB/스레드 | **90/160 = 56.3 %** |
+| 4 MiB / 4 MiB | 280 MiB/스레드 | **236/1120 = 21.1 %** |
+| 1 MiB / 1 MiB | 255 MiB/스레드 | **327/4080 = 8.0 %** |
+| 64 KiB / 64 KiB | 255 MiB/스레드 | 3/65280 = 0.005 % |
+| **4 KiB / 4 KiB** | 63.8 MiB/스레드 | **65662/261120 = 25.1 %** |
+
+**4 KiB 파일도 깨진다.** 그리고 실패 65662 건이 **전부 `foreign-file=512`** —
+4 KiB 파일 전체(512 워드)가 **다른 파일의 같은 라운드 데이터**로 깔끔히 치환된다.
+같은 버그이고, 청크 크기만 따라 내려간 것이다.
+(64 KiB 가 유독 낮은 것은 단조롭지 않다. 이유를 규명하지 못했으므로 관측만 기록한다.)
+
+⇒ **파일이 작아서 안전한 것이 아니다.**
+
+## 59.2 동시성이 요구조건이다
+
+| 형태 | 결과 |
+|---|---|
+| **1 스레드**, 캐시 off, 200 읽기 | **PASS 0/200** · AUDIT-PASS |
+| **1 스레드**, 캐시 on, 200 읽기 | **PASS 0/200** · AUDIT-PASS |
+| 16 스레드, 캐시 off | FAIL 102/160 (63.8 %) · AUDIT-FAIL 10/16 (§58) |
+| **16 스레드, 캐시 on** | **FAIL 150/160 (93.8 %)** · AUDIT-FAIL 12/16 |
+
+**단일 쓰기 프로세스에서는 400 읽기(200×2 arm) 동안 한 건도 나오지 않았다.**
+16 스레드 rate 를 56 % 로 잡으면 0/200 의 확률은 사실상 0 이다.
+
+⇒ **동시에 서로 다른 파일에 쓰는 쓰기자가 둘 이상 있어야 발생한다.**
+사람이 `vi` 나 `echo` 로 txt 하나를 쓰는 것은 정확히 그 조건을 만들지 않는다.
+
+## 59.3 캐시는 보호막이 아니다 — 오히려 더 나쁘다
+
+기본 캐시(캐싱 활성)에서 **93.8 %** 로, 캐시를 끈 63.8 % 보다 **높았다.**
+그리고 정지 상태 감사에서 16 개 중 **12 개** 파일이 여전히 틀렸다.
+
+즉 "캐시가 읽기를 메모리에서 처리해 손상을 숨긴다"는 가설은 틀렸다.
+캐시는 손상을 감추지도, 막지도 못한다.
+
+## 59.4 그래서 "txt 는 멀쩡하다"의 정확한 이유
+
+세 가지가 겹친다. 크기는 그중 하나도 아니다.
+
+1. **쓰기자가 하나다.** 이것이 결정적이다 — 0/400
+2. **시도 횟수가 적다.** 4 KiB arm 은 25 % 를 보기까지 261,120 회 읽었다.
+   txt 파일 하나를 쓰고 읽는 것은 1 회다
+3. **덮어쓰기 반복이 없다.** 우리 워크로드는 같은 파일을 라운드마다 다시 쓰며
+   미기록 미디어를 계속 소비한다(§50). 한 번 저장하는 txt 는 그렇지 않다
+
+**따라서 "안전하다"고 결론 내려서는 안 된다.** 위험한 것은 파일 크기가 아니라
+**동시에 여러 파일을 쓰는 워크로드**다 — 즉 체크포인트, 데이터 적재, 병렬 학습 I/O,
+`mpirun` 다중 랭크 쓰기 등 **DAOS 를 쓰는 이유 그 자체**에 해당하는 패턴이다.
+사용자 관점에서는 이렇게 요약된다:
+
+> 손으로 파일 하나 쓰는 것은 재현되지 않는다. 여러 프로세스가 동시에 파일을 쓰면
+> 4 KiB 파일까지 다른 파일의 내용으로 바뀌고, 그 상태로 디스크에 남는다.
+
+## 59.5 하네스 사고 (또 이스케이프, 그리고 죽은 마운트)
+
+- 첫 스윕은 전부 `PASS 0/0` 이었다 — `mount | grep dfuse` 는 통과하는데
+  FUSE 세션이 죽어 있어(`ENOTCONN`) 모든 스레드가 즉시 실패했다.
+  **`mount` 확인은 마운트가 살아 있음을 뜻하지 않는다.**
+  실제 파일 조작(`touch`/`rm`)으로 검증하도록 고치고, **읽기 0 건이거나
+  `failed:` 가 있으면 채점하지 않는** 가드를 넣었다
+- 후속 스크립트를 `ssh` 명령 문자열 안에서 python 으로 패치하려다 또 인용이 깨졌다.
+  로컬 작성 + `scp` 로 되돌렸다 — §46.4·§53.5 에 이어 세 번째다
+- `28MiB_x1` arm 이 `ABORT_cont_create` 로 빠졌다. 형태마다 풀 이름을 유일하게
+  주도록 고친 뒤 정상 실행됐다
+
+---
+
+# 60. ★★ 최소 재현 구성 — 디바이스도 타깃도 아니고 **랭크가 둘**이어야 한다 (2026-09-03)
+
+§51.4 는 "손상에 2 랭크 + 랭크당 2 디바이스가 필요해 보인다"고 적었다.
+**그 진술은 근거가 없었다.** 그 표에서 실제로 측정된 형태는 `2rank_2dev` 하나뿐이고
+나머지 세 형태는 하네스 결함으로 빠졌다 — 단일 랭크 조인 판정 정규식 오류와
+진단하지 않은 풀 생성 실패였다. 제대로 다시 쟀다.
+
+동일 조건: `targets: 4`(별도 표기 없으면), oclass S1/`rd_fac:0`, 런마다 재기동+포맷,
+PASCARI, 형태당 2~3 런.
+
+## 60.1 결과
+
+| 형태 | 랭크 | 디바이스/랭크 | pool `ntarget` | 결과 |
+|---|---|---|---|---|
+| 2rank_2dev | 2 | 2 | 8 | **FAIL 12, 26 /160** |
+| 2rank_1dev | 2 | 1 | 8 | **FAIL 36, 31 /160** |
+| 1rank_2dev | 1 | 2 | 4 | **PASS 0/160 ×2** |
+| 1rank_1dev | 1 | 1 | 4 | **PASS 0/160 ×2** |
+| **1rank_1dev, `targets: 8`** | **1** | 1 | **8** | **PASS 0/160 ×3** |
+
+## 60.2 판정
+
+- **디바이스 수는 무관하다.** 2 랭크는 디바이스가 1 개든 2 개든 손상된다(36·31 대 12·26).
+- **총 타깃 수도 아니다.** 마지막 arm 은 **한 랭크에 타깃 8 개**로 총 타깃을 손상 형태와
+  똑같이 맞췄는데 **3 런 전부 깨끗**하다.
+- **필요조건은 랭크가 둘, 즉 서버(엔진)가 둘인 것이다.**
+
+⇒ **§51.4 의 "2 디바이스 필요"를 철회하고 "2 랭크 필요"로 대체한다.**
+이것은 §51.4 에서 단일 랭크 PASCARI 3 런이 0/160 이었던 것(drive_ab)과도 일치한다 —
+그때는 형태 문제로 오해했지만 실제로는 단일 랭크가 이유였다.
+
+## 60.3 이것이 §46 의 targets 증폭과 어떻게 맞물리는가
+
+§46 은 `targets` 1→4 에서 5.5 %→59.5 % 를 보였다 — 단 **2 랭크 구성에서** 였다.
+§60 은 랭크가 하나면 `targets` 를 8 로 올려도 0 이라는 것을 보인다.
+따라서 정확한 서술은 이렇다:
+
+> **두 랭크가 동시에 쓸 때만 발생하고, 그 조건이 갖춰지면 랭크 내 타깃 수가 비율을 증폭한다.**
+
+`targets` 는 증폭기이지 방아쇠가 아니다.
+
+## 60.4 이것이 무엇을 시사하는가
+
+한 서버 안에서 8 개 xstream 이 같은 장치를 동시에 두드려도 깨끗한데,
+두 서버가 각자의 장치에 쓰면 깨진다. 두 랭크는 **저장 경로를 공유하지 않는다** —
+공유하는 것은 **클라이언트 측 I/O 분배**와 객체 배치, 그리고
+**클라이언트가 두 랭크에 동시에 발행하는 RPC 흐름**이다.
+
+이는 원인 위치에 대한 해석을 넓힌다. §57.1 은 (a) DAOS/SPDK 동시 쓰기 경합과
+(b) 드라이브 결함을 남겼는데, §60 은 **순수한 서버 내 경합이나 순수한 장치 결함으로는
+설명되지 않음**을 보여준다 — 둘 다 단일 랭크에서도 나타나야 한다.
+**두 랭크가 관여해야 한다는 사실 자체가 새로운 제약이며, 아직 설명되지 않았다.**
+
+가능한 방향(미검증):
+1. 클라이언트가 두 랭크에 병행 발행할 때만 만들어지는 타이밍
+2. 두 랭크가 같은 스위치·같은 네트워크 경로를 공유하며 생기는 무언가
+   (단 §17·§18 에서 프로바이더·전송 축은 배제됐다)
+3. 랭크 간 무언가(DTX, 에포크, 풀 맵)가 개입하는 경로 — S1(복제 없음)에서도
+   발생하므로 복제 경로는 아니다(§45)
+
+## 60.5 재현 레시피 갱신 (업스트림용)
+
+| 필수 | |
+|---|---|
+| 랭크 | **2 개 이상** (엔진 2 대). 1 랭크에서는 재현되지 않는다 |
+| 드라이브 | PASCARI XX208H023T84P324T0910 계열. Samsung MZQL2 는 0/1280 |
+| 미디어 상태 | 포맷 이후 미기록 영역에 쓰기(초기 적재 전체가 창, §50) |
+| 동시성 | 서로 다른 객체/파일에 **동시에 쓰는 쓰기자 2 개 이상**(§59) |
+| 증폭 | `targets` 를 올릴수록 비율 상승(2 랭크 조건 하에서, §46) |
+| 무관 | 디바이스 수, oclass·복제, 섹터 크기, 청크 크기(영역 크기만 따라감), 전송 |
+
+---
+
+# 61. ★★ 두 엔진이 아니라 **두 머신**이어야 한다 — 마이크로벤치 가능성 판정 (2026-09-03)
+
+§60 은 "랭크가 둘이어야 한다"를 확정했다. 그러면 그 "둘"이 **엔진 프로세스 둘**인지
+**물리 머신 둘**인지가 다음 질문이고, 이것이 **DAOS 없는 마이크로벤치가 가능한지**를 결정한다.
+
+cell1 한 대에 엔진 2 개를 올렸다 — 각각 PASCARI 1 대(`02:00.0`, `03:00.0`),
+`targets: 4`, 포트 31416/31516, 별도 `scm_mount`. 풀 `ntarget=8` 로 손상 형태와 동일하다.
+
+## 61.1 결과
+
+| 형태 | 랭크 | 머신 | ntarget | 결과 |
+|---|---|---|---|---|
+| 2 랭크 / **2 머신** (cell1+cell2) | 2 | 2 | 8 | **FAIL 36, 31 /160** (§60) |
+| **2 랭크 / 1 머신** (cell1 엔진 2 개) | 2 | **1** | 8 | **PASS 0/160 ×4** |
+
+같은 랭크 수, 같은 타깃 수, 같은 드라이브, 같은 oclass(S1), 같은 절차.
+2 랭크 S1 의 기대 손상률 ~20 % 에서 0/160 은 결정적이다(0.8¹⁶⁰ ≈ 4e-16), 4 런이면 여지가 없다.
+
+⇒ **"두 엔진 프로세스"로는 부족하다. 두 개의 물리 머신이어야 한다.**
+
+## 61.2 이것이 마이크로벤치에 대해 말해주는 것
+
+**DAOS 없는 마이크로벤치는 사실상 불가능하다.**
+
+두 머신이 필요하다는 것은, 재현에 **클라이언트가 두 원격 서버에 동시에 발행하는 흐름**이
+필수라는 뜻이다. 그런데 두 서버는 저장 경로를 전혀 공유하지 않는다 — 각자의 드라이브,
+각자의 SPDK, 각자의 메모리다. 순수 SPDK 프로그램 두 개를 두 머신에서 돌리면
+**서로 아무런 상호작용이 없으므로** 재현될 수 없다. 재현하려면 그 둘을 묶는 계층,
+즉 **DAOS 클라이언트/RPC 계층 자체**를 포함해야 한다 — 그러면 더 이상
+마이크로벤치가 아니라 DAOS 다.
+
+§28·§29·§42·§48 의 단독 재현기가 누적 0/2720 으로 깨끗했던 이유도 이제 설명된다.
+전부 **한 머신 한 프로세스**였다. 모방하지 못한 축(§48.3)을 아무리 채워도
+이 조건은 만들 수 없었다.
+
+## 61.3 그렇다면 무엇이 마이크로벤치인가
+
+**이미 갖고 있다.** DAOS 를 포함하되 최소한인 두 프로그램이다:
+
+| | 크기 | 재현율 | 용도 |
+|---|---|---|---|
+| `tests/obj_integrity.c` | ~390 줄 | 2 머신·`targets:4` 에서 53~60 % | raw object API. 계층 분석용 |
+| `tests/posix_integrity.c` | ~330 줄 | 동 조건에서 63.8 %(캐시 off), 93.8 %(캐시 on) | dfuse POSIX. **업스트림 제출용으로 이쪽이 낫다** |
+
+둘 다 태그 페이로드 `(tid<<56)|(round<<48)|offset` 로 **어느 객체·어느 라운드에서
+왔는지 스스로 밝히고**, `-A` 로 정지 상태 감사를 한다. 업스트림이 재현을 확인하고
+수정을 검증하는 데 필요한 것은 이것으로 충분하다.
+
+## 61.4 두 머신이 필요하다는 사실 자체가 가장 큰 단서다
+
+한 머신 안에서 엔진 2 개 × 타깃 4 개 = 8 개 xstream 이 두 PASCARI 를 동시에 두드려도
+깨끗한데, 그 엔진 하나를 다른 머신으로 옮기면 깨진다.
+**저장 스택은 완전히 동일하다.** 달라지는 것은:
+
+1. 클라이언트가 두 개의 **원격** 엔드포인트에 동시 발행한다(한 머신이면 같은 호스트)
+2. 두 엔진의 RPC 도착 타이밍이 **독립적**이 된다 — 한 머신에서는 같은 커널·같은 NIC 큐를
+   공유해 지터가 상관된다
+3. 완료 통지·bulk 전송이 실제 네트워크를 왕복한다
+
+§17·§18 에서 프로바이더·전송 축(`ofi+tcp`/`ucx`/`verbs`)은 배제됐으므로
+"어떤 전송을 쓰는가"의 문제는 아니다. 남는 것은 **타이밍의 독립성**이다.
+
+이는 §57.1 의 두 해석에 새 제약을 건다:
+- (a) 서버 내 동시 쓰기 경합 → **한 머신 8 xstream 에서 나타났어야 한다. 안 나타났다**
+- (b) 드라이브 결함 → **같은 드라이브 2 대를 한 머신에서 두드려도 안 나타났다**
+
+**두 해석 모두 단독으로는 §61.1 을 설명하지 못한다.**
+현재 데이터와 정합적인 서술은 이렇다:
+
+> 두 원격 엔진이 독립적인 타이밍으로 동시에 쓸 때만, PASCARI 계열 드라이브에서,
+> 포맷 이후 미기록 영역에 대해, 데이터가 조용히 오배치된다.
+
+## 61.5 남은 것
+1. 이 "두 머신" 제약을 좁힌다 — 예컨대 한 머신의 두 엔진을 **서로 다른 NUMA 노드**에 고정,
+   또는 한 엔진에 인위적 지연을 주어 타이밍 상관을 깨보기
+2. 업스트림 티켓 — §61.4 의 서술과 두 재현기를 함께 제출
+
+# 62. ★★★ 확정: 두 랭크가 **같은 물리 NVMe** 에 쓰고 있었다 — 결함이 아니라 공유 드라이브 오구성 (2026-09-03)
+
+§61 의 "두 머신이어야 한다"는 제약을 좁히려던 실험이 원인을 그대로 드러냈다.
+순서대로 적는다. 셋 다 새 런이고 전부 `targets: 4`, S1/`rd_fac:0`, 2 랭크(cell1+cell2), 런마다 재기동+포맷,
+`FILLHASH_DEBUG=1`(+ 마지막은 `WRAUDIT_DEBUG=1`).
+
+## 62.1 출처 객체의 위치 — 37/37 이 **다른 랭크**
+
+재현기에 `daos_obj_layout_get()` 을 넣어(`tests/obj_integrity.c`, `LAYOUT t<tid> rank=<r> tgt=<t>`) 피해 객체와
+외래 데이터의 출처 객체가 어느 랭크에 있는지 직접 봤다.
+
+| 런 | 랭크 분포 (rank0 / rank1 객체 수) | 손상 | 출처가 **다른 랭크** | 정지 감사 |
+|---|---|---|---|---|
+| 1 (`-T 0`) | 12 / 4 | 12/160 | **12/12** | 0/16 |
+| 2 (`-T 16`) | 9 / 7 | 3/160 | **3/3** | 3/16 |
+| 3 (`-T 32`) | 7 / 9 | 22/160 | **22/22** | 1/16 |
+
+**같은 랭크 안에서 섞인 사례가 하나도 없다.** 무작위라면 절반 가까이 같은 랭크였어야 한다.
+서버측 `FILLHASH`(NVMe→DMA 채움 직후 검사)도 같은 것을 말한다: cell1 이 자기 NVMe 에서 읽은 t7 의 버퍼에
+**cell2 에만 존재하는 t10** 의 바이트가 들어 있었다(§62 런1, `FILLHASH … exp_tid=7 … val t10`).
+런 3 에서는 t35(rank1)↔t36(rank0) 두 객체가 **28 MiB 전체를 라운드마다 번갈아 맞바꿨다**
+(r0: t36 에 t35, r1: t35 에 t36, …, r9 까지).
+
+## 62.2 서버에 도착한 쓰기 페이로드는 전부 옳았다
+
+`WRAUDIT`(장치에 넘기는 순간의 버퍼 tid)와 `OWNER op=W`(그 RPC 의 oid)를 같은 ULT·같은 blk 로 묶어 비교:
+
+| | 조인 | payload tid == RPC oid tid |
+|---|---|---|
+| cell1 (rank 0) | 490 | **490 / 490** |
+| cell2 (rank 1) | 630 | **630 / 630** |
+
+즉 cell1 은 t10 의 바이트를 **RPC 로 받은 적이 없는데** cell1 의 NVMe 가 t10 의 바이트를 돌려줬다.
+클라이언트·전송·bio·SPDK 어느 계층도 이 서버에 t10 을 넣지 않았다. 남는 설명은 하나다 —
+**그 바이트를 그 LBA 에 쓴 것은 cell2 의 엔진이다.**
+
+## 62.3 하드웨어 확인 — 같은 드라이브다
+
+| | cell1 | cell2 |
+|---|---|---|
+| 섀시 | Artemis U.2 | Artemis U.2 (동일) |
+| 커널에 보이는 PASCARI 24 대의 시리얼 집합 | A1E00NN0, A1E00NMV, A1E00NMZ, … | **완전히 같은 집합** |
+| `lspci -vv -s 02:00.0` DSN | `6479A701A8C0D000` | **`6479A701A8C0D000`** |
+| `lspci -vv -s 03:00.0` DSN | `6479A701A8C0B800` | **`6479A701A8C0B800`** |
+| `dmg storage query list-devices` 디바이스 UUID | `fd30a787-e49f-42f6-aded-a9ac6fcc46fa` (rank 0, 02:00.0) | **`fd30a787-…` 동일** (rank 1, 02:00.0) |
+
+Lustre HA 쌍이던 시절(§gpuflow-daos-vs-lustre)의 공유 백플레인이 그대로다. 양 노드가 24 대 전부를
+듀얼포트로 본다. §55.2 의 "두 디바이스가 실은 한 드라이브 — 배제(시리얼 상이)"는 **한 호스트 안의**
+02 와 03 을 비교한 것이었고, **호스트 간** 비교는 한 번도 하지 않았다.
+
+DAOS 자체가 이것을 보여주고 있었다 — 두 랭크의 디바이스 UUID 가 같다는 사실은 `dmg storage query
+list-devices` 한 줄에 들어 있었다.
+
+## 62.4 결정 실험 — cell2 를 다른 드라이브로
+
+cell2 만 `bdev_list: ["0000:03:00.0"]` 로 바꾸고(cell1 은 02:00.0 유지) 재포맷. 디바이스 UUID 가
+`fbb6bf1e…` / `2120a800…` 으로 갈렸다. 같은 하네스로 4 런(`-T 0/16/32/48`, 매 런 새 객체 = 미기록 영역 소비):
+
+| 런 | rank1 객체 수 | 손상 | 정지 감사 |
+|---|---|---|---|
+| 1~4 | 4 / 7 / 9 / 7 | **PASS 0/160 ×4** | **AUDIT-PASS 0/16 ×4** |
+
+직전 3 런은 같은 조건에서 12·3·22/160 이었다. **0/640.**
+
+## 62.5 이전 결론의 재해석 — 전부 한 가지로 설명된다
+
+| 관측 | 실제 원인 |
+|---|---|
+| 정확히 한 청크가 다른 객체의 **같은 오프셋** 데이터로 바뀜(§12.2·§38) | 두 엔진의 VEA 가 포맷 직후 **같은 blob 오프셋을 lockstep 으로 할당**한다(OWNER 로그에서 양 랭크가 같은 μs 에 같은 blk 를 배정). 같은 LBA 에 두 객체가 쓰이고 나중 것이 이긴다 |
+| 상호 교환·사슬(§38.2), 라운드마다 번갈아(§62.1) | 두 쓰기의 순서가 라운드마다 뒤바뀜 |
+| 손상이 미디어에 영구히 남음(§38) | 실제로 덮어써졌으므로 |
+| **DAOS 계층 계측이 전부 결백**(§37·§39·§40·§41·§47) | 각 엔진은 자기 관점에서 완전히 옳았다. 상대 엔진의 쓰기는 어느 계측에도 보이지 않는다 |
+| **단독 SPDK 재현기 0/2720**(§28·§29·§42·§48) | 한 호스트만 썼으므로 |
+| **`class: file` 깨끗**(§27) | 로컬 파일은 공유되지 않는다 |
+| **1 랭크는 깨끗, 2 랭크·2 머신이어야**(§60·§61) | 한 호스트의 두 엔진은 02 와 03 = 서로 다른 드라이브. 두 호스트의 02 = 같은 드라이브 |
+| **PASCARI 만 손상, Samsung 클러스터 0/1280**(§53·§54) | daos-1/daos-3 의 Samsung 은 각자 로컬 드라이브. 드라이브 모델과 무관 |
+| **`targets` 4 배에 10.8 배**(§46) | 동시 쓰기가 늘수록 두 엔진의 할당이 같은 영역에 겹칠 확률이 올라간다 |
+| **포맷 직후·미기록 영역에서만**(§34·§50) | 두 VEA 가 같은 지점에서 출발해 lockstep 으로 전진하는 구간. 한쪽만 재사용 영역에 들어가면 겹침이 줄어든다 |
+| 포맷 직후 과도 구간의 심한 오류·DTX flush 실패·bulk 역직렬화 실패(§13.4·§12.7·§12.8c) | 메타데이터/WAL blob 까지 같은 LBA 를 공유해 서로의 md 를 덮어쓴다 |
+| 체크섬이 잡는다(§49) | 당연히 |
+| VM 클러스터·34.x 에서 재현 안 됨(§20~§26·§51) | 드라이브를 공유하지 않는다 |
+| dfuse 에서 더 심함(§58·§59) | 동시 쓰기자가 많을수록 겹침 증가 |
+
+## 62.6 판정
+
+- **DAOS·SPDK·mercury·PASCARI 펌웨어 어느 것도 결함이 아니다.** 상류 티켓과 Phison 문의는 내지 않는다.
+- 결함은 **구성**이다: 듀얼포트 공유 백플레인에서 두 엔진에 같은 네임스페이스를 배정했다.
+  DAOS 는 이것을 막지 않지만(디바이스 UUID 가 같아도 경고하지 않음), 막아야 할 의무도 명시돼 있지 않다.
+  상류에 낼 만한 것이 있다면 **"같은 SMD 디바이스 UUID 가 두 랭크에 나타나면 format 을 거부하라"** 는
+  개선 요청 하나뿐이다.
+- lmcache-daos 의 DAOS 백엔드 "사용 불가" 판정(§0)은 **철회**한다. 이 클러스터에서 랭크별로 **서로 다른
+  물리 드라이브**를 배정하면 손상은 재현되지 않는다.
+
+## 62.7 운영 규칙 (이 섀시에서 DAOS 를 쓸 때)
+
+1. 엔진에 드라이브를 배정하기 전에 **양 노드에서 `lspci -vv -s <bdf> | grep Serial`** 로 DSN 을 비교한다.
+   BDF 가 같다고 같은 드라이브가 아니고, 다르다고 다른 드라이브도 아니다.
+2. 포맷 뒤 `dmg storage query list-devices` 로 **랭크 간 디바이스 UUID 가 전부 다른지** 확인한다.
+   같은 UUID 가 둘이면 즉시 중단.
+3. 이번 최종 구성: cell1 `0000:02:00.0`(DSN `…D000`), cell2 `0000:03:00.0`(DSN `…B800`).
+   cell1 의 `03:00.0` 은 cell2 의 것과 같은 드라이브이므로 cell1 에서 쓰지 말 것.
+
+## 62.8 방법론 — 이 조사가 이 지점에 61 절 만에 도달한 이유
+
+- 계측은 모두 **한 엔진의 관점** 안에 있었다. "모든 계층이 옳은데 결과가 틀리다"는 모순(§31·§33·§41)이
+  나왔을 때, 답은 "계측 밖의 행위자가 있다"였다. 그 가능성을 §62.1 처럼 **출처를 위치로 귀속**하기
+  전까지 아무도 시험하지 않았다.
+- "같은 오프셋의 다른 객체" 서명(§12.2)은 두 VEA 의 lockstep 을 그대로 말하고 있었다.
+- 하드웨어 동일성 확인이 **호스트 안**에서만 이루어졌다(§55.2). HA 쌍에서 온 장비라는 사실(§gpuflow-daos-vs-lustre,
+  Lustre 페일오버 구성)이 공유 스토리지를 뜻한다는 점을 연결하지 못했다.
+- 재현기·로그: client-5 `/root/attrib/`(run1~3, d_run_0~48), cell1/cell2 `/root/attrib_run*.log`,
+  재현기 소스 `tests/obj_integrity.c`(LAYOUT 출력 추가), 스크립트는 세션 스크래치패드.

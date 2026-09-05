@@ -39,6 +39,13 @@ def parse_prefix(prefix: bytes) -> Tuple[int, int]:
     return _PREFIX.unpack(prefix)
 
 
+def prefix_pack(meta_len: int, payload_len: int) -> bytes:
+    """Just the 8-byte prefix — for zero-copy writers that emit the payload
+    separately (header write + bulk write at an offset) instead of building one
+    concatenated blob."""
+    return _PREFIX.pack(meta_len, payload_len)
+
+
 def pack(meta: bytes, payload: bytes) -> bytes:
     """Full object bytes for callers that write in one shot."""
     return _PREFIX.pack(len(meta), len(payload)) + meta + payload

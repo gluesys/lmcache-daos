@@ -1,0 +1,83 @@
+Let NA_UCX_EXTRA_TLS add UCX memory-type components, defaulting to none.
+
+WHY THIS DEFAULTS TO OFF -- READ BEFORE CHANGING IT
+
+The first version of this patch appended "cuda_copy,cuda_ipc" unconditionally
+(NA_UCX_EXTRA_TLS only overrode it). That silently corrupted ORDINARY
+HOST-MEMORY bulk transfers on any client where CUDA is loadable: one 4 MiB
+region per transfer came back wrong, only with 4 or more concurrent readers,
+with sizes and return codes all normal. In the vLLM container CUDA always leads
+LD_LIBRARY_PATH, so it was always on. Measured on client-6 -- one host, one
+client bundle, one test, nothing else changed:
+
+    CUDA ahead of DAOS on the library path, appended by default : FAIL
+    CUDA ahead of DAOS on the library path, NA_UCX_EXTRA_TLS=   : PASS 80/80
+    DAOS ahead of CUDA on the library path                      : PASS 80/80
+
+So a patch whose whole purpose was enabling GPU-direct was breaking the path
+that does not use the GPU. It is needed only for dfs_read_gpu()/dfs_write_gpu(),
+and gpudirect/PLAN.md records the decision NOT to build the GPU-direct backend
+(GPU-direct measured 2.09x slower than host staging at the chunk sizes LMCache
+actually uses). Nothing in the production path wants it, so it is opt-in:
+
+    unset / empty  -> UCX gets exactly the requested protocol, as upstream
+    set to a list  -> that list is appended, e.g.
+                      NA_UCX_EXTRA_TLS=cuda_copy,cuda_ipc
+
+Set it only for GPU-direct experiments, and re-run tests/test_rawio_integrity.py
+(28 MiB, 16 threads) afterwards, requiring a clean pass before trusting
+anything measured with it. The failure mode is silent.
+
+Existing trees: this replaces an earlier version of the same patch, so on a tree
+carrying the OLD version apply-patches.sh reports "DOES NOT APPLY" rather than
+quietly mixing the two. Reverse the old one, or rebuild the prereq from clean,
+first.
+
+Verified by generating the diff against a pristine na_ucx.c (old patch reversed)
+rather than editing hunk counts by hand -- the first hand-written attempt was
+malformed.
+
+--- a/src/na/na_ucx.c
++++ b/src/na/na_ucx.c
+@@ -1426,8 +1426,39 @@
+         na_ucs_status_to_na(status), "ucp_config_read() failed (%s)",
+         ucs_status_string(status));
+ 
+-    /* Set user-requested transport */
+-    status = ucp_config_modify(config, "TLS", tls);
++    /* Set user-requested transport, optionally with extra components.
++     *
++     * cuda_copy and cuda_ipc are memory-type components, not network
++     * transports, but UCX gates them through the same TLS list. Restricting
++     * TLS to just the requested protocol therefore drops the component that
++     * supplies the dma-buf file descriptor for GPU buffers, and a later
++     * ucp_mem_map() of CUDA memory fails with -EINVAL (it falls back to
++     * ibv_reg_mr() on a device address).
++     *
++     * Adding them back is what GPU-direct needs and what host memory must
++     * not have: with the CUDA components live, concurrent host-memory bulk
++     * transfers lose one 4 MiB region per transfer, silently. So this stays
++     * OFF unless NA_UCX_EXTRA_TLS names the components explicitly. Do not
++     * restore a built-in default here; see the header of this patch. */
++    {
++        const char *extra_tls = getenv("NA_UCX_EXTRA_TLS");
++        char        tls_buf[256];
++
++        if (extra_tls != NULL && extra_tls[0] != '\0') {
++            snprintf(tls_buf, sizeof(tls_buf), "%s,%s", tls, extra_tls);
++            status = ucp_config_modify(config, "TLS", tls_buf);
++            /* Fall back to the bare protocol if this UCX build does not know
++             * the requested names, so a typo cannot disable the class. */
++            if (status != UCS_OK) {
++                NA_LOG_SUBSYS_WARNING(cls,
++                    "TLS \"%s\" rejected; falling back to \"%s\"",
++                    tls_buf, tls);
++                status = ucp_config_modify(config, "TLS", tls);
++            }
++        } else {
++            status = ucp_config_modify(config, "TLS", tls);
++        }
++    }
+     NA_CHECK_SUBSYS_ERROR(cls, status != UCS_OK, error, ret,
+         na_ucs_status_to_na(status), "ucp_config_modify() failed (%s)",
+         ucs_status_string(status));

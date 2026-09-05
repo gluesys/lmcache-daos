@@ -29,12 +29,15 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import hashlib
+import os
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import serde
-from .dfs_binding import DfsSys
+from .dfs_binding import DfsSys, DaosError
+from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
 # stays inspectable/unit-testable elsewhere.
@@ -52,6 +55,11 @@ except Exception:  # pragma: no cover - exercised only off the serving host
         def __init__(self, *a, **k):
             pass
 
+
+# How many bytes past the 8-byte prefix to grab in the header read. LMCache's
+# RemoteMetadata for a KV chunk serializes to ~28 B; 512 leaves ample room so
+# prefix+meta come back in a single round-trip.
+_HDR_CAP = 512
 
 def _parse_daos_url(url: str):
     """Parse a DAOS target out of either URL spelling.
@@ -128,20 +136,12 @@ class DaosConnector(RemoteConnector):
     def _run(self, fn, *args):
         return self.loop.run_in_executor(self._pool, fn, *args)
 
-    def _pack(self, memory_obj: "MemoryObj") -> bytes:
-        """Serialize one MemoryObj into the on-disk object bytes."""
-        kv_bytes = bytes(memory_obj.byte_array)
-        meta_bytes = RemoteMetadata(
-            len(kv_bytes),
-            memory_obj.get_shapes(),
-            memory_obj.get_dtypes(),
-            memory_obj.get_memory_format(),
-        ).serialize()
-        return serde.pack(meta_bytes, kv_bytes)
-
     # -- RemoteConnector interface -----------------------------------------
     async def exists(self, key) -> bool:
-        return await self._run(self._dfs.exists, _key_to_path(key))
+        return await self._run(self._exists_sync, _key_to_path(key))
+
+    def _exists_sync(self, path) -> bool:
+        return self._dfs.exists(path)
 
     def exists_sync(self, key) -> bool:
         return self._dfs.exists(_key_to_path(key))
@@ -149,9 +149,272 @@ class DaosConnector(RemoteConnector):
     async def get(self, key) -> Optional["MemoryObj"]:
         return await self._run(self._get_sync, _key_to_path(key))
 
+    # LMCache dispatches per-chunk get() concurrently, but also probes for a
+    # batched hook. Advertising it lets us gather every chunk of a request onto
+    # the thread pool in one shot; because _get_sync reads the payload straight
+    # into the target buffer via a GIL-releasing ctypes call, the chunk reads
+    # actually overlap instead of serializing on the interpreter lock.
+    def support_batched_get(self) -> bool:
+        return True
+
+    async def batched_get(self, keys) -> List[Optional["MemoryObj"]]:
+        """Fetch every key. Unlike the *_non_blocking variant this has no prefix
+        semantics -- the result is positional, with None for a miss."""
+        import time as _t
+        t0 = _t.perf_counter()
+        paths = [_key_to_path(k) for k in keys]
+        # return_exceptions: one unreadable object must not fail the whole
+        # batch. A cache reports a miss and lets the engine recompute that
+        # range. (Adopted from the main branch's batched_get.)
+        gathered = await asyncio.gather(
+            *(self._run(self._get_sync, p) for p in paths),
+            return_exceptions=True)
+        res = [None if isinstance(r, BaseException) else r for r in gathered]
+        # Instrumentation: connector-side batched_get wall time. LMCache's own
+        # "Retrieved ... cost" covers connector-read + H2D staging; subtracting
+        # this isolates the H2D stage (env DAOS_BG_PROF=1 to enable).
+        if os.environ.get("DAOS_BG_PROF") == "1" and len(keys) > 2:
+            nb = 0
+            for o in res:
+                if o is not None:
+                    try:
+                        nb += len(memoryview(o.byte_array).cast("B"))
+                    except Exception:
+                        pass
+            dt = _t.perf_counter() - t0
+            import sys as _s
+            _s.stderr.write(
+                f"[CONN-BG] chunks={len(keys)} bytes={nb} wall={dt*1000:.1f}ms "
+                f"= {nb/dt/1e9:.2f} GB/s\n")
+            _s.stderr.flush()
+        return res
+
+    # LMCache's async-loading path (storage_manager) prefers this over the
+    # blocking variant: it is awaited as a coroutine so the engine can overlap
+    # scheduling/H2D with the DAOS reads instead of running read-all → H2D-all
+    # strictly serially (that serialization is what caps retrieve at
+    # read⊕H2D ≈ 19 GB/s even though read alone does 34 and H2D 46).
+    # Contract (per base_connector): return only the CONSECUTIVE prefix of
+    # successfully retrieved objects; release anything after the first miss.
+    # MEASURED (2026-08-25): enabling this path did NOT unlock read↔H2D
+    # pipelining — the API returns a list, so all chunks must still be read
+    # before LMCache starts H2D. Aggregate was flat (conc4 +6%) and single
+    # request regressed 1.7× (172→288ms), so we opt out and keep the blocking
+    # batched_get. The implementation is retained for the day LMCache offers
+    # incremental/streaming chunk delivery.
+    def support_batched_get_non_blocking(self) -> bool:
+        return False
+
+    async def batched_get_non_blocking(self, lookup_id, keys):
+        paths = [_key_to_path(k) for k in keys]
+        res = await asyncio.gather(
+            *(self._run(self._get_sync, p) for p in paths))
+        prefix = []
+        for obj in res:
+            if obj is None:
+                break
+            prefix.append(obj)
+        for obj in res[len(prefix):]:
+            if obj is None:
+                continue
+            # avoid leaking allocations past the first miss
+            for meth in ("ref_count_down", "release", "free"):
+                fn = getattr(obj, meth, None)
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+        return prefix
+
+    # -- P4: completion-ordered streaming --------------------------------
+    # Not part of LMCache 0.5.2's connector interface -- this is the reference
+    # implementation for the upstream streaming-get RFC. LMCache will not call
+    # it until such an API lands; until then it costs nothing and is exercised
+    # by tests/bench_stream_h2d.py, which measures the overlap it enables.
+    #
+    # Deliberately built on the existing blocking thread pool rather than DAOS
+    # event queues: measured, the event path caps near 7-12 GB/s however the
+    # queues are arranged (per-EQ eqx_lock serialises submit+completion, and
+    # each extra EQ costs a network context), while the blocking pool reaches
+    # 34.3 GB/s on a 100 GB NVMe-resident working set. Completion ordering does
+    # not require DAOS events -- a resolved future is a completion.
+    def support_stream_get(self) -> bool:
+        return True
+
+    async def stream_get(self, keys, max_inflight: int = 16):
+        """Yield ``(index, MemoryObj | None)`` as each chunk finishes reading.
+
+        ``index`` is the position in ``keys``, so the consumer can copy each
+        chunk into its slot the moment it lands instead of waiting for the whole
+        batch. ``None`` means miss-or-error for that chunk; the stream continues
+        (per-chunk error semantics, as the RFC proposes).
+        """
+        paths = [_key_to_path(k) for k in keys]
+        async for idx, res in stream_completions(
+                self.loop, self._pool, self._get_sync, paths, max_inflight):
+            if isinstance(res, BaseException):
+                # A single unreadable chunk must not poison the batch; the
+                # engine treats it as a miss and recomputes that range.
+                yield idx, None
+            else:
+                yield idx, res
+
+    @staticmethod
+    def _drop_put_ref(memory_obj) -> None:
+        """Release the reference the serializer took on our behalf.
+
+        Required by LMCache's contract, which is only visible if you read the
+        serializer next to the backend. NaiveSerializer.serialize() is::
+
+            def serialize(self, memory_obj):
+                memory_obj.ref_count_up()
+                return memory_obj
+
+        -- the same object, with one reference added FOR THE CONSUMER. And
+        remote_backend.batched_submit_put_task() drops only its own::
+
+            for mo in memory_objs: mo.ref_count_up()
+            try:     compressed = [serialize(mo) for mo in memory_objs]
+            finally: for mo in memory_objs: mo.ref_count_down()
+            ... connection.batched_put(keys, compressed_memory_objs)
+
+        So every memory_obj arriving at put()/batched_put() carries a reference
+        that the connector owns and must release. This connector never did, on
+        either path, and support_batched_put() is True so the batched one is the
+        one in use -- a leaked reference per stored chunk.
+
+        A leak does not corrupt by itself; it stops the CPU pool from ever
+        reclaiming. What makes it a correctness problem is what the allocator
+        then does under pressure on the get path, where _get_sync() calls
+        local_cpu_backend.allocate() for every chunk. LMCache already reports
+        "Ref count of MemoryObj ... is negative: -1. Double free occurred
+        somewhere" on this path in the hundreds per run and never under
+        LocalCPUBackend, so its accounting is demonstrably inconsistent here.
+
+        Written as its own method rather than reusing _release(): that one tries
+        ref_count_down, then release, then free, for the torn-object path where
+        any of them will do. Here exactly one ref_count_down is owed, so
+        falling through to a different method would be wrong.
+        """
+        fn = getattr(memory_obj, "ref_count_down", None)
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:
+            pass
+
     async def put(self, key, memory_obj: "MemoryObj"):
-        # Extract on the calling thread (cheap), do the write in the pool.
-        await self._run(self._dfs.write, _key_to_path(key), self._pack(memory_obj))
+        header, src, n = self._prep_write(memory_obj)
+        try:
+            await self._run(self._put_sync, _key_to_path(key), header, src, n)
+        finally:
+            self._drop_put_ref(memory_obj)
+
+    # Aliasing the MemoryObj on the store path is UNSAFE and is off by default.
+    # See _prep_write. Set DAOS_UNSAFE_ALIAS_STORE=1 only to reproduce the bug.
+    _ALIAS_STORE = os.environ.get("DAOS_UNSAFE_ALIAS_STORE") == "1"
+
+    # Diagnostic for the KV corruption: read into a private bytearray and copy
+    # into the MemoryObj, instead of letting DAOS write straight into the
+    # MemoryObj's (torch-backed) memory.
+    #
+    # It discriminates the one hypothesis left standing. Concurrency is the
+    # trigger -- 0/200 sequential against 6/208 concurrent -- and the failures
+    # start at exact 4 MiB DFS chunk boundaries and lose exactly one or two
+    # chunks, with the head of the buffer holding the CORRECT key's data. The
+    # same 28 MiB at the same thread count into a plain bytearray
+    # (tests/test_rawio_integrity.py) is byte-exact 80/80, so the destination
+    # buffer is the variable that decides whether the defect appears.
+    #
+    #   corruption disappears -> the aliased MemoryObj destination is the
+    #       cause, and the fix is a copy here or a registered/pinned buffer
+    #   corruption persists   -> the destination is innocent and the fault is
+    #       in concurrent multi-chunk DFS reads, one layer down
+    #
+    # Off by default: it reintroduces the full copy per chunk that the aliased
+    # read exists to avoid.
+    _READ_VIA_BYTEARRAY = os.environ.get("DAOS_READ_VIA_BYTEARRAY") == "1"
+
+    def _prep_write(self, memory_obj):
+        """Build ``(header, src, n)`` for the write.
+
+        History, because the obvious "optimisation" here is a correctness bug.
+
+        The original path did ``bytes(byte_array)`` -> ``serde.pack`` concat ->
+        ``create_string_buffer``: THREE full copies of every chunk, 120 MB of
+        GIL-held memcpy per 40 MB chunk, ~1 GB/s effective store (+5.2 s on a
+        5.24 GB store). That was replaced by having ``src`` merely *alias* the
+        MemoryObj buffer, with header and payload written as two offset writes
+        so the payload is never concatenated: +5178 -> +65 ms at 8K.
+
+        The alias is unsafe in principle: ``put()`` is driven from LMCache's
+        ``batched_put()``, which is an ASYNC SUBMIT, and LMCache drops its
+        reference (``ref_count_down``) and recycles the MemoryObj without
+        waiting for us -- so an aliased write can land after the buffer has
+        become someone else's KV. Nothing fails: the write succeeds, the sizes
+        agree, and the object holds the wrong tensor.
+
+        Copying is the default as a precaution, and that is ALL the evidence
+        supports. Do not read it as a fix.
+
+        The honest history: this was claimed as the cause, retracted, re-claimed
+        with a "100% vs 10%" rate comparison, and then that comparison turned
+        out to be invalid too. The 10% came from a measurement whose reference
+        pass was itself a cache hit -- prompts repeated across runs, so pass A
+        read the same stale object as pass B and corrupt-matching-corrupt scored
+        as success. With the instrument fixed (per-run nonce, pass A asserted to
+        miss, container verified empty, non-perturbing checks) the rates are:
+
+            aliased store : 100%  95% CI [83.9%, 100%]
+            copied store  :  85%  95% CI [64.0%, 94.8%]
+
+        Those intervals overlap, so copying is NOT shown to help. It stays
+        because the alias is unsafe on its own terms -- batched_put() is an
+        async submit and LMCache ref_count_downs without waiting -- and because
+        it costs nothing measurable: one from_buffer_copy is not the old
+        three-copy path, it runs in this connector's thread pool rather than on
+        the latency path, and LMCache's reported store cost is unchanged either
+        way (offload ~62 ms, put_time ~0.12 ms).
+
+        The path is broken roughly 85% of the time either way. What IS
+        established is the layer: raw DFS reads and writes are byte-exact at 16
+        threads (tests/test_rawio_integrity.py, 80/80) while end-to-end KV
+        fails 85%, so the fault is in how this connector uses DFS or in the
+        LMCache integration -- not in transport or storage.
+
+        The zero-copy write can be recovered once the residual failures are
+        understood, but by PINNING the MemoryObj for the duration
+        (``pin()``/``unpin()``, as ``cache_engine`` does), not by reinstating an
+        unheld alias.
+        """
+        view = memory_obj.byte_array
+        if not isinstance(view, memoryview):
+            view = memoryview(view)
+        view = view.cast("B")
+        n = len(view)
+        meta_bytes = RemoteMetadata(
+            n,
+            memory_obj.get_shapes(),
+            memory_obj.get_dtypes(),
+            memory_obj.get_memory_format(),
+        ).serialize()
+        header = serde.prefix_pack(len(meta_bytes), n) + meta_bytes
+        buf = (ctypes.c_char * n)
+        if self._ALIAS_STORE:
+            return header, buf.from_buffer(view), n
+        return header, buf.from_buffer_copy(view), n
+
+    def _put_sync(self, path, header, src, n):
+        obj = self._dfs.open_rdwr_create(path)
+        try:
+            hdr = (ctypes.c_char * len(header)).from_buffer_copy(header)
+            self._dfs.write_obj_from(obj, 0, len(header), hdr)   # tiny (~36 B)
+            self._dfs.write_obj_from(obj, len(header), n, src)   # bulk, no copy
+        finally:
+            self._dfs.close_obj(obj)
 
     # -- batched interface --------------------------------------------------
     # Only get/put are overridden, and only because measurement said so.
@@ -186,29 +449,25 @@ class DaosConnector(RemoteConnector):
     # leak for no measured gain.
 
 
-    def support_batched_get(self) -> bool:
-        return True
-
     def support_batched_put(self) -> bool:
         return True
 
-    async def batched_get(self, keys) -> List[Optional["MemoryObj"]]:
-        """Fetch every key. Unlike the *_non_blocking variant this has no prefix
-        semantics -- the result is positional, with None for a miss."""
-        results = await asyncio.gather(
-            *(self._run(self._get_sync, _key_to_path(k)) for k in keys),
-            return_exceptions=True,
-        )
-        # A single unreadable object must not fail the whole batch; a cache
-        # reports a miss and lets the engine recompute.
-        return [None if isinstance(r, BaseException) else r for r in results]
-
     async def batched_put(self, keys, memory_objs):
-        blobs = [self._pack(mo) for mo in memory_objs]
-        await asyncio.gather(*(
-            self._run(self._dfs.write, _key_to_path(k), b)
-            for k, b in zip(keys, blobs)
-        ))
+        # Zero-copy, same as put(). main's version built every blob first via
+        # _pack() -- for a 5.24 GB store that is 10.5 GB of GIL-held memcpy on
+        # the asyncio loop thread plus a 5.24 GB transient. _prep_write only
+        # aliases each buffer, so nothing is materialised here.
+        prepped = [self._prep_write(mo) for mo in memory_objs]
+        try:
+            await asyncio.gather(*(
+                self._run(self._put_sync, _key_to_path(k), h, s, n)
+                for k, (h, s, n) in zip(keys, prepped)
+            ))
+        finally:
+            # One reference owed per object -- see _drop_put_ref. This is the
+            # path LMCache actually uses, since support_batched_put() is True.
+            for mo in memory_objs:
+                self._drop_put_ref(mo)
 
 
 
@@ -237,51 +496,124 @@ class DaosConnector(RemoteConnector):
 
     async def close(self):
         self._pool.shutdown(wait=True)
-        self._dfs.close()
+        try:
+            self._dfs.close()
+        except Exception:
+            pass
 
     # -- runs inside the thread pool ---------------------------------------
+    @staticmethod
+    def _release(memory_obj) -> None:
+        """Hand a MemoryObj back to the allocator (best effort).
+
+        Needed on the torn-object path: reading straight into the destination
+        means the buffer is allocated *before* the payload length is known to be
+        good, so a short read has to give it back or it leaks.
+        """
+        for meth in ("ref_count_down", "release", "free"):
+            fn = getattr(memory_obj, meth, None)
+            if fn is not None:
+                try:
+                    fn()
+                except Exception:
+                    pass
+                return
+
     def _get_sync(self, path) -> Optional["MemoryObj"]:
         """Load one object, or return None if it is absent OR incomplete.
 
-        A writer killed mid-store leaves a short file behind, and `exists()` is
-        only an open() so a torn object still looks present. Every read is
-        therefore length-checked and any shortfall is reported as a plain miss:
-        raising here would surface as a failed request, since vLLM's default
+        Every length is checked and any shortfall is reported as a plain miss.
+        A writer killed mid-store leaves a short file behind and `exists()` is
+        only an open(), so a torn object still looks present; raising here would
+        surface as a failed request, because vLLM's default
         ``kv_load_failure_policy`` is ``fail`` rather than recompute.
+
+        The checks are the same ones the main branch performs, but they cost
+        nothing here because the payload is never materialised: the destination
+        is the MemoryObj buffer and ``read_obj_into`` returns the byte count, so
+        a truncated payload is detected from the return value. Measured
+        (tests/bench_readpath_merge.py, 32 x 28 MiB):
+
+            arm                          1 thread   16 threads
+            main-style (4 opens, 2 copies)   2.78        2.61
+            zero-copy, no checks           14.37       33.55
+            zero-copy + these checks       12.31       32.75
+
+        main's path does not scale at all -- the two full Python-level copies
+        hold the GIL, so 16 threads serialise. Keeping its safety costs 2%.
         """
-        if not self._dfs.exists(path):
-            return None
-
-        prefix = self._dfs.read(path, 0, serde.prefix_size())
-        if len(prefix) != serde.prefix_size():
-            return None                      # empty or mid-prefix
-        meta_len, payload_len = serde.parse_prefix(prefix)
-
-        meta_bytes = self._dfs.read(path, serde.prefix_size(), meta_len)
-        if len(meta_bytes) != meta_len:
-            return None                      # mid-metadata
+        dfs = self._dfs
+        # One open for prefix + metadata + payload (was 3 opens: exists + meta +
+        # payload). Missing key => open raises ENOENT, which we map to None.
         try:
-            metadata = RemoteMetadata.deserialize(meta_bytes)
-        except Exception:
-            return None                      # unparseable header
+            obj = dfs.open_rdonly(path)
+        except DaosError as e:
+            if getattr(e, "rc", None) == 2:  # ENOENT
+                return None
+            raise
+        try:
+            # One small read grabs the prefix AND the (tiny) metadata together
+            # -- KV RemoteMetadata is ~28 B, so prefix+meta almost always fit in
+            # _HDR_CAP, cutting the per-chunk round-trips from 3 reads to 2
+            # (header + payload). Only a pathologically large meta needs a
+            # second read.
+            ps = serde.prefix_size()
+            hdr = dfs.read_obj(obj, 0, ps + _HDR_CAP)
+            if len(hdr) < ps:
+                return None                      # empty or mid-prefix
+            meta_len, payload_len = serde.parse_prefix(hdr[:ps])
+            if meta_len <= len(hdr) - ps:
+                meta_bytes = hdr[ps:ps + meta_len]
+            else:
+                meta_bytes = dfs.read_obj(obj, ps, meta_len)
+            if len(meta_bytes) != meta_len:
+                return None                      # mid-metadata
+            try:
+                metadata = RemoteMetadata.deserialize(meta_bytes)
+            except Exception:
+                return None                      # unparseable header
+            if payload_len < metadata.length:
+                return None                      # header itself is inconsistent
 
-        # Read the payload before allocating, so a torn object never costs a
-        # MemoryObj that then has to be handed back to the allocator.
-        kv_bytes = self._dfs.read(
-            path, serde.prefix_size() + meta_len, payload_len)
-        if len(kv_bytes) != payload_len or payload_len < metadata.length:
-            return None                      # truncated payload
+            memory_obj = self.local_cpu_backend.allocate(
+                metadata.shapes, metadata.dtypes, metadata.fmt)
+            if memory_obj is None:
+                return None
 
-        memory_obj = self.local_cpu_backend.allocate(
-            metadata.shapes, metadata.dtypes, metadata.fmt)
-        if memory_obj is None:
-            return None
+            # Read the (large) payload straight into the target MemoryObj
+            # buffer: no intermediate bytes object, no second GIL-held memcpy.
+            # dfs_sys_read is a ctypes C call that releases the GIL, so with the
+            # thread-pool + per-thread handles the concurrent chunk reads truly
+            # overlap -- this is the retrieve-pipeline parallelization. (Over
+            # UCX the aliased buffer reads back correctly; the corruption seen
+            # earlier was the libfabric verbs;ofi_rxm bug, not this alias.)
+            view = memory_obj.byte_array
+            if not isinstance(view, memoryview):
+                view = memoryview(view)
+            view = view.cast("B")
+            n = metadata.length
+            off = serde.prefix_size() + meta_len
 
-        view = memory_obj.byte_array
-        if isinstance(view, memoryview):
-            if view.format == "<B":
-                view = view.cast("B")
-        else:
-            view = memoryview(view)
-        view[: metadata.length] = kv_bytes
-        return memory_obj
+            if self._READ_VIA_BYTEARRAY:
+                # Experiment: read into a private bytearray, then copy. Costs
+                # one full copy per chunk, which is exactly what the aliased
+                # path exists to avoid -- see _READ_VIA_BYTEARRAY.
+                tmp = bytearray(payload_len)
+                got = dfs.read_obj_into(
+                    obj, off, payload_len,
+                    (ctypes.c_char * payload_len).from_buffer(tmp))
+                if got != payload_len:
+                    self._release(memory_obj)
+                    return None
+                view[:n] = memoryview(tmp)[:n]
+                return memory_obj
+
+            dest = (ctypes.c_char * n).from_buffer(view[:n])
+            got = dfs.read_obj_into(obj, off, payload_len, dest)
+            if got != payload_len:
+                # Truncated payload: give the buffer back and report a miss.
+                self._release(memory_obj)
+                return None
+            return memory_obj
+        finally:
+            dfs.close_obj(obj)

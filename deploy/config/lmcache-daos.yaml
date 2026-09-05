@@ -1,0 +1,22 @@
+# Pool/container updated 2026-08-30. This pointed at kvpool2/kv2s16, which no
+# longer exists: that pool was destroyed when the cluster was reformatted for
+# the GPU-direct work (every daos_server restart wedges SPDK on this hardware,
+# and recovery requires a format, which destroys pools -- see
+# gpudirect/README.md). The container below is created with the properties the
+# measurements settled on; both matter and both have burned us before:
+#   daos cont create gdspool kvlmc --type POSIX \
+#       --file-oclass=RP_2G4 --dir-oclass=RP_2G4 --oclass=RP_2G4 \
+#       --chunk-size=4194304 --properties=rd_fac:1
+# chunk-size must be the decimal byte count: '4M' parses as 4,000,000.
+# Verify with `daos fs get-attr <pool> <cont> --dfs-path=/`, not get-prop --
+# the DFS file oclass and chunk size live in the superblock and do not appear
+# in the container property list.
+chunk_size: 256
+local_cpu: false
+remote_url: "plugin://daos/gdspool/kvlmc"
+remote_serde: "naive"
+remote_storage_plugins: ["daos"]
+extra_config:
+  remote_storage_plugin.daos.module_path: lmcache_daos.connector
+  remote_storage_plugin.daos.class_name: DaosConnector
+enable_async_loading: True

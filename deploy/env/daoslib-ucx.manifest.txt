@@ -1,0 +1,351 @@
+-rw-r--r--. 1 root root       20 Aug 23 20:01 /root/daoslib-ucx/daos.conf
+lrwxrwxrwx. 1 root root       15 Aug 23 20:00 /root/daoslib-ucx/libabt.so.1 -> libabt.so.1.1.0
+-rwxr-xr-x. 1 root root   224424 Aug 23 20:00 /root/daoslib-ucx/libabt.so.1.1.0
+lrwxrwxrwx. 1 root root       12 Aug 24 13:40 /root/daoslib-ucx/libcart.so -> libcart.so.4
+lrwxrwxrwx. 1 root root       16 Aug 23 20:01 /root/daoslib-ucx/libcart.so.4 -> libcart.so.4.9.0
+-rwxr-xr-x. 1 root root  1130960 Aug 23 20:01 /root/daoslib-ucx/libcart.so.4.9.0
+-rwxr-xr-x. 1 root root   127448 Aug 23 20:02 /root/daoslib-ucx/libdaos_cmd_hdlrs.so
+-rwxr-xr-x. 1 root root   658528 Aug 23 20:01 /root/daoslib-ucx/libdaos_common.so
+-rwxr-xr-x. 1 root root    76440 Aug 23 20:02 /root/daoslib-ucx/libdaos_self_test.so
+lrwxrwxrwx. 1 root root       12 Aug 24 13:40 /root/daoslib-ucx/libdaos.so -> libdaos.so.2
+lrwxrwxrwx. 1 root root       16 Aug 23 20:02 /root/daoslib-ucx/libdaos.so.2 -> libdaos.so.2.8.0
+-rwxr-xr-x. 1 root root  2127664 Aug 23 20:02 /root/daoslib-ucx/libdaos.so.2.8.0
+-rwxr-xr-x. 1 root root   471000 Aug 23 20:02 /root/daoslib-ucx/libdfs.so
+-rwxr-xr-x. 1 root root    26808 Aug 23 20:02 /root/daoslib-ucx/libdfuse.so
+-rwxr-xr-x. 1 root root    72104 Aug 23 20:02 /root/daoslib-ucx/libds3.so
+-rwxr-xr-x. 1 root root    68080 Aug 23 20:02 /root/daoslib-ucx/libduns.so
+-rwxr-xr-x. 1 root root    46200 Aug 24 17:48 /root/daoslib-ucx/libefa.so.1
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/libfabric.so.1 -> libfabric.so.1.25.0
+-rwxr-xr-x. 1 root root  3616896 Aug 24 17:48 /root/daoslib-ucx/libfabric.so.1.25.0
+lrwxrwxrwx. 1 root root       12 Aug 24 13:40 /root/daoslib-ucx/libgurt.so -> libgurt.so.4
+lrwxrwxrwx. 1 root root       16 Aug 23 20:01 /root/daoslib-ucx/libgurt.so.4 -> libgurt.so.4.9.0
+-rwxr-xr-x. 1 root root   304544 Aug 23 20:01 /root/daoslib-ucx/libgurt.so.4.9.0
+-rwxr-xr-x. 1 root root   167312 Aug 23 20:02 /root/daoslib-ucx/libioil.so
+lrwxrwxrwx. 1 root root       24 Aug 23 20:01 /root/daoslib-ucx/libisal_crypto.so.2 -> libisal_crypto.so.2.0.26
+-rwxr-xr-x. 1 root root  3462768 Aug 23 20:01 /root/daoslib-ucx/libisal_crypto.so.2.0.26
+lrwxrwxrwx. 1 root root       17 Aug 23 20:00 /root/daoslib-ucx/libisal.so.2 -> libisal.so.2.0.31
+-rwxr-xr-x. 1 root root   352760 Aug 23 20:00 /root/daoslib-ucx/libisal.so.2.0.31
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/libmercury.so.2 -> libmercury.so.2.4.1
+-rwxr-xr-x. 1 root root   201064 Aug 23 20:01 /root/daoslib-ucx/libmercury.so.2.4.1
+lrwxrwxrwx. 1 root root       24 Aug 23 20:01 /root/daoslib-ucx/libmercury_util.so.4 -> libmercury_util.so.4.1.0
+-rwxr-xr-x. 1 root root    48136 Aug 23 20:01 /root/daoslib-ucx/libmercury_util.so.4.1.0
+-rwxr-xr-x. 1 root root   133880 Aug 23 20:01 /root/daoslib-ucx/libna_plugin_ofi.so
+lrwxrwxrwx. 1 root root       14 Aug 23 20:01 /root/daoslib-ucx/libna.so.6 -> libna.so.6.0.0
+-rwxr-xr-x. 1 root root   118672 Aug 23 20:01 /root/daoslib-ucx/libna.so.6.0.0
+-rwxr-xr-x. 1 root root   286512 Aug 23 20:02 /root/daoslib-ucx/libpil4dfs.so
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/libpmemobj.so.1 -> libpmemobj.so.1.0.0
+-rwxr-xr-x. 1 root root   311864 Aug 23 20:01 /root/daoslib-ucx/libpmemobj.so.1.0.0
+lrwxrwxrwx. 1 root root       16 Aug 23 20:01 /root/daoslib-ucx/libpmem.so.1 -> libpmem.so.1.0.0
+-rwxr-xr-x. 1 root root   364360 Aug 23 20:01 /root/daoslib-ucx/libpmem.so.1.0.0
+-rwxr-xr-x. 1 root root    36784 Aug 24 13:47 /root/daoslib-ucx/libprotobuf-c.so.1
+-rwxr-xr-x. 1 root root   447640 Aug 24 10:16 /root/daoslib-ucx/libpsm2.so.2
+lrwxrwxrwx. 1 root root       23 Aug 23 20:01 /root/daoslib-ucx/librte_argparse.so.26 -> librte_argparse.so.26.0
+-rwxr-xr-x. 1 root root    24624 Aug 23 20:01 /root/daoslib-ucx/librte_argparse.so.26.0
+lrwxrwxrwx. 1 root root       22 Aug 23 20:01 /root/daoslib-ucx/librte_cmdline.so.26 -> librte_cmdline.so.26.0
+-rwxr-xr-x. 1 root root    46944 Aug 23 20:01 /root/daoslib-ucx/librte_cmdline.so.26.0
+lrwxrwxrwx. 1 root root       18 Aug 23 20:01 /root/daoslib-ucx/librte_eal.so.26 -> librte_eal.so.26.0
+-rwxr-xr-x. 1 root root   422952 Aug 23 20:01 /root/daoslib-ucx/librte_eal.so.26.0
+lrwxrwxrwx. 1 root root       21 Aug 23 20:01 /root/daoslib-ucx/librte_ethdev.so.26 -> librte_ethdev.so.26.0
+-rwxr-xr-x. 1 root root   427376 Aug 23 20:01 /root/daoslib-ucx/librte_ethdev.so.26.0
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/librte_hash.so.26 -> librte_hash.so.26.0
+-rwxr-xr-x. 1 root root   136920 Aug 23 20:01 /root/daoslib-ucx/librte_hash.so.26.0
+lrwxrwxrwx. 1 root root       21 Aug 23 20:01 /root/daoslib-ucx/librte_kvargs.so.26 -> librte_kvargs.so.26.0
+-rwxr-xr-x. 1 root root    16104 Aug 23 20:01 /root/daoslib-ucx/librte_kvargs.so.26.0
+lrwxrwxrwx. 1 root root       18 Aug 23 20:01 /root/daoslib-ucx/librte_log.so.26 -> librte_log.so.26.0
+-rwxr-xr-x. 1 root root    29008 Aug 23 20:01 /root/daoslib-ucx/librte_log.so.26.0
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/librte_mbuf.so.26 -> librte_mbuf.so.26.0
+-rwxr-xr-x. 1 root root    50888 Aug 23 20:01 /root/daoslib-ucx/librte_mbuf.so.26.0
+lrwxrwxrwx. 1 root root       22 Aug 23 20:01 /root/daoslib-ucx/librte_mempool.so.26 -> librte_mempool.so.26.0
+-rwxr-xr-x. 1 root root    51456 Aug 23 20:01 /root/daoslib-ucx/librte_mempool.so.26.0
+lrwxrwxrwx. 1 root root       20 Aug 23 20:01 /root/daoslib-ucx/librte_meter.so.26 -> librte_meter.so.26.0
+-rwxr-xr-x. 1 root root    16160 Aug 23 20:01 /root/daoslib-ucx/librte_meter.so.26.0
+lrwxrwxrwx. 1 root root       18 Aug 23 20:01 /root/daoslib-ucx/librte_net.so.26 -> librte_net.so.26.0
+-rwxr-xr-x. 1 root root    36712 Aug 23 20:01 /root/daoslib-ucx/librte_net.so.26.0
+lrwxrwxrwx. 1 root root       18 Aug 23 20:01 /root/daoslib-ucx/librte_pci.so.26 -> librte_pci.so.26.0
+-rwxr-xr-x. 1 root root    16032 Aug 23 20:01 /root/daoslib-ucx/librte_pci.so.26.0
+lrwxrwxrwx. 1 root root       20 Aug 23 20:01 /root/daoslib-ucx/librte_power.so.26 -> librte_power.so.26.0
+-rwxr-xr-x. 1 root root    39104 Aug 23 20:01 /root/daoslib-ucx/librte_power.so.26.0
+lrwxrwxrwx. 1 root root       18 Aug 23 20:01 /root/daoslib-ucx/librte_rcu.so.26 -> librte_rcu.so.26.0
+-rwxr-xr-x. 1 root root    24416 Aug 23 20:01 /root/daoslib-ucx/librte_rcu.so.26.0
+lrwxrwxrwx. 1 root root       19 Aug 23 20:01 /root/daoslib-ucx/librte_ring.so.26 -> librte_ring.so.26.0
+-rwxr-xr-x. 1 root root    86904 Aug 23 20:01 /root/daoslib-ucx/librte_ring.so.26.0
+lrwxrwxrwx. 1 root root       20 Aug 23 20:01 /root/daoslib-ucx/librte_stack.so.26 -> librte_stack.so.26.0
+-rwxr-xr-x. 1 root root    16688 Aug 23 20:01 /root/daoslib-ucx/librte_stack.so.26.0
+lrwxrwxrwx. 1 root root       24 Aug 23 20:01 /root/daoslib-ucx/librte_telemetry.so.26 -> librte_telemetry.so.26.0
+-rwxr-xr-x. 1 root root    41720 Aug 23 20:01 /root/daoslib-ucx/librte_telemetry.so.26.0
+lrwxrwxrwx. 1 root root       20 Aug 23 20:01 /root/daoslib-ucx/librte_timer.so.26 -> librte_timer.so.26.0
+-rwxr-xr-x. 1 root root    24584 Aug 23 20:01 /root/daoslib-ucx/librte_timer.so.26.0
+-rwxr-xr-x. 1 root root    20576 Aug 23 20:01 /root/daoslib-ucx/libspdk_accel_ae4dma.so.1.0
+-rwxr-xr-x. 1 root root    20592 Aug 23 20:01 /root/daoslib-ucx/libspdk_accel_error.so.3.0
+-rwxr-xr-x. 1 root root    20608 Aug 23 20:01 /root/daoslib-ucx/libspdk_accel_ioat.so.7.0
+-rwxr-xr-x. 1 root root    80736 Aug 23 20:01 /root/daoslib-ucx/libspdk_accel.so.17.0
+-rwxr-xr-x. 1 root root    15872 Aug 23 20:01 /root/daoslib-ucx/libspdk_ae4dma.so.1.0
+-rwxr-xr-x. 1 root root    34760 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_aio.so.7.0
+-rwxr-xr-x. 1 root root    34872 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_delay.so.7.0
+-rwxr-xr-x. 1 root root    25528 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_error.so.7.0
+-rwxr-xr-x. 1 root root    29976 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_ftl.so.7.0
+-rwxr-xr-x. 1 root root    25264 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_gpt.so.7.0
+-rwxr-xr-x. 1 root root    74008 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_lvol.so.7.0
+-rwxr-xr-x. 1 root root    30512 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_malloc.so.7.0
+-rwxr-xr-x. 1 root root    25504 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_null.so.7.0
+-rwxr-xr-x. 1 root root   231592 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_nvme.so.8.0
+-rwxr-xr-x. 1 root root    30264 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_passthru.so.7.0
+-rwxr-xr-x. 1 root root    90360 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_raid.so.7.0
+-rwxr-xr-x. 1 root root   193352 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev.so.19.0
+-rwxr-xr-x. 1 root root    25520 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_split.so.7.0
+-rwxr-xr-x. 1 root root    47440 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_virtio.so.7.0
+-rwxr-xr-x. 1 root root    29960 Aug 23 20:01 /root/daoslib-ucx/libspdk_bdev_zone_block.so.7.0
+-rwxr-xr-x. 1 root root    16392 Aug 23 20:01 /root/daoslib-ucx/libspdk_blob_bdev.so.13.0
+-rwxr-xr-x. 1 root root   129048 Aug 23 20:01 /root/daoslib-ucx/libspdk_blob.so.13.1
+-rwxr-xr-x. 1 root root    16344 Aug 23 20:01 /root/daoslib-ucx/libspdk_conf.so.7.0
+-rwxr-xr-x. 1 root root    15752 Aug 23 20:01 /root/daoslib-ucx/libspdk_dma.so.6.0
+-rwxr-xr-x. 1 root root     7240 Aug 23 20:01 /root/daoslib-ucx/libspdk_env_dpdk_rpc.so.7.0
+-rwxr-xr-x. 1 root root    99056 Aug 23 20:01 /root/daoslib-ucx/libspdk_env_dpdk.so.16.1
+-rwxr-xr-x. 1 root root    11032 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_accel.so.7.0
+-rwxr-xr-x. 1 root root    11144 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_bdev.so.7.0
+-rwxr-xr-x. 1 root root    10960 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_fsdev.so.2.0
+-rwxr-xr-x. 1 root root    16232 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_iobuf.so.4.0
+-rwxr-xr-x. 1 root root    11072 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_iscsi.so.7.0
+-rwxr-xr-x. 1 root root    11080 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_keyring.so.2.0
+-rwxr-xr-x. 1 root root    11016 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_nbd.so.7.0
+-rwxr-xr-x. 1 root root    39760 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_nvmf.so.7.0
+-rwxr-xr-x. 1 root root    15544 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_scheduler.so.5.0
+-rwxr-xr-x. 1 root root    10968 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_scsi.so.7.0
+-rwxr-xr-x. 1 root root    93920 Aug 23 20:01 /root/daoslib-ucx/libspdk_event.so.15.1
+-rwxr-xr-x. 1 root root    15512 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_sock.so.6.0
+-rwxr-xr-x. 1 root root    16384 Aug 23 20:01 /root/daoslib-ucx/libspdk_event_vmd.so.7.0
+-rwxr-xr-x. 1 root root    51320 Aug 23 20:01 /root/daoslib-ucx/libspdk_fsdev_aio.so.2.0
+-rwxr-xr-x. 1 root root    42072 Aug 23 20:01 /root/daoslib-ucx/libspdk_fsdev.so.3.0
+-rwxr-xr-x. 1 root root   209704 Aug 23 20:01 /root/daoslib-ucx/libspdk_ftl.so.10.0
+-rwxr-xr-x. 1 root root    67256 Aug 23 20:01 /root/daoslib-ucx/libspdk_fuse_dispatcher.so.2.0
+-rwxr-xr-x. 1 root root    35320 Aug 23 20:01 /root/daoslib-ucx/libspdk_init.so.7.0
+-rwxr-xr-x. 1 root root    20200 Aug 23 20:01 /root/daoslib-ucx/libspdk_ioat.so.8.0
+-rwxr-xr-x. 1 root root   174928 Aug 23 20:01 /root/daoslib-ucx/libspdk_iscsi.so.9.0
+-rwxr-xr-x. 1 root root    32832 Aug 23 20:01 /root/daoslib-ucx/libspdk_jsonrpc.so.7.0
+-rwxr-xr-x. 1 root root    42072 Aug 23 20:01 /root/daoslib-ucx/libspdk_json.so.7.0
+-rwxr-xr-x. 1 root root    20432 Aug 23 20:01 /root/daoslib-ucx/libspdk_keyring_file.so.3.0
+-rwxr-xr-x. 1 root root    16008 Aug 23 20:01 /root/daoslib-ucx/libspdk_keyring_linux.so.2.0
+-rwxr-xr-x. 1 root root    20872 Aug 23 20:01 /root/daoslib-ucx/libspdk_keyring.so.3.0
+-rwxr-xr-x. 1 root root    24032 Aug 23 20:01 /root/daoslib-ucx/libspdk_log.so.8.0
+-rwxr-xr-x. 1 root root    53768 Aug 23 20:01 /root/daoslib-ucx/libspdk_lvol.so.12.0
+-rwxr-xr-x. 1 root root    34528 Aug 23 20:01 /root/daoslib-ucx/libspdk_nbd.so.8.0
+-rwxr-xr-x. 1 root root    16312 Aug 23 20:01 /root/daoslib-ucx/libspdk_notify.so.7.0
+-rwxr-xr-x. 1 root root   466264 Aug 23 20:01 /root/daoslib-ucx/libspdk_nvme.so.17.0
+-rwxr-xr-x. 1 root root   288872 Aug 23 20:01 /root/daoslib-ucx/libspdk_nvmf.so.22.0
+-rwxr-xr-x. 1 root root    21144 Aug 23 20:01 /root/daoslib-ucx/libspdk_rpc.so.8.0
+-rwxr-xr-x. 1 root root    16072 Aug 23 20:01 /root/daoslib-ucx/libspdk_scheduler_dpdk_governor.so.5.0
+-rwxr-xr-x. 1 root root    15776 Aug 23 20:01 /root/daoslib-ucx/libspdk_scheduler_dynamic.so.5.0
+-rwxr-xr-x. 1 root root    15384 Aug 23 20:01 /root/daoslib-ucx/libspdk_scheduler_gscheduler.so.5.0
+-rwxr-xr-x. 1 root root    63000 Aug 23 20:01 /root/daoslib-ucx/libspdk_scsi.so.10.0
+-rw-r--r--. 1 root root     1443 Aug 23 20:01 /root/daoslib-ucx/libspdk.so.7.0
+-rwxr-xr-x. 1 root root    47768 Aug 23 20:01 /root/daoslib-ucx/libspdk_sock_posix.so.7.0
+-rwxr-xr-x. 1 root root    38048 Aug 23 20:01 /root/daoslib-ucx/libspdk_sock.so.13.0
+-rwxr-xr-x. 1 root root    76800 Aug 23 20:01 /root/daoslib-ucx/libspdk_thread.so.12.0
+-rwxr-xr-x. 1 root root    24608 Aug 23 20:01 /root/daoslib-ucx/libspdk_trace_parser.so.7.0
+-rwxr-xr-x. 1 root root    37568 Aug 23 20:01 /root/daoslib-ucx/libspdk_trace.so.12.0
+-rwxr-xr-x. 1 root root    90128 Aug 23 20:01 /root/daoslib-ucx/libspdk_util.so.11.0
+-rwxr-xr-x. 1 root root    15144 Aug 23 20:01 /root/daoslib-ucx/libspdk_ut_mock.so.7.0
+-rwxr-xr-x. 1 root root    20152 Aug 23 20:01 /root/daoslib-ucx/libspdk_vfio_user.so.6.0
+-rwxr-xr-x. 1 root root    53800 Aug 23 20:01 /root/daoslib-ucx/libspdk_virtio.so.8.0
+-rwxr-xr-x. 1 root root    28560 Aug 23 20:01 /root/daoslib-ucx/libspdk_vmd.so.7.0
+-rwxr-xr-x. 3 root root   624080 Aug 23 19:50 /root/daoslib-ucx/libucm.so
+-rwxr-xr-x. 3 root root   624080 Aug 23 19:50 /root/daoslib-ucx/libucm.so.0
+-rwxr-xr-x. 3 root root   624080 Aug 23 19:50 /root/daoslib-ucx/libucm.so.0.0.0
+-rwxr-xr-x. 3 root root 10695040 Aug 23 19:50 /root/daoslib-ucx/libucp.so
+-rwxr-xr-x. 3 root root 10695040 Aug 23 19:50 /root/daoslib-ucx/libucp.so.0
+-rwxr-xr-x. 3 root root 10695040 Aug 23 19:50 /root/daoslib-ucx/libucp.so.0.0.0
+-rwxr-xr-x. 3 root root    17832 Aug 23 19:50 /root/daoslib-ucx/libucs_signal.so
+-rwxr-xr-x. 3 root root    17832 Aug 23 19:50 /root/daoslib-ucx/libucs_signal.so.0
+-rwxr-xr-x. 3 root root    17832 Aug 23 19:50 /root/daoslib-ucx/libucs_signal.so.0.0.0
+-rwxr-xr-x. 3 root root  2353816 Aug 23 19:50 /root/daoslib-ucx/libucs.so
+-rwxr-xr-x. 3 root root  2353816 Aug 23 19:50 /root/daoslib-ucx/libucs.so.0
+-rwxr-xr-x. 3 root root  2353816 Aug 23 19:50 /root/daoslib-ucx/libucs.so.0.0.0
+-rwxr-xr-x. 3 root root  1594432 Aug 23 19:50 /root/daoslib-ucx/libuct.so
+-rwxr-xr-x. 3 root root  1594432 Aug 23 19:50 /root/daoslib-ucx/libuct.so.0
+-rwxr-xr-x. 3 root root  1594432 Aug 23 19:50 /root/daoslib-ucx/libuct.so.0.0.0
+-rwxr-xr-x. 1 root root   131848 Aug 24 13:47 /root/daoslib-ucx/libyaml-0.so.2
+-rwxr-xr-x. 1 root root    68856 Aug 23 20:02 /root/daoslib-ucx/pydaos_shim.so
+-rwxr-xr-x. 1 root root    65224 Aug 23 20:02 /root/daoslib-ucx/torch_shim.so
+-rwxr-xr-x. 1 root root   418872 Aug 25 10:02 /root/daoslib-ucx/ucx_info
+
+/root/daoslib-ucx:
+total 65488
+drwxr-xr-x.  3 root root     8192 Aug 25 10:51 .
+dr-xr-x---. 17 root root     4096 Aug 25 21:46 ..
+-rw-r--r--.  1 root root       20 Aug 23 20:01 daos.conf
+lrwxrwxrwx.  1 root root       15 Aug 23 20:00 libabt.so.1 -> libabt.so.1.1.0
+-rwxr-xr-x.  1 root root   224424 Aug 23 20:00 libabt.so.1.1.0
+lrwxrwxrwx.  1 root root       12 Aug 24 13:40 libcart.so -> libcart.so.4
+lrwxrwxrwx.  1 root root       16 Aug 23 20:01 libcart.so.4 -> libcart.so.4.9.0
+-rwxr-xr-x.  1 root root  1130960 Aug 23 20:01 libcart.so.4.9.0
+-rwxr-xr-x.  1 root root   127448 Aug 23 20:02 libdaos_cmd_hdlrs.so
+-rwxr-xr-x.  1 root root   658528 Aug 23 20:01 libdaos_common.so
+-rwxr-xr-x.  1 root root    76440 Aug 23 20:02 libdaos_self_test.so
+lrwxrwxrwx.  1 root root       12 Aug 24 13:40 libdaos.so -> libdaos.so.2
+lrwxrwxrwx.  1 root root       16 Aug 23 20:02 libdaos.so.2 -> libdaos.so.2.8.0
+-rwxr-xr-x.  1 root root  2127664 Aug 23 20:02 libdaos.so.2.8.0
+-rwxr-xr-x.  1 root root   471000 Aug 23 20:02 libdfs.so
+-rwxr-xr-x.  1 root root    26808 Aug 23 20:02 libdfuse.so
+-rwxr-xr-x.  1 root root    72104 Aug 23 20:02 libds3.so
+-rwxr-xr-x.  1 root root    68080 Aug 23 20:02 libduns.so
+-rwxr-xr-x.  1 root root    46200 Aug 24 17:48 libefa.so.1
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 libfabric.so.1 -> libfabric.so.1.25.0
+-rwxr-xr-x.  1 root root  3616896 Aug 24 17:48 libfabric.so.1.25.0
+lrwxrwxrwx.  1 root root       12 Aug 24 13:40 libgurt.so -> libgurt.so.4
+lrwxrwxrwx.  1 root root       16 Aug 23 20:01 libgurt.so.4 -> libgurt.so.4.9.0
+-rwxr-xr-x.  1 root root   304544 Aug 23 20:01 libgurt.so.4.9.0
+-rwxr-xr-x.  1 root root   167312 Aug 23 20:02 libioil.so
+lrwxrwxrwx.  1 root root       24 Aug 23 20:01 libisal_crypto.so.2 -> libisal_crypto.so.2.0.26
+-rwxr-xr-x.  1 root root  3462768 Aug 23 20:01 libisal_crypto.so.2.0.26
+lrwxrwxrwx.  1 root root       17 Aug 23 20:00 libisal.so.2 -> libisal.so.2.0.31
+-rwxr-xr-x.  1 root root   352760 Aug 23 20:00 libisal.so.2.0.31
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 libmercury.so.2 -> libmercury.so.2.4.1
+-rwxr-xr-x.  1 root root   201064 Aug 23 20:01 libmercury.so.2.4.1
+lrwxrwxrwx.  1 root root       24 Aug 23 20:01 libmercury_util.so.4 -> libmercury_util.so.4.1.0
+-rwxr-xr-x.  1 root root    48136 Aug 23 20:01 libmercury_util.so.4.1.0
+-rwxr-xr-x.  1 root root   133880 Aug 23 20:01 libna_plugin_ofi.so
+lrwxrwxrwx.  1 root root       14 Aug 23 20:01 libna.so.6 -> libna.so.6.0.0
+-rwxr-xr-x.  1 root root   118672 Aug 23 20:01 libna.so.6.0.0
+-rwxr-xr-x.  1 root root   286512 Aug 23 20:02 libpil4dfs.so
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 libpmemobj.so.1 -> libpmemobj.so.1.0.0
+-rwxr-xr-x.  1 root root   311864 Aug 23 20:01 libpmemobj.so.1.0.0
+lrwxrwxrwx.  1 root root       16 Aug 23 20:01 libpmem.so.1 -> libpmem.so.1.0.0
+-rwxr-xr-x.  1 root root   364360 Aug 23 20:01 libpmem.so.1.0.0
+-rwxr-xr-x.  1 root root    36784 Aug 24 13:47 libprotobuf-c.so.1
+-rwxr-xr-x.  1 root root   447640 Aug 24 10:16 libpsm2.so.2
+lrwxrwxrwx.  1 root root       23 Aug 23 20:01 librte_argparse.so.26 -> librte_argparse.so.26.0
+-rwxr-xr-x.  1 root root    24624 Aug 23 20:01 librte_argparse.so.26.0
+lrwxrwxrwx.  1 root root       22 Aug 23 20:01 librte_cmdline.so.26 -> librte_cmdline.so.26.0
+-rwxr-xr-x.  1 root root    46944 Aug 23 20:01 librte_cmdline.so.26.0
+lrwxrwxrwx.  1 root root       18 Aug 23 20:01 librte_eal.so.26 -> librte_eal.so.26.0
+-rwxr-xr-x.  1 root root   422952 Aug 23 20:01 librte_eal.so.26.0
+lrwxrwxrwx.  1 root root       21 Aug 23 20:01 librte_ethdev.so.26 -> librte_ethdev.so.26.0
+-rwxr-xr-x.  1 root root   427376 Aug 23 20:01 librte_ethdev.so.26.0
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 librte_hash.so.26 -> librte_hash.so.26.0
+-rwxr-xr-x.  1 root root   136920 Aug 23 20:01 librte_hash.so.26.0
+lrwxrwxrwx.  1 root root       21 Aug 23 20:01 librte_kvargs.so.26 -> librte_kvargs.so.26.0
+-rwxr-xr-x.  1 root root    16104 Aug 23 20:01 librte_kvargs.so.26.0
+lrwxrwxrwx.  1 root root       18 Aug 23 20:01 librte_log.so.26 -> librte_log.so.26.0
+-rwxr-xr-x.  1 root root    29008 Aug 23 20:01 librte_log.so.26.0
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 librte_mbuf.so.26 -> librte_mbuf.so.26.0
+-rwxr-xr-x.  1 root root    50888 Aug 23 20:01 librte_mbuf.so.26.0
+lrwxrwxrwx.  1 root root       22 Aug 23 20:01 librte_mempool.so.26 -> librte_mempool.so.26.0
+-rwxr-xr-x.  1 root root    51456 Aug 23 20:01 librte_mempool.so.26.0
+lrwxrwxrwx.  1 root root       20 Aug 23 20:01 librte_meter.so.26 -> librte_meter.so.26.0
+-rwxr-xr-x.  1 root root    16160 Aug 23 20:01 librte_meter.so.26.0
+lrwxrwxrwx.  1 root root       18 Aug 23 20:01 librte_net.so.26 -> librte_net.so.26.0
+-rwxr-xr-x.  1 root root    36712 Aug 23 20:01 librte_net.so.26.0
+lrwxrwxrwx.  1 root root       18 Aug 23 20:01 librte_pci.so.26 -> librte_pci.so.26.0
+-rwxr-xr-x.  1 root root    16032 Aug 23 20:01 librte_pci.so.26.0
+lrwxrwxrwx.  1 root root       20 Aug 23 20:01 librte_power.so.26 -> librte_power.so.26.0
+-rwxr-xr-x.  1 root root    39104 Aug 23 20:01 librte_power.so.26.0
+lrwxrwxrwx.  1 root root       18 Aug 23 20:01 librte_rcu.so.26 -> librte_rcu.so.26.0
+-rwxr-xr-x.  1 root root    24416 Aug 23 20:01 librte_rcu.so.26.0
+lrwxrwxrwx.  1 root root       19 Aug 23 20:01 librte_ring.so.26 -> librte_ring.so.26.0
+-rwxr-xr-x.  1 root root    86904 Aug 23 20:01 librte_ring.so.26.0
+lrwxrwxrwx.  1 root root       20 Aug 23 20:01 librte_stack.so.26 -> librte_stack.so.26.0
+-rwxr-xr-x.  1 root root    16688 Aug 23 20:01 librte_stack.so.26.0
+lrwxrwxrwx.  1 root root       24 Aug 23 20:01 librte_telemetry.so.26 -> librte_telemetry.so.26.0
+-rwxr-xr-x.  1 root root    41720 Aug 23 20:01 librte_telemetry.so.26.0
+lrwxrwxrwx.  1 root root       20 Aug 23 20:01 librte_timer.so.26 -> librte_timer.so.26.0
+-rwxr-xr-x.  1 root root    24584 Aug 23 20:01 librte_timer.so.26.0
+-rwxr-xr-x.  1 root root    20576 Aug 23 20:01 libspdk_accel_ae4dma.so.1.0
+-rwxr-xr-x.  1 root root    20592 Aug 23 20:01 libspdk_accel_error.so.3.0
+-rwxr-xr-x.  1 root root    20608 Aug 23 20:01 libspdk_accel_ioat.so.7.0
+-rwxr-xr-x.  1 root root    80736 Aug 23 20:01 libspdk_accel.so.17.0
+-rwxr-xr-x.  1 root root    15872 Aug 23 20:01 libspdk_ae4dma.so.1.0
+-rwxr-xr-x.  1 root root    34760 Aug 23 20:01 libspdk_bdev_aio.so.7.0
+-rwxr-xr-x.  1 root root    34872 Aug 23 20:01 libspdk_bdev_delay.so.7.0
+-rwxr-xr-x.  1 root root    25528 Aug 23 20:01 libspdk_bdev_error.so.7.0
+-rwxr-xr-x.  1 root root    29976 Aug 23 20:01 libspdk_bdev_ftl.so.7.0
+-rwxr-xr-x.  1 root root    25264 Aug 23 20:01 libspdk_bdev_gpt.so.7.0
+-rwxr-xr-x.  1 root root    74008 Aug 23 20:01 libspdk_bdev_lvol.so.7.0
+-rwxr-xr-x.  1 root root    30512 Aug 23 20:01 libspdk_bdev_malloc.so.7.0
+-rwxr-xr-x.  1 root root    25504 Aug 23 20:01 libspdk_bdev_null.so.7.0
+-rwxr-xr-x.  1 root root   231592 Aug 23 20:01 libspdk_bdev_nvme.so.8.0
+-rwxr-xr-x.  1 root root    30264 Aug 23 20:01 libspdk_bdev_passthru.so.7.0
+-rwxr-xr-x.  1 root root    90360 Aug 23 20:01 libspdk_bdev_raid.so.7.0
+-rwxr-xr-x.  1 root root   193352 Aug 23 20:01 libspdk_bdev.so.19.0
+-rwxr-xr-x.  1 root root    25520 Aug 23 20:01 libspdk_bdev_split.so.7.0
+-rwxr-xr-x.  1 root root    47440 Aug 23 20:01 libspdk_bdev_virtio.so.7.0
+-rwxr-xr-x.  1 root root    29960 Aug 23 20:01 libspdk_bdev_zone_block.so.7.0
+-rwxr-xr-x.  1 root root    16392 Aug 23 20:01 libspdk_blob_bdev.so.13.0
+-rwxr-xr-x.  1 root root   129048 Aug 23 20:01 libspdk_blob.so.13.1
+-rwxr-xr-x.  1 root root    16344 Aug 23 20:01 libspdk_conf.so.7.0
+-rwxr-xr-x.  1 root root    15752 Aug 23 20:01 libspdk_dma.so.6.0
+-rwxr-xr-x.  1 root root     7240 Aug 23 20:01 libspdk_env_dpdk_rpc.so.7.0
+-rwxr-xr-x.  1 root root    99056 Aug 23 20:01 libspdk_env_dpdk.so.16.1
+-rwxr-xr-x.  1 root root    11032 Aug 23 20:01 libspdk_event_accel.so.7.0
+-rwxr-xr-x.  1 root root    11144 Aug 23 20:01 libspdk_event_bdev.so.7.0
+-rwxr-xr-x.  1 root root    10960 Aug 23 20:01 libspdk_event_fsdev.so.2.0
+-rwxr-xr-x.  1 root root    16232 Aug 23 20:01 libspdk_event_iobuf.so.4.0
+-rwxr-xr-x.  1 root root    11072 Aug 23 20:01 libspdk_event_iscsi.so.7.0
+-rwxr-xr-x.  1 root root    11080 Aug 23 20:01 libspdk_event_keyring.so.2.0
+-rwxr-xr-x.  1 root root    11016 Aug 23 20:01 libspdk_event_nbd.so.7.0
+-rwxr-xr-x.  1 root root    39760 Aug 23 20:01 libspdk_event_nvmf.so.7.0
+-rwxr-xr-x.  1 root root    15544 Aug 23 20:01 libspdk_event_scheduler.so.5.0
+-rwxr-xr-x.  1 root root    10968 Aug 23 20:01 libspdk_event_scsi.so.7.0
+-rwxr-xr-x.  1 root root    93920 Aug 23 20:01 libspdk_event.so.15.1
+-rwxr-xr-x.  1 root root    15512 Aug 23 20:01 libspdk_event_sock.so.6.0
+-rwxr-xr-x.  1 root root    16384 Aug 23 20:01 libspdk_event_vmd.so.7.0
+-rwxr-xr-x.  1 root root    51320 Aug 23 20:01 libspdk_fsdev_aio.so.2.0
+-rwxr-xr-x.  1 root root    42072 Aug 23 20:01 libspdk_fsdev.so.3.0
+-rwxr-xr-x.  1 root root   209704 Aug 23 20:01 libspdk_ftl.so.10.0
+-rwxr-xr-x.  1 root root    67256 Aug 23 20:01 libspdk_fuse_dispatcher.so.2.0
+-rwxr-xr-x.  1 root root    35320 Aug 23 20:01 libspdk_init.so.7.0
+-rwxr-xr-x.  1 root root    20200 Aug 23 20:01 libspdk_ioat.so.8.0
+-rwxr-xr-x.  1 root root   174928 Aug 23 20:01 libspdk_iscsi.so.9.0
+-rwxr-xr-x.  1 root root    32832 Aug 23 20:01 libspdk_jsonrpc.so.7.0
+-rwxr-xr-x.  1 root root    42072 Aug 23 20:01 libspdk_json.so.7.0
+-rwxr-xr-x.  1 root root    20432 Aug 23 20:01 libspdk_keyring_file.so.3.0
+-rwxr-xr-x.  1 root root    16008 Aug 23 20:01 libspdk_keyring_linux.so.2.0
+-rwxr-xr-x.  1 root root    20872 Aug 23 20:01 libspdk_keyring.so.3.0
+-rwxr-xr-x.  1 root root    24032 Aug 23 20:01 libspdk_log.so.8.0
+-rwxr-xr-x.  1 root root    53768 Aug 23 20:01 libspdk_lvol.so.12.0
+-rwxr-xr-x.  1 root root    34528 Aug 23 20:01 libspdk_nbd.so.8.0
+-rwxr-xr-x.  1 root root    16312 Aug 23 20:01 libspdk_notify.so.7.0
+-rwxr-xr-x.  1 root root   466264 Aug 23 20:01 libspdk_nvme.so.17.0
+-rwxr-xr-x.  1 root root   288872 Aug 23 20:01 libspdk_nvmf.so.22.0
+-rwxr-xr-x.  1 root root    21144 Aug 23 20:01 libspdk_rpc.so.8.0
+-rwxr-xr-x.  1 root root    16072 Aug 23 20:01 libspdk_scheduler_dpdk_governor.so.5.0
+-rwxr-xr-x.  1 root root    15776 Aug 23 20:01 libspdk_scheduler_dynamic.so.5.0
+-rwxr-xr-x.  1 root root    15384 Aug 23 20:01 libspdk_scheduler_gscheduler.so.5.0
+-rwxr-xr-x.  1 root root    63000 Aug 23 20:01 libspdk_scsi.so.10.0
+-rw-r--r--.  1 root root     1443 Aug 23 20:01 libspdk.so.7.0
+-rwxr-xr-x.  1 root root    47768 Aug 23 20:01 libspdk_sock_posix.so.7.0
+-rwxr-xr-x.  1 root root    38048 Aug 23 20:01 libspdk_sock.so.13.0
+-rwxr-xr-x.  1 root root    76800 Aug 23 20:01 libspdk_thread.so.12.0
+-rwxr-xr-x.  1 root root    24608 Aug 23 20:01 libspdk_trace_parser.so.7.0
+-rwxr-xr-x.  1 root root    37568 Aug 23 20:01 libspdk_trace.so.12.0
+-rwxr-xr-x.  1 root root    90128 Aug 23 20:01 libspdk_util.so.11.0
+-rwxr-xr-x.  1 root root    15144 Aug 23 20:01 libspdk_ut_mock.so.7.0
+-rwxr-xr-x.  1 root root    20152 Aug 23 20:01 libspdk_vfio_user.so.6.0
+-rwxr-xr-x.  1 root root    53800 Aug 23 20:01 libspdk_virtio.so.8.0
+-rwxr-xr-x.  1 root root    28560 Aug 23 20:01 libspdk_vmd.so.7.0
+-rwxr-xr-x.  3 root root   624080 Aug 23 19:50 libucm.so
+-rwxr-xr-x.  3 root root   624080 Aug 23 19:50 libucm.so.0
+-rwxr-xr-x.  3 root root   624080 Aug 23 19:50 libucm.so.0.0.0
+-rwxr-xr-x.  3 root root 10695040 Aug 23 19:50 libucp.so
+-rwxr-xr-x.  3 root root 10695040 Aug 23 19:50 libucp.so.0
+-rwxr-xr-x.  3 root root 10695040 Aug 23 19:50 libucp.so.0.0.0
+-rwxr-xr-x.  3 root root    17832 Aug 23 19:50 libucs_signal.so
+-rwxr-xr-x.  3 root root    17832 Aug 23 19:50 libucs_signal.so.0
+-rwxr-xr-x.  3 root root    17832 Aug 23 19:50 libucs_signal.so.0.0.0
+-rwxr-xr-x.  3 root root  2353816 Aug 23 19:50 libucs.so
+-rwxr-xr-x.  3 root root  2353816 Aug 23 19:50 libucs.so.0
+-rwxr-xr-x.  3 root root  2353816 Aug 23 19:50 libucs.so.0.0.0
+-rwxr-xr-x.  3 root root  1594432 Aug 23 19:50 libuct.so
+-rwxr-xr-x.  3 root root  1594432 Aug 23 19:50 libuct.so.0
+-rwxr-xr-x.  3 root root  1594432 Aug 23 19:50 libuct.so.0.0.0
+-rwxr-xr-x.  1 root root   131848 Aug 24 13:47 libyaml-0.so.2
+drwxr-xr-x.  2 root root       60 Aug 25 09:59 mercury
+-rwxr-xr-x.  1 root root    68856 Aug 23 20:02 pydaos_shim.so
+-rwxr-xr-x.  1 root root    65224 Aug 23 20:02 torch_shim.so
+-rwxr-xr-x.  1 root root   418872 Aug 25 10:02 ucx_info
+
+/root/daoslib-ucx/mercury:
+total 464
+drwxr-xr-x. 2 root root     60 Aug 25 09:59 .
+drwxr-xr-x. 3 root root   8192 Aug 25 10:51 ..
+-rwxr-xr-x. 1 root root 133880 Aug 23 20:01 libna_plugin_ofi.so
+-rwxr-xr-x. 1 root root 326360 Aug 25 09:59 libna_plugin_ucx.so

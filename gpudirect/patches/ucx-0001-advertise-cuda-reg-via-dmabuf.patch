@@ -1,0 +1,52 @@
+Advertise CUDA registration on IB when dmabuf is available.
+
+SCOPE AND SAFETY -- this patch is DEFAULT ON (opt out with DAOS_IB_DMABUF_CUDA=0),
+unlike its companion mercury-0001, which is opt-in for a reason.
+
+It is measured harmless. The configuration that passed
+tests/test_rawio_integrity.py 80/80 (28 MiB, 16 threads) on client-6 had THIS
+patch active and mercury-0001's CUDA components disabled via
+NA_UCX_EXTRA_TLS=. So advertising CUDA registrability on the memory domain
+does not by itself disturb host-memory transfers; adding cuda_copy/cuda_ipc to
+the UCX TLS list does, and that is the other patch.
+
+Record the validated combination, because only this one has been tested:
+
+    ucx-0001      : enabled  (default)
+    mercury-0001  : disabled (NA_UCX_EXTRA_TLS unset or empty)
+    result        : raw DFS I/O byte-exact, 80/80
+
+Both patches exist only to make dfs_read_gpu()/dfs_write_gpu() work, and
+gpudirect/PLAN.md records the decision not to build the GPU-direct backend. If
+you enable the CUDA components, re-run test_rawio_integrity.py and require a
+clean pass first -- the failure mode is silent corruption, not an error.
+
+diff --git a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
+index 265d53e0a..a3a80a2e0 100644
+--- a/src/uct/ib/base/ib_md.c
++++ b/src/uct/ib/base/ib_md.c
+@@ -1248,6 +1248,24 @@ static void uct_ib_md_check_dmabuf(uct_ib_md_t *md)
+ 
+     ucs_debug("%s: dmabuf is supported", uct_ib_device_name(&md->dev));
+     md->cap_flags |= UCT_MD_FLAG_REG_DMABUF;
++
++    /* On platforms that have no legacy peer-memory driver (nvidia_peermem or
++     * nv_peer_mem), uct_ib_check_gpudirect_driver() leaves CUDA out of
++     * reg_mem_types because it only probes those sysfs paths. ucp_mem_map()
++     * with UCS_MEMORY_TYPE_CUDA then fails with -EIO even though the device
++     * can register GPU memory through a dma-buf FD -- which is the path
++     * ibv_reg_dmabuf_mr() takes, and which we verified works on this HCA.
++     * Advertise CUDA when dmabuf is available. Set DAOS_IB_DMABUF_CUDA=0 to
++     * restore the upstream behaviour. */
++    {
++        const char *dmabuf_cuda = getenv("DAOS_IB_DMABUF_CUDA");
++
++        if ((dmabuf_cuda == NULL) || strcmp(dmabuf_cuda, "0")) {
++            md->reg_mem_types |= UCS_BIT(UCS_MEMORY_TYPE_CUDA);
++            ucs_debug("%s: advertising cuda registration via dmabuf",
++                      uct_ib_device_name(&md->dev));
++        }
++    }
+ #endif
+ }
+ 

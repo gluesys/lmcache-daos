@@ -1,0 +1,17 @@
+diff --git a/site_scons/components/__init__.py b/site_scons/components/__init__.py
+index 7c21a537d..48faae573 100644
+--- a/site_scons/components/__init__.py
++++ b/site_scons/components/__init__.py
+@@ -167,8 +167,10 @@ def define_mercury(reqs):
+     ucx_configure = ['./configure', '--disable-assertions', '--disable-params-check', '--enable-mt',
+                      '--without-go', '--without-java', '--prefix=$UCX_PREFIX',
+                      '--libdir=$UCX_PREFIX/lib64', '--enable-cma',
+-                     '--with-cuda' if enable_gpu_direct else '--without-cuda',
+-                     '--with-gdrcopy' if enable_gpu_direct else '--without-gdrcopy',
++                     # UCX's configure does not search /usr/local/cuda when given a
++                     # bare --with-cuda, so pass explicit paths for GPU-direct builds.
++                     '--with-cuda=/usr/local/cuda' if enable_gpu_direct else '--without-cuda',
++                     '--with-gdrcopy=/usr/local' if enable_gpu_direct else '--without-gdrcopy',
+                      '--with-verbs', '--without-knem', '--without-rocm',
+                      '--without-xpmem', '--without-fuse3', '--without-ugni']
+ 

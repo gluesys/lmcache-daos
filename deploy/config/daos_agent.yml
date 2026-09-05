@@ -1,0 +1,10 @@
+name: daos_server
+access_points: ["10.100.230.81"]
+transport_config:
+  allow_insecure: true
+exclude_fabric_ifaces: ["ens4f1","eno1","eno2","eno3","docker0"]
+fabric_ifaces:
+- numa_node: 0
+  devices:
+  - iface: ens255np0
+    domain: mlx5_0:1
