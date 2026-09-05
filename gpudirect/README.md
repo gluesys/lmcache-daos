@@ -1366,6 +1366,62 @@ rd_fac:0, 요청 32 MiB, 8 GiB, client-5(H100 NVL, SNC). `NA_UCX_EXTRA_TLS=cuda_
 양 cell `override.conf` 를 `/opt/daos-gds` 로, provider 를 `ucx+rc_v` 로, client-5 agent domain 을
 `mlx5_0:1` 로 바꾸고 재포맷해야 한다(약 10 분; 절차는 이 세션의 `deploy/README.md` §9 전송 교체와 같다).
 
+## 2026-09-06 GDS over `ofi+verbs;ofi_rxm` — 동작하고, 스테이징에 근접한다
+
+UCX 경로의 16~20 GB/s 를 "GPU BAR write 의 QP 당 하드웨어 천장" 으로 읽었던 것은 **틀렸다.** 같은 GDS 빌드·같은
+드라이브·같은 클라이언트에서 전송만 libfabric verbs 로 바꾸면 GPU-direct 가 35 GB/s 까지 올라간다. 병목은 UCX 경로 안에 있었다.
+
+### 필요했던 것 세 가지 (UCX 쪽 mercury 패치는 불필요)
+1. **cart 에 메모리 디바이스 지원 켜기**: `D_MEM_DEVICE=1`(또는 `D_GPU_DIRECT=1`). 초안의 cart 는
+   `crt_mem_device_enabled()` 가 참일 때만 mercury 에 `request_mem_device` 를 넘기고, 그래야 na_ofi 가 도메인을 `FI_HMEM` 으로 연다.
+   없으면 `NA_Mem_register() failed (NA_OPNOTSUPPORTED)`.
+2. **libfabric 을 CUDA 지원으로 빌드**: 초안 빌드의 libfabric 1.25 는 `--with-cuda` 없이 빌드돼 `FI_HMEM_CUDA not supported`.
+   `CPPFLAGS=-I/usr/local/cuda/include LDFLAGS="-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs" ./configure … --with-cuda=/usr/local/cuda --enable-cuda-dlopen`
+   (기본 `--with-cuda=DIR` 만으로는 configure 가 `-lcudart` 를 못 찾는다). 런타임에 `libcudart.so`·`libcuda.so`(버전 없는 이름) 를 dlopen 하므로
+   LD 경로에 심볼릭 링크가 필요하다(`/opt/ofi-cuda/lib64/libcudart.so -> /usr/local/cuda/lib64/libcudart.so.13`).
+3. **libfabric verbs 패치** `patches/libfabric-0001-verbs-cuda-dmabuf-and-close-fd.patch`(2 헝크):
+   - `vrb_mr_reg_common()` 이 dmabuf 등록 경로를 ZE/ROCR/SYNAPSEAI 에만 쓰고 **CUDA 는 `ibv_reg_mr` 로 떨어뜨린다** → peermem 없는
+     플랫폼에서 `-14 (Bad address)`. 조건에 `FI_HMEM_CUDA` 추가.
+   - `vrb_reg_hmem_dmabuf()` 가 `ibv_reg_dmabuf_mr()` 뒤 **dma-buf fd 를 닫지 않아 등록마다 fd 1 개 누수** → MR 캐시가 꺼진 상태에서 4 MiB
+     청크 2048 개(8 GiB) 를 읽으면 nofile 1024 에 걸려 `cuMemGetHandleForAddressRange: CUDA_ERROR_OPERATING_SYSTEM`. `close(fd)` 추가
+     (실측: 1.5 s 에 dmabuf fd 634 개 → 패치 후 1 개).
+   둘 다 ucx-0001 과 같은 "dmabuf-only 플랫폼 회귀" 성격이라 상류 제출 가치가 있다.
+
+### 결과 (분리 드라이브, GDS 엔진 `/opt/daos-gds`, `ofi+verbs;ofi_rxm`, client-5, chunk 4 MiB, 32 MiB 요청, 8 GiB)
+정합성: `dfs_gpu_rt` 4 KiB~32 MiB 왕복 ALL OK(S16, 3 회). fd 누수 없음.
+
+| 컨테이너 | 워커 | `gpu` | `pinnedcopy` | `pinned` | gpu/staging | (UCX 였을 때 gpu) |
+|---|---|---|---|---|---|---|
+| S16 | 1 | **11.63** | 10.42 | 12.80 | **1.12** | 6.17 |
+| S16 | 4 | 26.67 | 27.99 | 30.78 | 0.95 | 9.35 |
+| S16 | 16 | **35.26** (3 회 35.1~35.4) | 41.21 | 42.43 | **0.86** | 16.01 |
+| RP_2G4 | 1 | 11.88 | 10.38 | 13.21 | 1.14 | 8.20 |
+| RP_2G4 | 4 | 24.11 | 23.52 | 23.59 | 1.03 | 12.52 |
+| RP_2G4 | 16 | 23.85 | 23.48 | 24.34 | **1.02** | 19.74 |
+
+DRAM 트래픽(16W, S16, perf uncore_imc): `gpu` read 999 + write 887 MiB vs `pinnedcopy` 7557 + 7542 MiB → **약 8× 절감**, 전달 바이트당 0.23 vs 1.84.
+
+읽는 법:
+- verbs 에서는 GPU-direct 가 **1 워커에서 스테이징을 앞서고**(복사 한 단계가 없으니 당연한 방향), 16 워커에서도 0.86 배로 UCX 의 0.46 배와
+  차원이 다르다. RP_2G4 처럼 스토리지 쪽이 상한(24~25 GB/s)이면 두 경로가 같다 — 즉 GPU 경로 자체의 천장은 이 구성에서 최소 35 GB/s 이상이다.
+- 따라서 §4-2 의 "QP 당 22 GB/s" 는 perftest 조건(1 QP)의 사실이지만 DAOS 의 GPU 경로 상한을 설명하지 못한다. DAOS 는 16 xstream 에서 16 QP
+  로 밀어넣으므로 원래 22 에 갇힐 이유가 없었고, 실제로 UCX 만 갇혔다. UCX 쪽 손실(CUDA 목적지에 대한 프로토콜 선택, rndv 조각화 등)은
+  미규명이며 verbs 가 답이 된 이상 파지 않는다.
+- 호스트 스테이징도 verbs 가 UCX 보다 빠르다(S16 16W 41~42 vs 35).
+
+### 남은 문제
+- **RP_2 컨테이너에 GPU 소스로 쓰기(`dfs_write_gpu`)가 verbs 에서 실패**: 64 KiB 부터 follower(rank 1 tag 9) 로의 update 가 `DER_HG` →
+  15 s 뒤 `DER_CANCELED`. S16(복제 없음) 쓰기·읽기와 RP_2G4 **읽기**는 정상, UCX 에서는 RP_2G4 쓰기도 정상이었다. 서버 로그에 ERR 없음.
+  복제 update 의 follower 가 클라이언트 GPU 메모리를 bulk GET 하는 경로로 보이며 미규명. KV 캐시 용도는 rd_fac:0/S16 이라 영향 없음.
+- MR 캐시가 `uffd`/`memhooks` 모니터 초기화 실패("No space left on device")로 꺼져 있어 I/O 마다 등록한다. 등록 비용은 위 수치에 포함돼 있다.
+- 서버 측은 GDS 엔진 빌드(`/opt/daos-gds`) 가 필요했는가는 미확인 — 클라이언트 측 변경만이므로 stockfull 서버로도 될 가능성이 크다(다음 시험).
+
+### 판단에 미치는 영향
+이 문서 앞부분과 8/31 정정의 "GDS 는 실제 청크 크기에서 2 배 느리다 → `DaosGdsBackend` 를 만들지 않는다" 는 **UCX 경로에서만 성립하는
+결론**이었다. verbs(운영 권고 전송)에서는 대역폭 손실이 0.86~1.1 배로 사라지고 DRAM 절감 8 배만 남으므로, `PLAN.md` §0 의 재개 조건
+("GDS 가 실제 청크 크기에서 스테이징보다 느리지 않다")이 **충족됐다.** LMCache 수준 GDS 백엔드는 다시 검토 대상이다. 다음 확인 순서:
+(1) stockfull 서버 + GDS 클라이언트 조합, (2) 실제 KV 청크(28~40 MiB) 크기의 TTFT 비교, (3) 8-GPU 호스트에서의 DRAM 경합.
+
 ## 알려진 한계
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency
