@@ -1483,11 +1483,37 @@ retrieve 로그: 16K 2.5 GB 91 ms(백엔드 88 ms, 30.4 GB/s), 31K 4.84 GB 163 m
 p95 201 ms 로 MP 의 151 에 근접한다. **DRAM: 100 GB 를 GPU 로 가져오는 동안 호스트 DRAM 트래픽이 read 4.5 + write 4.3 GB(0.09 B/B)** — 스테이징의 1.8~1.9 B/B
 대비 20 배 이상 절감으로, 계획서 §6 의 합격 기준(≤ 0.3 B/B)을 크게 넘는다.
 
+### async prefetch — 요청 간 겹침 (2026-09-06)
+`enable_async_loading: True` 면 스토리지 매니저가 **lookup 시점**(스케줄 전)에 백엔드의 `batched_async_contains` → `batched_get_non_blocking` 을 이벤트
+루프에서 돌려 결과를 이벤트 매니저로 retrieve 에 넘긴다(LocalCPUBackend 를 거치지 않음). 두 메서드를 구현해(스레드풀 read 를 `run_in_executor`
+로 gather, 접두 절단) 다음 요청의 DAOS→GPU 읽기가 현재 요청의 prefill 과 겹치게 했다. 계획서 §1 의 "GDS+async = hang" 은 in-tree GdsBackend 에
+이 메서드가 없어서 난 것이다.
+그런데 0.5.2 는 prefetch 직렬화기를 `AsyncSingleSerializer`(asyncio.Lock, 한 번에 한 요청)로 **하드코딩**하고, 청크 예산 가중 세마포어인
+`AsyncMultiSerializer` 는 같은 파일에 있으나 선택 경로가 없다. 플러그인 import 가 `StorageManager.__init__` 안(직렬화기 생성 전)에서 일어나므로
+그 이름을 우리 GPU 풀의 청크 예산으로 만든 multi 로 되묶는다(`DAOS_GDS_MULTI_PREFETCH=1`, 기본 on; 런처 `MULTI=`).
+
+| Part B 100 GB, 149 쿼리 | avg | p50 | p95 | 집계 |
+|---|---|---|---|---|
+| sync (재시작 후 콜드) | 363 | 359 | 477 | 21.7 GB/s |
+| async + single serializer | 303~311 | 319~328 | 349~356 | 25.5~26.1 |
+| **async + multi serializer**, 12 inflight | **285~302** | 290~299 | **320~345** | **26.5~27.7** |
+| async + multi, 6 inflight | 163 | 163 | **182** | 24.4 |
+| async + multi, 24 inflight (풀 10 GiB 부족) | 1512 | 1579 | 2512 | 10.6 |
+| MP verbs 콜드(비교) | 216 | 210 | 295 | 36.2 |
+
+Part A 콜드는 그대로(80 / 132~138 / 215~218 ms). 남은 격차(27.7 vs 36.2)는 엔진 쪽 — retrieve 의 `to_gpu` 청크 루프와 요청 단위 직렬 처리 — 이고 스토리지 읽기
+자체는 요청당 23~25 ms(26~30 GB/s)로 MP 어댑터와 같다. **GPU 풀은 inflight × KV 크기 이상**이어야 한다: 24 inflight × 640 MB = 15 GB > 10 GiB 에서
+할당 실패 → 접두 절단 → 재계산으로 급락한다(정합성은 유지). 가중 세마포어는 prefetch 동시성만 막고 소비 지연은 못 막으므로 여유를 둘 것
+(`GDS_GB`, `--gpu-memory-utilization` 과 상충).
+
+MR 캐시: mercury na_ofi 가 `FI_MR_CACHE_MAX_COUNT=0` 을 강제해 libfabric 캐시가 꺼진 상태(`ofi_mr_cache_init` → ENOSPC). 환경변수 덮어쓰기는 듣지 않고,
+16 워커 34.3~34.9 GB/s 로 대역폭 영향도 없어 그대로 둔다.
+
 ### 판정
 - 단일 GPU·단일 요청 콜드 지연과 DRAM 은 GDS in-process 가 최선이고, 다중 요청 집계 처리량은 MP(pinned L1 + 서버측 겹침)가 최선이다.
   8-GPU 호스트(계획서 §6)에서는 집계 = GPU 수 × 단일 GPU 이므로 엔진 직렬화가 GPU 단위로 병렬화되고 DRAM 절감이 결정적이 된다 — 미측정(장비 없음).
-- 남은 것: (1) GDS 백엔드의 retrieve 를 LMCache `enable_async_loading`/prefetch 와 결합해 요청 간 겹침 확보(계획서 §1 은 GDS+async = hang 기록 →
-  재검증 필요), (2) `to_gpu` 청크 루프의 Python 고정비(§"운영 경로의 병목은 전송이 아니다"), (3) MR 캐시 비활성으로 매 I/O 등록, (4) RP_2 GPU 소스 쓰기 결함.
+- 남은 것: (1) `to_gpu` 청크 루프의 Python 고정비와 요청 단위 직렬 retrieve(§"운영 경로의 병목은 전송이 아니다") — 27.7 → 36 GB/s 의 격차, (2) RP_2 GPU 소스 쓰기 결함,
+  (3) libfabric 패치 2 건·multi serializer 선택 옵션의 상류 제출, (4) 8-GPU 실측.
 
 ## 알려진 한계
 

@@ -65,6 +65,45 @@ from .dfs_binding import DaosError, DfsSys, warm_up_all_targets
 logger = init_logger(__name__)
 
 
+_LAST_BACKEND: Optional["DaosGdsBackend"] = None
+
+
+def _install_multi_prefetch_serializer() -> None:
+    """LMCache 0.5.2 hard-codes ``AsyncSingleSerializer`` (an asyncio.Lock: one
+    request's prefetch at a time) although ``AsyncMultiSerializer`` -- a
+    chunk-budget weighted semaphore -- sits next to it with no config switch.
+    Prefetches that cannot overlap cap the aggregate at one request's read
+    bandwidth (Part B: 21-26 GB/s vs the 36 GB/s the MP server reaches).
+
+    This module is imported by the plugin launcher *inside*
+    ``StorageManager.__init__`` before the serializer is constructed, so
+    rebinding the name in that module makes the manager build the multi
+    serializer over our GPU pool's chunk budget. Off with
+    ``DAOS_GDS_MULTI_PREFETCH=0``."""
+    if os.environ.get("DAOS_GDS_MULTI_PREFETCH", "1") != "1":
+        return
+    try:
+        from lmcache.v1.storage_backend import storage_manager as smm
+    except Exception:  # pragma: no cover
+        return
+    if getattr(smm, "_daos_gds_multi_patched", False):
+        return
+    multi = smm.AsyncMultiSerializer
+
+    def factory(loop):
+        be = _LAST_BACKEND
+        if be is None:
+            return smm.__dict__["_daos_gds_single"](loop)
+        ser = multi(be, loop)
+        logger.info("DaosGdsBackend: prefetch serializer = AsyncMultiSerializer (chunk budget %d, concurrent cap %d)",
+                    ser.chunk_budget, ser.chunk_budget // 2)
+        return ser
+
+    smm._daos_gds_single = smm.AsyncSingleSerializer
+    smm.AsyncSingleSerializer = factory
+    smm._daos_gds_multi_patched = True
+
+
 def _cfg(config: LMCacheEngineConfig, key: str, default=None):
     ec = config.extra_config or {}
     return ec.get(f"daosgds.{key}", default)
@@ -142,6 +181,9 @@ class DaosGdsBackend(AllocatorBackendInterface):
         logger.info("DaosGdsBackend: pool=%s cont=%s root=%s device=%s gpu_buffer=%.1f GiB workers=%d",
                     pool, cont, self.root, self.dst_device, self.gpu_buffer_bytes / (1 << 30),
                     self.io_workers)
+        global _LAST_BACKEND
+        _LAST_BACKEND = self
+        _install_multi_prefetch_serializer()
 
     # -- allocator backend ----------------------------------------------------
     def initialize_allocator(self, config, metadata=None) -> MemoryAllocatorInterface:

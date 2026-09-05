@@ -37,7 +37,7 @@ podman run -d --name vllm-daos --net host --security-opt label=disable --device 
   -v /var/run/daos_agent:/var/run/daos_agent -v /etc/daos:/etc/daos \
   -v /root/lmcache-daos-repo:/lmd -v /root/lmc:/cfg -v /home/hf/hf_cache:/hf \
   -e HF_HOME=/hf -e PYTHONHASHSEED=0 -e PYTHONPATH=/lmd -e LMCACHE_CONFIG_FILE=/cfg/gds.yaml \
-  -e VLLM_USE_FLASHINFER_SAMPLER=0 ${PODMAN_EXTRA:-} \
+  -e VLLM_USE_FLASHINFER_SAMPLER=0 -e DAOS_GDS_MULTI_PREFETCH=${MULTI:-1} ${PODMAN_EXTRA:-} \
   localhost/kvsup-ucx-lmc:local \
   bash -c "$INNER" -- /hf/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18 \
     --served-model-name qwen3 --max-model-len $MML --gpu-memory-utilization $GPU_UTIL \

@@ -181,5 +181,5 @@ L1→GPU 직렬 구간이며, 그것은 §7.7 의 스트리밍(현재 프로토�
 | 16K | 298 | 158 | 85 | **118** |
 | 31K | 437 | 281 | 141 | **198~211** |
 
-Part B(100 GB, 12 inflight): GDS in-proc 콜드 avg 363 / p50 359 / p95 477, 21.7 GB/s(엔진 요청 직렬화 한계), inflight 6 → p95 201; DRAM 0.09 B/B.
+Part B(100 GB, 12 inflight): GDS in-proc 콜드 sync avg 363 / p95 477, 21.7 GB/s; async prefetch + multi serializer 285~302 / 320~345, 26.5~27.7 GB/s(엔진 측 잔여 한계), inflight 6 → p95 182; DRAM 0.09 B/B.
 콜드 단건은 GDS 가, 다중 요청 집계는 MP 가 최선. 상세 `gpudirect/README.md` "Phase 2".
