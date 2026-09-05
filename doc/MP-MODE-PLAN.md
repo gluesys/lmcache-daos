@@ -329,3 +329,18 @@ tcp 의 대역폭은 8K(2.7 GB) load 466 ms = 어댑터 3.7 GB/s 로 UCX 의 ~34
 `ucx+rc_v` 로 되돌렸다. 운영 회피책은 "store 직후 15 s 안에 같은 프로세스에서 콜드 load 가 오지 않게" 하는 것인데 실사용에서는
 보장할 수 없으므로 상류 수정이 답이다. 후보 회피책(미검증): `ofi+verbs` 로 RDMA 유지(§0 의 rxm 손상 이력은 공유 드라이브 오구성
 때문이었을 가능성이 높아 재평가 가치 있음).
+
+### 7.7d `ofi+verbs;ofi_rxm` — 스톨 없음, 대역폭 동일 → **권고 전송** (2026-09-05)
+
+| 전송 | store→load 첫 load(8K) | load only | 어댑터 읽기 | 8K 콜드 hit | 정합성 |
+|---|---|---|---|---|---|
+| `ucx+rc_v` | 12/16 스톨 | 0/10 | 33~37 GB/s | ~150 ms | 게이트 PASS |
+| `ofi+tcp` | 0/8 | 0/2 | 3.7 GB/s | 576 ms | — |
+| **`ofi+verbs;ofi_rxm`** | **0/6, 46~49 ms** | 0/2 | **35~38 GB/s** | **153~157 ms** | 게이트 6/6 PASS, raw 0/320 + 감사 0/32 |
+
+verbs 는 UCX 와 같은 대역폭(16K 콜드 289 ms, load 97~102 ms = 36~38 GB/s)에 스톨이 없다. 클러스터는 **verbs 로 유지**한다.
+
+이 결과는 이 프로젝트 초기의 판정 — "libfabric `verbs;ofi_rxm` 은 대용량 RDMA read 를 조용히 손상시킨다(28 MB × 30 중
+3~10 개만 정상), UCX 로 해결" (`deploy/README.md` §2, Hub 문서) — 를 **뒤집는다.** 그때의 손상은 두 랭크가 같은 NVMe 를 쓰던
+오구성(`gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md` §62)이었고, UCX 가 "고친" 것처럼 보인 것은 30 회 시행의 검정력 부족이었다.
+분리된 드라이브 위에서 verbs 는 raw 320 회 + 정지 감사 32 객체 전부 정상이다.
