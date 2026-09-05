@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import os
 import math
 import threading
 import time
@@ -58,6 +59,10 @@ from lmcache.v1.platform import create_event_notifier
 from ..dfs_binding import DaosError, DfsSys
 
 logger = init_logger(__name__)
+
+# daos_obj_class.h: OBJ_CLASS_DEF(OR_RP_1, MAX_NUM_GROUPS) -- one shard on
+# every target of the pool. Used only for the start-up probe (see _warm_up).
+OC_SX = (1 << 24) | 0xFFFF
 
 ADAPTER_TYPE = "daos"
 
@@ -194,6 +199,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         status_interval_s: float = 0.0,
         task_workers: int = 32,
         load_schedule: str = "fifo",
+        probe_chunks: int = 64,
     ):
         self.pool = pool
         self.container = container
@@ -205,6 +211,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         self.status_interval_s = status_interval_s
         self.task_workers = task_workers
         self.load_schedule = load_schedule
+        self.probe_chunks = probe_chunks
 
     @classmethod
     def from_dict(cls, d: dict) -> "DaosL2AdapterConfig":
@@ -238,6 +245,9 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         load_schedule = d.get("load_schedule", "fifo")
         if load_schedule not in ("fifo", "fair"):
             raise ValueError("daos: 'load_schedule' must be 'fifo' or 'fair'")
+        probe_chunks = d.get("probe_chunks", 64)
+        if not isinstance(probe_chunks, int) or probe_chunks < 0:
+            raise ValueError("daos: 'probe_chunks' must be a non-negative integer")
         cfg = cls(
             pool=pool,
             container=container,
@@ -249,6 +259,7 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             status_interval_s=float(status_interval),
             task_workers=task_workers,
             load_schedule=load_schedule,
+            probe_chunks=probe_chunks,
         )
         # Optional common sub-configs handled by the base class parsers.
         cfg.eviction_config = cls._parse_eviction_config(d)
@@ -364,27 +375,34 @@ class DaosL2Adapter(L2AdapterInterface):
         )
 
     def _warm_up(self) -> None:
-        """Pay the first-I/O cost at start-up instead of on a user request.
+        """Open a transport connection to EVERY target before serving.
 
-        On client-5 the first DAOS I/O of a fresh process intermittently took
-        14-17 s (3 of ~9 restarts; no server-side or client WARN logged, so
-        the cause is still open -- transport endpoint set-up is the suspect).
-        A write + read of a small probe object under ``root`` moves whatever
-        that is to adapter construction, where the MP server is not yet
-        serving requests.
+        Root cause of the 14-17 s stalls seen on ``ucx+rc_v`` (MP-MODE-PLAN
+        7.7e): mercury NA-UCX connects to a server xstream lazily, on the
+        first RPC to it, through rdma_cm. When that first contact happens in
+        the middle of a store -- the client->server direction is then saturated
+        by the servers' RDMA reads on a lossy RoCE fabric -- the CM ``RTU``
+        message is dropped, the server's endpoint stays half-open until the
+        kernel CM retransmits ``REP`` (~16 s), and every RPC to that one
+        rank:tag waits. The 16-chunk S16 probe used before covered only 12 of
+        16 targets, so the last four were first contacted by user traffic.
+
+        Fix: create the probe with object class ``SX`` (one shard on every
+        target) and read ``probe_chunks`` chunks (>= target count), so all
+        connections are established here, while the fabric is quiet and
+        before the MP server accepts requests. The probe is per process and
+        removed afterwards; ``probe_chunks: 0`` disables the warm-up.
         """
-        path = f"{self._root}/.daos-l2-probe"
+        nchunks = int(getattr(self._config, "probe_chunks", 64) or 0)
+        if nchunks <= 0:
+            return
+        path = f"{self._root}/.daos-l2-probe.{os.getpid()}"
         t0 = time.monotonic()
         try:
-            # 16 DFS chunks of 4 MiB: with S16 striping every target of both
-            # ranks serves one chunk, so the first RPC/bulk to each target --
-            # where the intermittent 14-17 s stall was observed to hit ALL
-            # concurrent reads of the first user request -- happens here.
             chunk = 4 << 20
-            nchunks = 16
             n = chunk * nchunks
             src = (ctypes.c_char * n).from_buffer(bytearray(b"\x5a" * n))
-            h = self._dfs.open_rdwr_create(path)
+            h = self._dfs.open_rdwr_create(path, oclass=OC_SX)
             try:
                 self._dfs.write_obj_from(h, 0, n, src)
             finally:
@@ -399,8 +417,12 @@ class DaosL2Adapter(L2AdapterInterface):
                     self._dfs.close_obj(hh)
 
             got = list(self._pool.map(_read, range(nchunks)))
-            logger.info("DaosL2Adapter warm-up: probe %s, %d chunk reads of %d bytes "
-                        "(%s ok) in %.1f ms", path, len(got), chunk,
+            try:
+                self._dfs.remove(path)
+            except Exception as e:  # pragma: no cover
+                logger.warning("DaosL2Adapter warm-up: could not remove %s: %s", path, e)
+            logger.info("DaosL2Adapter warm-up: SX probe, %d chunk writes+reads of %d bytes "
+                        "(%s ok) in %.1f ms -- all targets contacted", len(got), chunk,
                         sum(1 for g in got if g == chunk), (time.monotonic() - t0) * 1e3)
         except Exception as e:  # pragma: no cover - best effort
             logger.warning("DaosL2Adapter warm-up failed (%s) after %.1f ms",

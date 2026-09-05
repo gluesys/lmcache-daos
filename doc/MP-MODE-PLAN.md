@@ -344,3 +344,31 @@ verbs 는 UCX 와 같은 대역폭(16K 콜드 289 ms, load 97~102 ms = 36~38 GB/
 3~10 개만 정상), UCX 로 해결" (`deploy/README.md` §2, Hub 문서) — 를 **뒤집는다.** 그때의 손상은 두 랭크가 같은 NVMe 를 쓰던
 오구성(`gpudirect/DAOS-CONCURRENT-READ-CORRUPTION.md` §62)이었고, UCX 가 "고친" 것처럼 보인 것은 30 회 시행의 검정력 부족이었다.
 분리된 드라이브 위에서 verbs 는 raw 320 회 + 정지 감사 32 객체 전부 정상이다.
+
+### 7.7e 스톨 근본 원인 — 지연 연결(rdma_cm) 의 RTU 유실 + 커널 CM 재전송 타이머 (2026-09-05)
+
+`ucx+rc_v` 로 되돌려 클라이언트 cart DEBUG(rpc/hg), 서버 xstream DEBUG, 양쪽 HCA 하드웨어 카운터, 커널 CM(connection
+manager) 카운터를 동시에 잡았다(6/6 재현). 결론: **store 중에 처음 접촉하는 서버 xstream 으로의 rdma_cm 연결 수립에서
+클라이언트→서버 `RTU` 가 유실되고, 서버 커널 CM 이 `REP` 를 재전송하는 ~16 s 동안 그 rank:tag 로 가는 모든 RPC 가 대기한다.**
+
+증거(run "ucxlog 2", 스톨 14.5 s, 막힌 엔드포인트 rank 0 tag 9):
+1. 클라이언트 cart 로그: rank 0 tag 9 로의 **첫 URI lookup·첫 송신이 05:44:23.22, warm store 도중**이다. 기동 시 프로브는
+   14 개 엔드포인트만 연결했고(S16 16 청크가 12 타깃에만 놓임) 0:5, 0:9, 1:3, 1:5 는 store 가 처음 접촉했다.
+   막힌 RPC 는 전부 0:9 행(update 7 + fetch 3), 다른 rank:tag 는 즉시 완료. 05:44:39.66 에 전부 동시 완료.
+2. 서버 xs 9(cell1): 05:44:24.70 이후 로그 0 줄(유휴), 막힌 update 를 **05:44:39.663 에 수신**해 7 ms 안에 응답.
+3. HCA 카운터(양쪽): 스톨 창에 ack timeout·RNR·retrans 증가 0 → 와이어 재전송 없음, 패킷이 QP 에 오르지 않았다.
+4. **CM 카운터**: 클라이언트 `cm_tx_msgs/req` +4 (store 중 새 연결 4 개), 서버 cell1 14:44:23~24 `rep +2, rx_req +2, rx_rtu +1`
+   → REQ 2 개 중 **RTU 하나가 도착하지 않음**. 14:44:40 `retry_rep +1`(서버 REP 재전송) → 클라이언트 `dup_rep +1, retry_rtu +1`
+   (중복 REP 수신, RTU 재송신) → 연결 성립 → 스톨 종료. keepalive(3 s)·FC off 는 무효(§7.7d 이후 실험).
+5. RTU 가 왜 store 중에만 유실되는가: store 는 서버가 클라이언트 메모리를 RDMA read 하므로 **클라이언트→서버 방향이 포화**된다.
+   이 패브릭은 PFC 없음(client-5 `rx_discards_phy` 2.1 M, 서버 `packet_seq_err` 4 만, ECN CNP 200 만): 손실형 RoCE 에서 작은 CM
+   MAD 가 함께 버려진다. load 는 서버→클라이언트 방향이 포화라 RTU(클→서) 는 살아남는다 — load-only 0/12 와 일치.
+6. 왜 UCX 한정인가(추정): libfabric verbs 는 rdma_cm 이 만든 QP 를 쓰므로 RTU 가 없어도 첫 데이터 패킷이 커널 CM 의
+   `COMM_EST` 로 연결을 확정한다. UCX rdmacm 은 QP 를 자체 관리해 `ESTABLISHED`(RTU) 이벤트를 기다린다.
+
+**수정**: 어댑터 기동 프로브를 **SX(모든 타깃에 샤드 1 개) 오브젝트 클래스**로 만들고 `probe_chunks`(기본 64) 청크를 써서
+읽는다(`lmcache_daos/mp/l2_adapter.py::_warm_up`, `dfs_binding.open_rdwr_create(oclass=)`). 모든 rank:tag 연결이 요청을 받기
+전, 패브릭이 조용할 때 성립하므로 사용자 트래픽 중 첫 접촉이 사라진다. 프로브는 프로세스별 이름으로 만들고 지운다.
+남는 노출은 기동 시 연결 자체가 RTU 유실을 겪는 경우(기동 지연 16 s, 요청 경로 아님)와 서버 재시작 후 재연결이다.
+근본 해결은 패브릭 측(PFC/무손실 클래스 또는 CM MAD 우선순위)이고, DAOS/UCX 상류에는 "NA-UCX 지연 연결이 손실 패브릭에서
+RTU 유실 시 16 s 멈춤" 으로 보고할 수 있다.

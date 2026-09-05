@@ -52,7 +52,7 @@ class FakeDfs:
             b = self.files.get(path)
         return None if b is None else len(b)
 
-    def open_rdwr_create(self, path):
+    def open_rdwr_create(self, path, oclass=0):
         with self.lock:
             self.files.setdefault(path, bytearray())
         return path
@@ -127,9 +127,9 @@ def make(schedule="fifo"):
     )
     dfs = FakeDfs()
     ad = DaosL2Adapter(cfg, dfs_factory=lambda: dfs)
-    # The constructor writes a warm-up probe; keep the object counts below
-    # about the keys the tests store.
-    assert dfs.files.pop("/mp/.daos-l2-probe", None) is not None
+    # The constructor writes, reads and removes a per-process SX warm-up
+    # probe; nothing of it may remain, so the object counts below are exact.
+    assert not any(k.startswith("/mp/.daos-l2-probe") for k in dfs.files)
     return ad, dfs
 
 

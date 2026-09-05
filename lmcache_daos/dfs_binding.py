@@ -305,11 +305,14 @@ class DfsSys:
             self._sys = ctypes.c_void_p()
 
     # -- object I/O ---------------------------------------------------------
-    def _open(self, path: str, flags: int, create: bool) -> ctypes.c_void_p:
+    def _open(self, path: str, flags: int, create: bool,
+              cid: int = 0) -> ctypes.c_void_p:
+        """``cid`` is the DAOS object class for a file created here (0 = the
+        container default); it is ignored when the file already exists."""
         mode = _S_IFREG | 0o644 if create else 0
         obj = ctypes.c_void_p()
         rc = _dfs.dfs_sys_open(self._sys, path.encode(), mode, flags,
-                               0, 0, None, ctypes.byref(obj))
+                               cid, 0, None, ctypes.byref(obj))
         if rc != 0:
             raise DaosError(f"dfs_sys_open({path})", rc)
         return obj
@@ -326,8 +329,8 @@ class DfsSys:
         finally:
             _dfs.dfs_sys_close(obj)
 
-    def open_rdwr_create(self, path: str) -> ctypes.c_void_p:
-        return self._open(path, DFS_RDWR | os.O_CREAT, create=True)
+    def open_rdwr_create(self, path: str, oclass: int = 0) -> ctypes.c_void_p:
+        return self._open(path, DFS_RDWR | os.O_CREAT, create=True, cid=oclass)
 
     def write_obj_from(self, obj: ctypes.c_void_p, offset: int, length: int,
                        src) -> int:
