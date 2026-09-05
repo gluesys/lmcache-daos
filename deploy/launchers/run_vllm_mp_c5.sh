@@ -42,7 +42,7 @@ exec numactl --interleave=all vllm serve $MODEL \
   --kv-transfer-config '{"kv_connector":"DaosMPConnector","kv_connector_module_path":"lmcache_daos.mp.vllm_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":$MP_PORT}}'
 EOF
 
-podman run -d --name vllm-daos --net host --security-opt label=disable --device nvidia.com/gpu=all --ipc host \
+podman run -d --name vllm-daos --net host --security-opt label=disable --device nvidia.com/gpu=all --ipc host ${PODMAN_EXTRA:-} \
   --device /dev/infiniband --ulimit memlock=-1:-1 --cap-add=IPC_LOCK \
   -v /root/daoslibs-stock:/daoslib:ro -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
   -v /var/run/daos_agent:/var/run/daos_agent -v /etc/daos:/etc/daos \

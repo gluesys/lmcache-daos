@@ -400,11 +400,27 @@ class DaosL2Adapter(L2AdapterInterface):
         t0 = time.monotonic()
         try:
             chunk = 4 << 20
-            n = chunk * nchunks
-            src = (ctypes.c_char * n).from_buffer(bytearray(b"\x5a" * n))
+            # Phase 1 -- connect: one tiny write per DFS chunk, sequentially.
+            # Each chunk lives on a different shard/target (SX), so this is
+            # the first RPC to every rank:tag, issued one at a time while the
+            # fabric is quiet: the CM handshake is not competing with a bulk
+            # stream (a 256 MiB parallel write here reproduced the lost-RTU
+            # 16 s wait at start-up in 5 of 6 launches).
+            tiny = 4096
+            small = (ctypes.c_char * tiny).from_buffer(bytearray(b"\x5a" * tiny))
             h = self._dfs.open_rdwr_create(path, oclass=OC_SX)
             try:
-                self._dfs.write_obj_from(h, 0, n, src)
+                for i in range(nchunks):
+                    self._dfs.write_obj_from(h, i * chunk, tiny, small)
+                t1 = time.monotonic()
+                # Phase 2 -- bandwidth warm-up on the now-connected endpoints:
+                # a full 4 MiB write per chunk in parallel, then read back.
+                src = (ctypes.c_char * chunk).from_buffer(bytearray(b"\xa5" * chunk))
+
+                def _write(i):
+                    return self._dfs.write_obj_from(h, i * chunk, chunk, src)
+
+                list(self._pool.map(_write, range(nchunks)))
             finally:
                 self._dfs.close_obj(h)
 
@@ -421,8 +437,9 @@ class DaosL2Adapter(L2AdapterInterface):
                 self._dfs.remove(path)
             except Exception as e:  # pragma: no cover
                 logger.warning("DaosL2Adapter warm-up: could not remove %s: %s", path, e)
-            logger.info("DaosL2Adapter warm-up: SX probe, %d chunk writes+reads of %d bytes "
-                        "(%s ok) in %.1f ms -- all targets contacted", len(got), chunk,
+            logger.info("DaosL2Adapter warm-up: SX probe, %d targets contacted in %.1f ms, "
+                        "%d chunk writes+reads of %d bytes (%s ok), total %.1f ms",
+                        nchunks, (t1 - t0) * 1e3, len(got), chunk,
                         sum(1 for g in got if g == chunk), (time.monotonic() - t0) * 1e3)
         except Exception as e:  # pragma: no cover - best effort
             logger.warning("DaosL2Adapter warm-up failed (%s) after %.1f ms",
