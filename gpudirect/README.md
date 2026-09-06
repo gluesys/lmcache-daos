@@ -1506,6 +1506,20 @@ Part A 콜드는 그대로(80 / 132~138 / 215~218 ms). 남은 격차(27.7 vs 36.
 (정합성은 유지; 오류 분류 전에 컨테이너가 교체되어 "GPU buffer full → 접두 절단 → 재계산" 은 정황 추정이다 — 재현 시 `GPU buffer full` 카운트로 확정할 것). 가중 세마포어는 prefetch 동시성만 막고 소비 지연은 못 막으므로 여유를 둘 것
 (`GDS_GB`, `--gpu-memory-utilization` 과 상충).
 
+#### 시간 분해 — 격차는 엔진이 아니라 GPU 목적지 읽기 경로다 (2026-09-06)
+12 inflight, async+multi, 149 요청의 로그 분해: **prefetch(DAOS→GPU) p50 28.6 / p90 50.9 ms, retrieve(`to_gpu` D2D scatter 등) p50 0.9 / p90 2.4 ms.**
+엔진 측 비용은 1 ms 대라 §"운영 경로의 병목은 전송이 아니다" 의 고정비는 GPU 상주 객체에서는 사라졌다. I/O 스레드를 16 → 32 → 48 로 늘리면
+집계는 26.6 → 26.0 → 25.6 GB/s 로 그대로이고 prefetch p50 만 29 → 43 → 42 ms 로 늘어난다(요청당 읽기가 서로 대역을 나눔). 즉 이 워크로드의
+GDS 집계 ~27 GB/s 는 **GPU 목적지 RDMA write 경로의 상한**(raw 벤치 35 GB/s, 호스트 목적지 41)이며, MP 의 36 GB/s 는 호스트 pinned 목적지가
+더 빠른 데서 온다. 단건 콜드 지연은 GDS 가 앞서고(두 단계 → 한 단계), 다중 요청 집계는 호스트 목적지가 앞서는 구조적 결과다.
+남은 상류 여지: `daos_mem_attr_t.ma_rkey` 로 GPU 풀을 **1 회 사전 등록**해 I/O 마다의 dmabuf 등록을 없애는 것(초안이 import 경로를 가짐,
+미시험 — 1 워커 32 MiB 에서 gpu 2.9 vs pinned 2.7 ms 라 등록 비용 자체는 ~0.2 ms/청크로 작다).
+
+**스레드 CUDA 컨텍스트, 두 번째 교훈**: DAOS 클라이언트는 다른 스레드의 fetch RPC 를 **progress 를 돌리는 임의의 스레드**에서 인코딩하고 그 자리에서
+GPU bulk 를 등록한다. 그래서 stat 만 하던 스레드(`batched_contains`, LMCache lookup 스레드)도 `CUDA_ERROR_INVALID_CONTEXT` 를 낼 수 있다 — 16 워커에서는
+우연히 모두 get 을 먼저 거쳐 통과했고 24 워커 이상에서 엔진이 죽었다. torch 런타임 호출은 새 스레드에 드라이버 컨텍스트를 확실히 묶지 않으므로
+드라이버 API(`cuDevicePrimaryCtxRetain` 1 회 + 스레드별 `cuCtxSetCurrent`)로 묶고, 스레드풀 `initializer` 와 `contains()` 진입에서 보장한다.
+
 MR 캐시: mercury na_ofi 가 `FI_MR_CACHE_MAX_COUNT=0` 을 강제해 libfabric 캐시가 꺼진 상태(`ofi_mr_cache_init` → ENOSPC). 환경변수 덮어쓰기는 듣지 않고,
 16 워커 34.3~34.9 GB/s 로 대역폭 영향도 없어 그대로 둔다.
 
