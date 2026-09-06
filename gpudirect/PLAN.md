@@ -8,7 +8,10 @@
 >
 > 아래 Phase 1~5 설계는 폐기하지 않고 남긴다. 전제(스토리지 티어가 GPU 당 17 GB/s 이상을
 > 공급하고, QP 당 22 GB/s 제한을 우회할 방법이 생기는 것)가 바뀌면 그대로 유효하다.
-> **재개 조건은 §0 끝에 적었다.**
+> **상태(2026-09-06)**: Phase 1(v2 포맷)·Phase 2(GPU 바인딩, ctypes)·Phase 3(`DaosGdsBackend`) **구현·검증 완료** — README "Phase 2 — in-process DaosGdsBackend".
+> Phase 4(store 우선)는 무의미해졌다(스토리지 매니저가 store 객체를 GPU 로 복사해 넘기므로 store/retrieve 가 함께 켜진다). Phase 5(8-GPU)는 장비 대기.
+>
+> **재개 조건은 §0 끝에 적었다.** 2026-09-05 분리 드라이브 재측정(README 말미)에서도 UCX 경로는 gpu/staging 0.46~0.79 로 판정 불변이었으나, **2026-09-06 `ofi+verbs` 에서는 0.86~1.1 로 재개 조건 충족**(README "GDS over ofi+verbs" 절). 백엔드 구현 재검토.
 >
 > 대신 하기로 했던 두 가지도 끝났다:
 > - **인터리브 적용: 완료·검증됨.** `run_vllm_daos.sh` 에 `numactl --interleave=all`.
@@ -142,12 +145,13 @@ GDS 가 이기는 구간은 chunk 256 KiB 뿐인데(0.36~0.59배), Qwen3-14B 의
 
 | 사실 | 설계에 미치는 영향 |
 |---|---|
-| GPU 당 수요 = 집계/8. 교차점에서도 17.3 GB/s ≪ 22 (1 QP BAR 천장) | **per-QP 핸디캡이 구속하지 않는다.** 단일 GPU 에서의 열세가 8장에서는 사라진다 |
+| ~~GPU 당 수요 = 집계/8. 교차점에서도 17.3 GB/s ≪ 22 (1 QP BAR 천장)~~ **2026-09-06 정정: 22 GB/s 천장은 UCX 경로 한정. `ofi+verbs` 에서는 단일 GPU 에서도 gpu 35.3 vs staging 42.0(0.84×), 1 워커 1.13×** | 단일 GPU 에서도 열세가 거의 없다. 전송은 **verbs(운영 권고) 고정**, UCX 는 GDS 에 쓰지 않는다 |
 | 워커 프로세스마다 CaRT 컨텍스트 → 자체 QP | 8 프로세스 = QP 8개 이상 → 22 GB/s 천장을 구조적으로 우회. 상한 176 GB/s |
 | store 방향은 페널티 없음 (34.57 GPU vs 35.12 host) | **store 를 먼저 적용**하는 비대칭 구성이 가능 |
 | `RP_2G4` + chunk 4 MiB 가 최적, `RP_2G8` 은 역효과(20.0→12.7), EC 는 draft 가 거부 | 컨테이너 파라미터를 시작 시 **검증하고 거부**. 이 두 값이 결론을 세 번 뒤집었다 |
 | LMCache async loading + GPU 백엔드 = hang | **동기 + 스레드풀 고정**, `enable_async_loading: False` |
 | `daos_server` 재시작이 SPDK wedge → 풀 파기 | **서버 설정 변경을 요구하는 설계 금지** |
+| **stock 서버 + GDS 클라이언트 왕복 OK (2026-09-06)** | 서버 변경 없이 클라이언트 번들만 교체하면 된다 — 위 제약을 만족 |
 | DRAM 배수 gpu 0.10~0.30 / pinnedcopy 1.93~2.02 / hostcopy 4.18~4.73 | 합격 기준은 대역폭이 아니라 **DRAM 배수**로 잡는다 |
 
 ---

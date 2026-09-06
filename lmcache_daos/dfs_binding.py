@@ -49,6 +49,7 @@ class _Dirent(ctypes.Structure):
 
 _daos = None  # libdaos handle
 _dfs = None   # libdfs handle
+_gpu_ok = False  # libdfs exposes dfs_read_gpu/dfs_write_gpu (GPU-direct draft build)
 
 
 # ---- gurt/types.h scatter-gather types -----------------------------------
@@ -93,6 +94,22 @@ class DSgList(ctypes.Structure):
     ]
 
 
+DAOS_MEM_TYPE_HOST = 0
+DAOS_MEM_TYPE_CUDA = 1
+
+
+class DaosMemAttr(ctypes.Structure):
+    """``daos_mem_attr_t`` (GPU-direct draft, gurt/types.h): side-channel memory
+    attributes for an sgl -- {daos_mem_type_t ma_mem_type; uint64 ma_device_id;
+    d_iov_t ma_rkey}. ``ma_rkey`` zeroed = let CaRT register the buffer."""
+
+    _fields_ = [
+        ("ma_mem_type", ctypes.c_int),
+        ("ma_device_id", ctypes.c_uint64),
+        ("ma_rkey", DIov),
+    ]
+
+
 class DaosError(OSError):
     """Raised when a DAOS/DFS call returns a non-zero status."""
 
@@ -107,8 +124,15 @@ def _load() -> None:
     if _dfs is not None:
         return
 
-    daos_path = ctypes.util.find_library("daos") or "libdaos.so"
-    dfs_path = ctypes.util.find_library("dfs") or "libdfs.so"
+    # LMCACHE_DAOS_LIBDIR selects a specific client bundle (e.g. the GPU-direct
+    # build at /opt/daos-gds-gpu/lib64) ahead of whatever ldconfig knows.
+    libdir = os.environ.get("LMCACHE_DAOS_LIBDIR")
+    if libdir:
+        daos_path = os.path.join(libdir, "libdaos.so")
+        dfs_path = os.path.join(libdir, "libdfs.so")
+    else:
+        daos_path = ctypes.util.find_library("daos") or "libdaos.so"
+        dfs_path = ctypes.util.find_library("dfs") or "libdfs.so"
     _daos = ctypes.CDLL(daos_path, mode=ctypes.RTLD_GLOBAL)
     _dfs = ctypes.CDLL(dfs_path, mode=ctypes.RTLD_GLOBAL)
 
@@ -209,6 +233,39 @@ def _load() -> None:
     ]
 
     # -- async path: the base dfs API, not the dfs_sys wrapper ---------------
+    # GPU-direct entry points exist only in the b_cufile draft build.
+    #   int dfs_read_gpu (dfs_t *, dfs_obj_t *, d_sg_list_t *, daos_off_t,
+    #                     daos_size_t *read_size, daos_mem_attr_t *);
+    #   int dfs_write_gpu(dfs_t *, dfs_obj_t *, d_sg_list_t *, daos_off_t,
+    #                     daos_mem_attr_t *);
+    global _gpu_ok
+    _gpu_ok = hasattr(_dfs, "dfs_read_gpu") and hasattr(_dfs, "dfs_write_gpu")
+    if _gpu_ok:
+        _dfs.dfs_read_gpu.restype = ctypes.c_int
+        _dfs.dfs_read_gpu.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(DSgList),
+            ctypes.c_ulonglong, ctypes.POINTER(ctypes.c_ulonglong),
+            ctypes.POINTER(DaosMemAttr)]
+        _dfs.dfs_write_gpu.restype = ctypes.c_int
+        _dfs.dfs_write_gpu.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(DSgList),
+            ctypes.c_ulonglong, ctypes.POINTER(DaosMemAttr)]
+
+    # int dfs_lookup(dfs_t *, const char *path, int flags, dfs_obj_t **obj,
+    #                mode_t *mode, struct stat *stbuf);
+    _dfs.dfs_lookup.restype = ctypes.c_int
+    _dfs.dfs_lookup.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+                                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                ctypes.c_void_p]
+    # int dfs_release(dfs_obj_t *obj);
+    _dfs.dfs_release.restype = ctypes.c_int
+    _dfs.dfs_release.argtypes = [ctypes.c_void_p]
+    # int dfs_move(dfs_t *, dfs_obj_t *parent, const char *name,
+    #              dfs_obj_t *new_parent, const char *new_name, daos_obj_id_t *oid);
+    _dfs.dfs_move.restype = ctypes.c_int
+    _dfs.dfs_move.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p,
+                              ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
     # int dfs_sys2base(dfs_sys_t *dfs_sys, dfs_t **dfs);
     _dfs.dfs_sys2base.restype = ctypes.c_int
     _dfs.dfs_sys2base.argtypes = [
@@ -452,6 +509,69 @@ class DfsSys:
                            ctypes.byref(size), ctypes.c_void_p(ev_addr))
         if rc != 0:
             raise DaosError("dfs_read(async submit)", rc)
+
+    # -- GPU-direct I/O (b_cufile draft: dfs_read_gpu / dfs_write_gpu) --------
+    @staticmethod
+    def gpu_supported() -> bool:
+        """True when the loaded libdfs has the GPU-direct entry points."""
+        _load()
+        return _gpu_ok
+
+    def _gpu_call(self, fn_name: str, obj, offset: int, length: int, dev_ptr: int,
+                  device_id: int, read: bool) -> int:
+        if not self.gpu_supported():
+            raise RuntimeError("libdfs has no dfs_read_gpu/dfs_write_gpu (not the GPU-direct build)")
+        iov = DIov(ctypes.c_void_p(dev_ptr), length, length)
+        sgl = DSgList(1, 1, ctypes.pointer(iov))
+        attr = DaosMemAttr(DAOS_MEM_TYPE_CUDA, device_id, DIov(None, 0, 0))
+        if read:
+            size = ctypes.c_ulonglong(length)
+            rc = _dfs.dfs_read_gpu(self.base(), obj, ctypes.byref(sgl), offset,
+                                   ctypes.byref(size), ctypes.byref(attr))
+            if rc != 0:
+                raise DaosError(fn_name, rc)
+            return size.value
+        rc = _dfs.dfs_write_gpu(self.base(), obj, ctypes.byref(sgl), offset,
+                                ctypes.byref(attr))
+        if rc != 0:
+            raise DaosError(fn_name, rc)
+        return length
+
+    def read_gpu_into(self, obj: ctypes.c_void_p, offset: int, length: int,
+                      dev_ptr: int, device_id: int = 0) -> int:
+        """DMA ``length`` bytes at file ``offset`` straight into CUDA device
+        memory at ``dev_ptr`` (e.g. ``tensor.data_ptr()``); returns bytes read
+        (short at EOF). Synchronous; ctypes releases the GIL for the call."""
+        return self._gpu_call("dfs_read_gpu", obj, offset, length, dev_ptr, device_id, True)
+
+    def write_gpu_from(self, obj: ctypes.c_void_p, offset: int, length: int,
+                       dev_ptr: int, device_id: int = 0) -> int:
+        """Write ``length`` bytes from CUDA device memory at ``dev_ptr`` to the
+        file at ``offset`` (server RDMA-reads the GPU buffer)."""
+        return self._gpu_call("dfs_write_gpu", obj, offset, length, dev_ptr, device_id, False)
+
+    # -- directory handles + atomic publish -----------------------------------
+    def lookup(self, path: str, flags: int = DFS_RDWR) -> ctypes.c_void_p:
+        """``dfs_lookup``: open an existing path (file or directory) as a
+        ``dfs_obj_t *``; release with :meth:`release`."""
+        _load()
+        obj = ctypes.c_void_p()
+        rc = _dfs.dfs_lookup(self.base(), path.encode(), flags, ctypes.byref(obj), None, None)
+        if rc != 0:
+            raise DaosError(f"dfs_lookup({path})", rc)
+        return obj
+
+    def release(self, obj: ctypes.c_void_p) -> None:
+        _dfs.dfs_release(obj)
+
+    def move(self, parent: ctypes.c_void_p, name: str, new_parent: ctypes.c_void_p,
+             new_name: str) -> None:
+        """``dfs_move``: atomic rename within/between directories (the v2
+        writer's publish step: temp name -> final name)."""
+        rc = _dfs.dfs_move(self.base(), parent, name.encode(), new_parent,
+                           new_name.encode(), None)
+        if rc != 0:
+            raise DaosError(f"dfs_move({name}->{new_name})", rc)
 
     def exists(self, path: str) -> bool:
         try:

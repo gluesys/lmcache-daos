@@ -1,0 +1,34 @@
+--- prov/verbs/src/verbs_mr.c.orig	2026-09-06 00:20:24.809900845 +0900
++++ prov/verbs/src/verbs_mr.c	2026-09-06 00:31:20.008014450 +0900
+@@ -32,6 +32,7 @@
+  */
+ 
+ #include <ofi_util.h>
++#include <unistd.h>
+ #include "verbs_ofi.h"
+ 
+ static int vrb_mr_close(fid_t fid)
+@@ -86,6 +87,13 @@
+ 
+ 	mr = ibv_reg_dmabuf_mr(pd, offset, len, (uint64_t)buf/* iova */,
+ 			       fd, vrb_access);
++	saved_errno = errno;
++	/* The MR holds its own reference to the dma-buf; without this close
++	 * every registration leaks one fd and long runs die on EMFILE
++	 * (cuMemGetHandleForAddressRange -> CUDA_ERROR_OPERATING_SYSTEM). */
++	close(fd);
++	errno = saved_errno;
++	saved_errno = 0;
+ 	if (!mr && failover_policy[iface] == TRY &&
+ 	    vrb_gl_data.peer_mem_support) {
+ 		saved_errno = errno;
+@@ -145,7 +153,8 @@
+ 	else if (vrb_gl_data.dmabuf_support &&
+ 		 (iface == FI_HMEM_ZE ||
+ 		  iface == FI_HMEM_SYNAPSEAI ||
+-		  iface == FI_HMEM_ROCR))
++		  iface == FI_HMEM_ROCR ||
++		  iface == FI_HMEM_CUDA))  /* dmabuf-only platforms (no peermem) */
+ 		md->mr = vrb_reg_hmem_dmabuf(iface, md->domain->pd, buf, len,
+ 						vrb_access);
+ 	else

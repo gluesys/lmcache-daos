@@ -1330,6 +1330,191 @@ shim 은 측정 도구로만 저장소에 남긴다. 파일 상단에 배포 금
 때는 분모도 분자와 같은 엄격함으로 재야 한다** — 4판의 결론을 뒤집은 것은 새로운 분자가
 아니라 제대로 잰 분모였다.
 
+## 2026-09-05 재측정 — 분리된 드라이브 위에서도 결론은 같다
+
+이 README 의 모든 수치는 cell1/cell2 가 같은 듀얼포트 NVMe 를 두 랭크가 함께 쓰던 오구성
+상태에서 측정됐다(`DAOS-CONCURRENT-READ-CORRUPTION.md` §62). 드라이브를 분리한 뒤(랭크당 4 대,
+cell1 02~05 / cell2 06~09) GDS 엔진 빌드(`/opt/daos-gds`, 양 cell) + `ucx+rc_v` +
+클라이언트 `/opt/daos-gds-gpu` 로 같은 5-arm 벤치를 다시 돌렸다. 풀 `attr1`, 컨테이너 chunk 4 MiB,
+rd_fac:0, 요청 32 MiB, 8 GiB, client-5(H100 NVL, SNC). `NA_UCX_EXTRA_TLS=cuda_copy,cuda_ipc`.
+
+정합성: `dfs_gpu_rt` 4 KiB / 64 KiB / 1 MiB / 32 MiB 왕복 **ALL OK** (S16, RP_2G4 둘 다).
+
+| 컨테이너 | 워커 | `gpu` | `pinnedcopy` | `pinned` | gpu/staging | DRAM_x gpu / pinnedcopy |
+|---|---|---|---|---|---|---|
+| S16 | 1 | 6.17 | 10.77 | 13.42 | 0.57 | 0.11 / 0.10 |
+| S16 | 4 | 9.35 | 27.03 | 28.52 | 0.35 | 0.30 / 0.67 |
+| S16 | 16 | 16.01 | **35.12** | 35.33 | **0.46** | 0.29 / 1.88 |
+| RP_2G4 | 1 | 8.20 | 10.18 | 12.29 | 0.81 | 0.11 / 0.10 |
+| RP_2G4 | 4 | 12.52 | 22.02 | 14.52 | 0.57 | 0.20 / 0.75 |
+| RP_2G4 | 16 | 19.74 | 24.89 | 25.50 | 0.79 | 0.26 / 1.81 |
+
+읽는 법:
+- **GPU-direct 는 여전히 대역폭에서 진다.** 16 워커에서 S16 0.46배, RP_2G4 0.79배. `gpu` 는
+  16~20 GB/s 에 머물고(§"GPU BAR 쓰기는 QP 당 제한된다" 의 1 QP 천장 22 와 일치), 호스트 경로는
+  S16 에서 35 GB/s(랭크당 4 대로도 8 대 시절 35.6 재현)까지 간다. 그룹이 넓을수록(S16 = 16 샤드)
+  전송 단위가 작아져 GPU 경로만 더 손해를 보는 것도 그대로다(RP_2G4 19.7 vs S16 16.0).
+- **남는 이득도 그대로 DRAM 트래픽만이다**: 16 워커 DRAM_x 0.26~0.29 vs 1.8~1.9 (약 7×).
+- **오구성은 이 결론에 영향을 주지 않았다.** 전송 계층의 병목(QP 당 BAR write)은 스토리지와 무관하다.
+- **mercury 패치(`cuda_copy,cuda_ipc` TLS)가 호스트 전송을 깨뜨린다는 판정은 재검토가 필요하다.**
+  TLS on/off 에서 호스트 경로 대역폭은 같고(S16 16W pinnedcopy 35.12 vs 34.88), 당시의 "4 MiB
+  한 덩어리 손상" 은 공유 드라이브 오구성과 같은 시기·같은 증상이다. 여기서는 대역폭만 재봤고
+  호스트 경로 정합성은 `dfs_integrity` 로 따로 확인해야 한다. 패치 기본값 opt-in 은 그대로 둔다.
+
+**판정 유지: `DaosGdsBackend` 는 만들지 않는다**(`PLAN.md` §0 재개 조건 불변). 재측정 뒤 클러스터는
+운영 권고 구성(stockfull + `ofi+verbs;ofi_rxm`)으로 되돌렸다. GDS 경로는 UCX 전용이므로 다시 시험하려면
+양 cell `override.conf` 를 `/opt/daos-gds` 로, provider 를 `ucx+rc_v` 로, client-5 agent domain 을
+`mlx5_0:1` 로 바꾸고 재포맷해야 한다(약 10 분; 절차는 이 세션의 `deploy/README.md` §9 전송 교체와 같다).
+
+## 2026-09-06 GDS over `ofi+verbs;ofi_rxm` — 동작하고, 스테이징에 근접한다
+
+UCX 경로의 16~20 GB/s 를 "GPU BAR write 의 QP 당 하드웨어 천장" 으로 읽었던 것은 **틀렸다.** 같은 GDS 빌드·같은
+드라이브·같은 클라이언트에서 전송만 libfabric verbs 로 바꾸면 GPU-direct 가 35 GB/s 까지 올라간다. 병목은 UCX 경로 안에 있었다.
+
+### 필요했던 것 세 가지 (UCX 쪽 mercury 패치는 불필요)
+1. **cart 에 메모리 디바이스 지원 켜기**: `D_MEM_DEVICE=1`(또는 `D_GPU_DIRECT=1`). 초안의 cart 는
+   `crt_mem_device_enabled()` 가 참일 때만 mercury 에 `request_mem_device` 를 넘기고, 그래야 na_ofi 가 도메인을 `FI_HMEM` 으로 연다.
+   없으면 `NA_Mem_register() failed (NA_OPNOTSUPPORTED)`.
+2. **libfabric 을 CUDA 지원으로 빌드**: 초안 빌드의 libfabric 1.25 는 `--with-cuda` 없이 빌드돼 `FI_HMEM_CUDA not supported`.
+   `CPPFLAGS=-I/usr/local/cuda/include LDFLAGS="-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs" ./configure … --with-cuda=/usr/local/cuda --enable-cuda-dlopen`
+   (기본 `--with-cuda=DIR` 만으로는 configure 가 `-lcudart` 를 못 찾는다). 런타임에 `libcudart.so`·`libcuda.so`(버전 없는 이름) 를 dlopen 하므로
+   LD 경로에 심볼릭 링크가 필요하다(`/opt/ofi-cuda/lib64/libcudart.so -> /usr/local/cuda/lib64/libcudart.so.13`).
+3. **libfabric verbs 패치** `patches/libfabric-0001-verbs-cuda-dmabuf-and-close-fd.patch`(2 헝크):
+   - `vrb_mr_reg_common()` 이 dmabuf 등록 경로를 ZE/ROCR/SYNAPSEAI 에만 쓰고 **CUDA 는 `ibv_reg_mr` 로 떨어뜨린다** → peermem 없는
+     플랫폼에서 `-14 (Bad address)`. 조건에 `FI_HMEM_CUDA` 추가.
+   - `vrb_reg_hmem_dmabuf()` 가 `ibv_reg_dmabuf_mr()` 뒤 **dma-buf fd 를 닫지 않아 등록마다 fd 1 개 누수** → MR 캐시가 꺼진 상태에서 4 MiB
+     청크 2048 개(8 GiB) 를 읽으면 nofile 1024 에 걸려 `cuMemGetHandleForAddressRange: CUDA_ERROR_OPERATING_SYSTEM`. `close(fd)` 추가
+     (실측: 1.5 s 에 dmabuf fd 634 개 → 패치 후 1 개).
+   둘 다 ucx-0001 과 같은 "dmabuf-only 플랫폼 회귀" 성격이라 상류 제출 가치가 있다.
+
+### 결과 (분리 드라이브, GDS 엔진 `/opt/daos-gds`, `ofi+verbs;ofi_rxm`, client-5, chunk 4 MiB, 32 MiB 요청, 8 GiB)
+정합성: `dfs_gpu_rt` 4 KiB~32 MiB 왕복 ALL OK(S16, 3 회). fd 누수 없음.
+
+| 컨테이너 | 워커 | `gpu` | `pinnedcopy` | `pinned` | gpu/staging | (UCX 였을 때 gpu) |
+|---|---|---|---|---|---|---|
+| S16 | 1 | **11.63** | 10.42 | 12.80 | **1.12** | 6.17 |
+| S16 | 4 | 26.67 | 27.99 | 30.78 | 0.95 | 9.35 |
+| S16 | 16 | **35.26** (3 회 35.1~35.4) | 41.21 | 42.43 | **0.86** | 16.01 |
+| RP_2G4 | 1 | 11.88 | 10.38 | 13.21 | 1.14 | 8.20 |
+| RP_2G4 | 4 | 24.11 | 23.52 | 23.59 | 1.03 | 12.52 |
+| RP_2G4 | 16 | 23.85 | 23.48 | 24.34 | **1.02** | 19.74 |
+
+DRAM 트래픽(16W, S16, perf uncore_imc): `gpu` read 999 + write 887 MiB vs `pinnedcopy` 7557 + 7542 MiB → **약 8× 절감**, 전달 바이트당 0.23 vs 1.84.
+
+읽는 법:
+- verbs 에서는 GPU-direct 가 **1 워커에서 스테이징을 앞서고**(복사 한 단계가 없으니 당연한 방향), 16 워커에서도 0.86 배로 UCX 의 0.46 배와
+  차원이 다르다. RP_2G4 처럼 스토리지 쪽이 상한(24~25 GB/s)이면 두 경로가 같다 — 즉 GPU 경로 자체의 천장은 이 구성에서 최소 35 GB/s 이상이다.
+- 따라서 §4-2 의 "QP 당 22 GB/s" 는 perftest 조건(1 QP)의 사실이지만 DAOS 의 GPU 경로 상한을 설명하지 못한다. DAOS 는 16 xstream 에서 16 QP
+  로 밀어넣으므로 원래 22 에 갇힐 이유가 없었고, 실제로 UCX 만 갇혔다. UCX 쪽 손실(CUDA 목적지에 대한 프로토콜 선택, rndv 조각화 등)은
+  미규명이며 verbs 가 답이 된 이상 파지 않는다.
+- 호스트 스테이징도 verbs 가 UCX 보다 빠르다(S16 16W 41~42 vs 35).
+
+### 남은 문제
+- **RP_2 컨테이너에 GPU 소스로 쓰기(`dfs_write_gpu`)가 verbs 에서 실패**: 64 KiB 부터 follower(rank 1 tag 9) 로의 update 가 `DER_HG` →
+  15 s 뒤 `DER_CANCELED`. S16(복제 없음) 쓰기·읽기와 RP_2G4 **읽기**는 정상, UCX 에서는 RP_2G4 쓰기도 정상이었다. 서버 로그에 ERR 없음.
+  복제 update 의 follower 가 클라이언트 GPU 메모리를 bulk GET 하는 경로로 보이며 미규명. KV 캐시 용도는 rd_fac:0/S16 이라 영향 없음.
+- MR 캐시가 `uffd`/`memhooks` 모니터 초기화 실패("No space left on device")로 꺼져 있어 I/O 마다 등록한다. 등록 비용은 위 수치에 포함돼 있다.
+- 서버 측은 GDS 엔진 빌드(`/opt/daos-gds`) 가 필요했는가는 미확인 — 클라이언트 측 변경만이므로 stockfull 서버로도 될 가능성이 크다(다음 시험).
+
+### 판단에 미치는 영향
+이 문서 앞부분과 8/31 정정의 "GDS 는 실제 청크 크기에서 2 배 느리다 → `DaosGdsBackend` 를 만들지 않는다" 는 **UCX 경로에서만 성립하는
+결론**이었다. verbs(운영 권고 전송)에서는 대역폭 손실이 0.86~1.1 배로 사라지고 DRAM 절감 8 배만 남으므로, `PLAN.md` §0 의 재개 조건
+("GDS 가 실제 청크 크기에서 스테이징보다 느리지 않다")이 **충족됐다.** LMCache 수준 GDS 백엔드는 다시 검토 대상이다. 다음 확인 순서:
+(1) stockfull 서버 + GDS 클라이언트 조합, (2) 실제 KV 청크(28~40 MiB) 크기의 TTFT 비교, (3) 8-GPU 호스트에서의 DRAM 경합.
+
+## 2026-09-06 Phase 1 — stockfull 서버 + GDS 클라이언트 (서버 변경 불필요 확인)
+
+서버를 운영 구성(`/var/daos-stockfull` 2.9.100, `ofi+verbs;ofi_rxm`, 드라이브 분리) 그대로 두고 client-5 에서 GDS 클라이언트
+(`/opt/daos-gds-gpu` + `/opt/ofi-cuda` + `D_MEM_DEVICE=1`)만 썼다. 같은 풀에서 stockfull 클라이언트의 MP 스택(`kvlmc5`)이 동시에 돌고 있었다.
+
+- `dfs_gpu_rt` 4 KiB~32 MiB 왕복 **3/3 ALL OK** — GDS 초안 클라이언트와 stock 서버는 wire 호환이다(초안의 변경은 클라이언트 측 메모리
+  속성·등록 경로에 국한). `PLAN.md` §1 의 "서버 설정 변경을 요구하는 설계 금지" 제약을 GDS 가 만족한다.
+- MP 스택은 영향 없음(8001 응답 정상).
+
+| 워커 | `gpu` | `pinnedcopy` | `pinned` | gpu/staging |
+|---|---|---|---|---|
+| 1 | 11.50 | 10.22 | 12.43 | 1.13 |
+| 4 | 25.08 | 28.10 | 29.75 | 0.89 |
+| 16 | 35.33 | 41.99 | 42.09 | 0.84 |
+| 16, **40 MiB 요청**(Qwen3-14B 의 LMCache 청크 크기) | 35.10 | 40.22 | — | 0.87 |
+
+DRAM(16W): gpu 971+895 MiB vs pinnedcopy 7428+7357 MiB (8.0×). GDS 엔진 빌드로 잰 앞 절과 같은 값이다.
+
+다음 단계(Phase 2, 계획서 §2~§4 의 Phase 1~3 에 해당): v2 정렬 포맷 → `dfs_read_gpu`/`dfs_write_gpu` 바인딩(GPU slab 1 회 등록·재사용)
+→ in-process `DaosGdsBackend`(GPU 스테이징 + 페이지드 KV 로 D2D scatter) → 실제 KV 청크 TTFT 를 스테이징 경로와 비교.
+전제 조건은 컨테이너 이미지에 GDS 클라이언트 번들(`/opt/daos-gds-gpu` lib64 + `/opt/ofi-cuda` + CUDA 링크)을 넣는 것.
+
+## 2026-09-06 Phase 2 — in-process `DaosGdsBackend` end-to-end (vLLM + LMCache 0.5.2)
+
+계획서 §2~§4 의 세 단계를 구현해 client-5 에서 실제 KV 캐시로 검증했다(서버 stockfull + `ofi+verbs`, 컨테이너 `kvgds_s16`).
+- `lmcache_daos/serde_v2.py`: 4 KiB 헤더 페이지 + payload @4096, committed 플래그 + CRC, temp→`dfs_move` 원자 게시, `/v2` 네임스페이스. 단위 테스트 8/8.
+- `dfs_binding.py`: `dfs_read_gpu`/`dfs_write_gpu`(`daos_mem_attr_t`), `dfs_lookup`/`dfs_release`/`dfs_move`, `LMCACHE_DAOS_LIBDIR` 번들 선택. C shim 대신 ctypes
+  (계획서 §3 은 shim 을 권했지만 caller-owned sgl 로 충분했다). `tests/test_gds_binding.py`: torch GPU 버퍼 왕복 40 MiB 3/3, 4 MiB, 256 MiB 바이트 일치.
+- `lmcache_daos/gds_backend.py::DaosGdsBackend(AllocatorBackendInterface)`: `storage_plugins: ["daosgds"]` 로 로드(T-check 통과 — 0.5.2 의
+  `storage_plugin_launcher` 가 out-of-tree `module_path` 를 받는다). 자체 `GPUMemoryAllocator` 풀을 가지므로 스토리지 매니저가 store 객체를 GPU 로 복사해
+  넘기고(`allocate_and_copy_objects`), retrieve 는 GPU 객체를 할당해 `dfs_read_gpu` 로 채운 뒤 GPU 커넥터가 D2D scatter 한다. 런처 `deploy/launchers/run_vllm_gds_c5.sh`.
+
+구현 중 배운 계약 세 가지(각각 한 번씩 엔진을 죽였다):
+1. `batched_contains()` 는 bool 리스트가 아니라 **접두 히트 개수(int)** 를 돌려야 한다(매니저가 `keys[:n]` 으로 슬라이스). 틀리면 lookup 이 3 s 타임아웃을 반복해 TTFT 가 3.8 s 가 된다.
+2. `RemoteMetadata.serialize()` 는 RemoteBackend 가 프로세스 전역 포맷을 초기화해야 동작한다 → 플러그인은 자체 메타데이터(JSON, 헤더 페이지 안)를 쓴다.
+3. libfabric 의 CUDA 등록(`cuMemGetAddressRange`, dma-buf export)은 **호출 스레드에 CUDA 컨텍스트**가 있어야 한다. 스레드풀 워커는 없으므로
+   `CUDA_ERROR_INVALID_CONTEXT` → `DER_HG_FATAL` → 엔진 사망. 워커마다 한 번 `torch.cuda.set_device()` 로 컨텍스트를 올린다.
+
+### Part A — 재시작 후 콜드 hit(모든 청크 DAOS→GPU), Qwen3-14B, ms
+| ctx | GDS in-process 1번째 / 2번째 | MP verbs 콜드 | MP L1 warm | in-process 스테이징 콜드 | Hub in-process |
+|---|---|---|---|---|---|
+| 8K | **149 / 76** | 139 | 105 | 151~221 | 151 |
+| 16K | **119 / 118** | 158 | 85 | 251~444 | 298 |
+| 31K | **211 / 198** | 281 | 141 | — | 437 |
+
+retrieve 로그: 16K 2.5 GB 91 ms(백엔드 88 ms, 30.4 GB/s), 31K 4.84 GB 163 ms(157 ms, 33.2 GB/s). 31K hit 한 건 동안 호스트 DRAM 트래픽 read 893 + write 847 MiB(스테이징은 ~5 GB × 2).
+**콜드 hit 가 처음으로 L1 warm hit 수준에 왔다** — DAOS→L1→GPU 두 단계가 DAOS→GPU 한 단계가 됐기 때문이다. 게이트 3/3 PASS, put/get 오류 0.
+
+### Part B — 100 GB working set, 12 inflight, 149 쿼리
+| arm | avg | p50 | p95 | 집계 | populate |
+|---|---|---|---|---|---|
+| GDS in-process, 재시작 후 콜드 | 363 | 359 | 477 | 21.7 GB/s | 45 s |
+| GDS in-process, inflight 6 | 195 | 196 | **201** | 20.4 | — |
+| MP verbs 콜드(비교) | 216 | 210 | 295 | 36.2 | 42 s |
+| Hub in-process 스테이징 | 371 | 356 | 547 | 21.4 | 63 s |
+
+집계는 MP 에 진다. 스토리지가 아니라 **in-process 엔진이 요청별 retrieve 를 직렬로 실행**하기 때문이다(백엔드 로그의 640 MiB 읽기가 23~26 ms 씩
+순차로 찍힘 = 26~29 GB/s 단건, 겹침 없음; Hub §7-4a 가 지적한 구조 그대로). 대신 12 inflight 에서 p95 가 안정적이고(477, 큐잉만), inflight 6 에서는
+p95 201 ms 로 MP 의 151 에 근접한다. **DRAM: 100 GB 를 GPU 로 가져오는 동안 호스트 DRAM 트래픽이 read 4.5 + write 4.3 GB(0.09 B/B)** — 스테이징의 1.8~1.9 B/B
+대비 20 배 이상 절감으로, 계획서 §6 의 합격 기준(≤ 0.3 B/B)을 크게 넘는다.
+
+### async prefetch — 요청 간 겹침 (2026-09-06)
+`enable_async_loading: True` 면 스토리지 매니저가 **lookup 시점**(스케줄 전)에 백엔드의 `batched_async_contains` → `batched_get_non_blocking` 을 이벤트
+루프에서 돌려 결과를 이벤트 매니저로 retrieve 에 넘긴다(LocalCPUBackend 를 거치지 않음). 두 메서드를 구현해(스레드풀 read 를 `run_in_executor`
+로 gather, 접두 절단) 다음 요청의 DAOS→GPU 읽기가 현재 요청의 prefill 과 겹치게 했다. 계획서 §1 의 "GDS+async = hang" 은 in-tree GdsBackend 에
+이 메서드가 없어서 난 것이다.
+그런데 0.5.2 는 prefetch 직렬화기를 `AsyncSingleSerializer`(asyncio.Lock, 한 번에 한 요청)로 **하드코딩**하고, 청크 예산 가중 세마포어인
+`AsyncMultiSerializer` 는 같은 파일에 있으나 선택 경로가 없다. 플러그인 import 가 `StorageManager.__init__` 안(직렬화기 생성 전)에서 일어나므로
+그 이름을 우리 GPU 풀의 청크 예산으로 만든 multi 로 되묶는다(`DAOS_GDS_MULTI_PREFETCH=1`, 기본 on; 런처 `MULTI=`).
+
+| Part B 100 GB, 149 쿼리 | avg | p50 | p95 | 집계 |
+|---|---|---|---|---|
+| sync (재시작 후 콜드) | 363 | 359 | 477 | 21.7 GB/s |
+| async + single serializer | 303~311 | 319~328 | 349~356 | 25.5~26.1 |
+| **async + multi serializer**, 12 inflight | **285~302** | 290~299 | **320~345** | **26.5~27.7** |
+| async + multi, 6 inflight | 163 | 163 | **182** | 24.4 |
+| async + multi, 24 inflight (풀 10 GiB 부족) | 1512 | 1579 | 2512 | 10.6 |
+| MP verbs 콜드(비교) | 216 | 210 | 295 | 36.2 |
+
+Part A 콜드는 그대로(80 / 132~138 / 215~218 ms). 남은 격차(27.7 vs 36.2)는 엔진 쪽 — retrieve 의 `to_gpu` 청크 루프와 요청 단위 직렬 처리 — 이고 스토리지 읽기
+자체는 요청당 23~25 ms(26~30 GB/s)로 MP 어댑터와 같다. **GPU 풀은 inflight × KV 크기 이상**이어야 한다: 24 inflight × 640 MB = 15 GB > 10 GiB 인 런에서 백엔드 오류 355 줄과 함께 급락했다
+(정합성은 유지; 오류 분류 전에 컨테이너가 교체되어 "GPU buffer full → 접두 절단 → 재계산" 은 정황 추정이다 — 재현 시 `GPU buffer full` 카운트로 확정할 것). 가중 세마포어는 prefetch 동시성만 막고 소비 지연은 못 막으므로 여유를 둘 것
+(`GDS_GB`, `--gpu-memory-utilization` 과 상충).
+
+MR 캐시: mercury na_ofi 가 `FI_MR_CACHE_MAX_COUNT=0` 을 강제해 libfabric 캐시가 꺼진 상태(`ofi_mr_cache_init` → ENOSPC). 환경변수 덮어쓰기는 듣지 않고,
+16 워커 34.3~34.9 GB/s 로 대역폭 영향도 없어 그대로 둔다.
+
+### 판정
+- 단일 GPU·단일 요청 콜드 지연과 DRAM 은 GDS in-process 가 최선이고, 다중 요청 집계 처리량은 MP(pinned L1 + 서버측 겹침)가 최선이다.
+  8-GPU 호스트(계획서 §6)에서는 집계 = GPU 수 × 단일 GPU 이므로 엔진 직렬화가 GPU 단위로 병렬화되고 DRAM 절감이 결정적이 된다 — 미측정(장비 없음).
+- 남은 것: (1) `to_gpu` 청크 루프의 Python 고정비와 요청 단위 직렬 retrieve(§"운영 경로의 병목은 전송이 아니다") — 27.7 → 36 GB/s 의 격차, (2) RP_2 GPU 소스 쓰기 결함,
+  (3) libfabric 패치 2 건·multi serializer 선택 옵션의 상류 제출, (4) 8-GPU 실측.
+
 ## 알려진 한계
 
 - **측정 범위가 read 경로에 한정된다.** 대역폭·지연·cycles/byte·DRAM 트래픽·concurrency
