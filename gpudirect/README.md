@@ -1410,9 +1410,14 @@ DRAM 트래픽(16W, S16, perf uncore_imc): `gpu` read 999 + write 887 MiB vs `pi
 - 호스트 스테이징도 verbs 가 UCX 보다 빠르다(S16 16W 41~42 vs 35).
 
 ### 남은 문제
-- **RP_2 컨테이너에 GPU 소스로 쓰기(`dfs_write_gpu`)가 verbs 에서 실패**: 64 KiB 부터 follower(rank 1 tag 9) 로의 update 가 `DER_HG` →
-  15 s 뒤 `DER_CANCELED`. S16(복제 없음) 쓰기·읽기와 RP_2G4 **읽기**는 정상, UCX 에서는 RP_2G4 쓰기도 정상이었다. 서버 로그에 ERR 없음.
-  복제 update 의 follower 가 클라이언트 GPU 메모리를 bulk GET 하는 경로로 보이며 미규명. KV 캐시 용도는 rd_fac:0/S16 이라 영향 없음.
+- **복제 컨테이너(RP_2G1/RP_2G4/RP_3G1)에 GPU 소스로 쓰기(`dfs_write_gpu`)가 verbs 에서 실패/15 s 반복**(2026-09-06 서버 DEBUG 로 확정):
+  4 KiB(인라인)는 성공, 64 KiB 부터 bulk 가 필요한 update 마다 **서버 xstream 의 `obj_bulk_transfer(bulk_op GET)` 가 14 s 뒤 `HG_IO_ERROR`**
+  (`crt_hg_bulk_transfer_cb ret 22`, `obj_bulk_comp_cb bulk transfer failed: -1020`)로 끝나고 오류 응답 → 클라이언트 재시도 → 다음 15 s.
+  같은 프로세스에서 S16 의 bulk GET(모든 타깃)은 정상이고, 호스트 메모리 소스면 RP_2G4 쓰기도 정상이다(8 GiB pre-create). 즉 **복제 update 경로 +
+  GPU 소스 메모리 + verbs** 의 조합에서만 서버측 RDMA READ 가 완료되지 않는다(전송 재시도 소진 시간과 일치). UCX 에서는 정상이었다.
+  후보: 복제 update 에서 리더가 follower 로 넘기는 bulk 핸들의 HMEM 속성(디바이스 iface) 소실, 또는 follower→클라이언트 신규 연결 위 첫 RMA 의 CUDA MR 처리.
+  KV 캐시 용도는 rd_fac:0/S16 이라 영향 없음; 복제가 필요하면 GDS 쓰기 대신 호스트 경로로 쓰고 읽기만 GDS 로(읽기는 정상).
+- `daos_mem_attr_t.ma_rkey` 사전 등록 경로는 초안의 mercury `HG_Bulk_import_rkey` 가 **스텁**("not implemented", cart 는 -DER_NOSYS 폴백)이라 현재 빌드에서는 쓸 수 없다.
 - MR 캐시가 `uffd`/`memhooks` 모니터 초기화 실패("No space left on device")로 꺼져 있어 I/O 마다 등록한다. 등록 비용은 위 수치에 포함돼 있다.
 - 서버 측은 GDS 엔진 빌드(`/opt/daos-gds`) 가 필요했는가는 미확인 — 클라이언트 측 변경만이므로 stockfull 서버로도 될 가능성이 크다(다음 시험).
 
