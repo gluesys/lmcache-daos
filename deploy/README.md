@@ -321,4 +321,4 @@ GPU 메모리로 직접 읽고(`dfs_read_gpu`) GPU 에서 직접 쓴다. 호스�
 서버는 **stockfull 그대로**(전송 `ofi+verbs;ofi_rxm`, agent domain `mlx5_0`). 컨테이너 env: `LMCACHE_DAOS_LIBDIR`, `D_MEM_DEVICE=1`, LD 경로 선두에
 CUDA libfabric, `--ulimit nofile=65536`. 설정 `GDS_GB`(GPU 스테이징 풀, 기본 6; Part B 는 10, **inflight × KV 크기 이상**), `GPU_UTIL` 0.80, `ASYNC=True`(lookup 시점 prefetch 로 요청 간 겹침), `MULTI=1`(prefetch 직렬화기를 청크 예산 세마포어로 교체, 기본 on).
 결과(Qwen3-14B, verbs): 재시작 후 콜드 hit 8K 76~149 / 16K 118 / 31K 198~211 ms(MP verbs 139/158/281), 31K retrieve 33 GB/s GPU-direct, 요청당 호스트 DRAM
-~0.9 GB. Part B 12 inflight sync avg 363 / p95 477, 21.7 GB/s → async+multi 285~302 / 320~345, 26.5~27.7 GB/s(MP 36.2), inflight 6 p95 182, DRAM 0.09 B/B. 상세 `gpudirect/README.md`.
+~0.9 GB. Part B 12 inflight sync avg 363 / p95 477, 21.7 GB/s → async+multi 285~302 / 320~345, 26.5~27.7 GB/s(MP 36.2), inflight 6 p95 182, DRAM 0.09 B/B; 집계 상한은 GPU 목적지 RDMA write 경로(워커 수 무관). 상세 `gpudirect/README.md`.

@@ -156,10 +156,16 @@ class DaosGdsBackend(AllocatorBackendInterface):
         self.gpu_buffer_bytes = int(float(_cfg(config, "gpu_buffer_gb", 6)) * (1 << 30))
         self.store_enabled = bool(_cfg(config, "store", True))
 
+        self._tls = threading.local()
         self._dfs = DfsSys(pool=pool, cont=cont, sys=_cfg(config, "sys"))
         self._dfs.mkdir_p(self.root)
+        # Every pool thread binds the CUDA context up front (initializer): the
+        # DAOS client encodes another thread's fetch RPC -- and registers its
+        # GPU bulk buffer -- from whichever thread happens to drive progress,
+        # so a thread that only ever did stat() can hit the registration path.
         self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.io_workers, thread_name_prefix="daosgds-io")
+            max_workers=self.io_workers, thread_name_prefix="daosgds-io",
+            initializer=self._ensure_cuda_ctx)
         # Connect every target now (see MP-MODE-PLAN 7.7e); env DAOS_PROBE_CHUNKS.
         try:
             n = int(os.environ.get("DAOS_PROBE_CHUNKS", "64"))
@@ -177,7 +183,6 @@ class DaosGdsBackend(AllocatorBackendInterface):
         self._put_tasks: set = set()
         self.stats = {"put": 0, "put_bytes": 0, "get": 0, "get_bytes": 0, "miss": 0,
                       "alloc_fail": 0, "get_ms": 0.0, "put_ms": 0.0}
-        self._tls = threading.local()
         logger.info("DaosGdsBackend: pool=%s cont=%s root=%s device=%s gpu_buffer=%.1f GiB workers=%d",
                     pool, cont, self.root, self.dst_device, self.gpu_buffer_bytes / (1 << 30),
                     self.io_workers)
@@ -221,16 +226,35 @@ class DaosGdsBackend(AllocatorBackendInterface):
         except Exception:
             return 16
 
+    _cu = None          # libcuda handle (process-wide)
+    _cu_ctx = None      # retained primary context for device_id
+
     def _ensure_cuda_ctx(self) -> None:
         """libfabric's CUDA HMEM path calls cuMemGetAddressRange / dma-buf export
         on the *calling* thread; a pool thread that never touched CUDA has no
-        current context and fails with CUDA_ERROR_INVALID_CONTEXT (seen as
-        DER_HG_FATAL on the bulk). Make the device's primary context current
-        once per worker thread."""
-        if not getattr(self._tls, "ctx", False):
-            torch.cuda.set_device(self.device_id)
-            torch.cuda.current_stream(self.device_id)   # forces context creation on this thread
-            self._tls.ctx = True
+        current driver context and fails with CUDA_ERROR_INVALID_CONTEXT (seen
+        as DER_HG_FATAL on the bulk, and it killed the engine). torch's runtime
+        calls do not reliably bind the driver context on a fresh thread (worked
+        with 16 workers, failed with 24+), so bind it explicitly with the driver
+        API: retain the device's primary context once, cuCtxSetCurrent per thread."""
+        if getattr(self._tls, "ctx", False):
+            return
+        import ctypes
+        cls = type(self)
+        if cls._cu is None:
+            cu = ctypes.CDLL("libcuda.so.1")
+            rc = cu.cuInit(0)
+            if rc != 0:
+                raise RuntimeError(f"cuInit failed: {rc}")
+            ctx = ctypes.c_void_p()
+            rc = cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), ctypes.c_int(self.device_id))
+            if rc != 0:
+                raise RuntimeError(f"cuDevicePrimaryCtxRetain failed: {rc}")
+            cls._cu, cls._cu_ctx = cu, ctx
+        rc = cls._cu.cuCtxSetCurrent(cls._cu_ctx)
+        if rc != 0:
+            raise RuntimeError(f"cuCtxSetCurrent failed: {rc}")
+        self._tls.ctx = True
 
     # -- paths ------------------------------------------------------------------
     def _path(self, key: CacheEngineKey) -> str:
@@ -241,6 +265,7 @@ class DaosGdsBackend(AllocatorBackendInterface):
 
     # -- lookups ----------------------------------------------------------------
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        self._ensure_cuda_ctx()       # stat() may progress another thread's GPU bulk registration
         with self._known_lock:
             if key in self._known:
                 return True
