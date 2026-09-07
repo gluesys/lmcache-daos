@@ -29,7 +29,7 @@
  *
  * Output: one line per (direction, tid, round, chunk) with byte totals, then
  * per-(tid,round) object totals. Direction is by IPv4 source address:
- * 192.168.10.82/.84 (the cells' data interfaces) count as S->C, anything
+ * 203.0.113.82/.84 (the cells' data interfaces) count as S->C, anything
  * else as C->S.
  */
 #include <arpa/inet.h>
@@ -110,8 +110,8 @@ int main(int argc, char **argv)
 	if (argc > 2)
 		g_chunk = (size_t)strtoul(argv[2], NULL, 0) << 20;
 
-	srv_ips[0] = inet_addr("192.168.10.82");
-	srv_ips[1] = inet_addr("192.168.10.84");
+	srv_ips[0] = inet_addr("203.0.113.82");
+	srv_ips[1] = inet_addr("203.0.113.84");
 
 	FILE *f = fopen(argv[1], "rb");
 	if (!f) { perror(argv[1]); return 2; }

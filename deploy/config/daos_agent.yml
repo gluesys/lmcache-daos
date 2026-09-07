@@ -1,5 +1,5 @@
 name: daos_server
-access_points: ["10.100.230.81"]
+access_points: ["198.51.100.81"]
 transport_config:
   allow_insecure: true
 exclude_fabric_ifaces: ["ens4f1","eno1","eno2","eno3","docker0"]

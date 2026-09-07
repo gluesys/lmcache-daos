@@ -2885,7 +2885,7 @@ z
     </g>
    </g>
    <g id="text_9">
-    <!-- ens255np0  192.168.10.60/24   (RoCE) -->
+    <!-- ens255np0  203.0.113.60/24   (RoCE) -->
     <defs>
      <path d="M 43.40625 72.90625 
 L 52.6875 72.90625 
@@ -2948,7 +2948,7 @@ z
     </g>
    </g>
    <g id="text_10">
-    <!-- ens4f1     10.100.230.x  (mgmt) -->
+    <!-- ens4f1     198.51.100.x  (mgmt) -->
     <defs>
      <path d="M 51.90625 75.984375 
 L 51.90625 68.5 
@@ -3316,7 +3316,7 @@ z
     </g>
    </g>
    <g id="text_18">
-    <!-- ens255np0  192.168.10.17/24   (RoCE) -->
+    <!-- ens255np0  203.0.113.17/24   (RoCE) -->
     <g style="fill:#666666;" transform="translate(38.232 219.342191)scale(0.066 -0.066)">
      <use xlink:href="#DejaVuSansMono-101"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-110"/>
@@ -3357,7 +3357,7 @@ z
     </g>
    </g>
    <g id="text_19">
-    <!-- ens4f1     10.100.230.x  (mgmt) -->
+    <!-- ens4f1     198.51.100.x  (mgmt) -->
     <g style="fill:#666666;" transform="translate(38.232 226.750345)scale(0.066 -0.066)">
      <use xlink:href="#DejaVuSansMono-101"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-110"/>
@@ -3527,7 +3527,7 @@ z
     </g>
    </g>
    <g id="text_23">
-    <!-- 192.168.10.0/24 -->
+    <!-- 203.0.113.0/24 -->
     <g style="fill:#666666;" transform="translate(272.443266 174.959356)scale(0.074 -0.074)">
      <use xlink:href="#DejaVuSansMono-49"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-57"/>
@@ -4073,7 +4073,7 @@ z
     </g>
    </g>
    <g id="text_30">
-    <!-- mlx5_0  192.168.10.82 -->
+    <!-- mlx5_0  203.0.113.82 -->
     <g style="fill:#666666;" transform="translate(427.3488 152.323203)scale(0.067 -0.067)">
      <use xlink:href="#DejaVuSansMono-109"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-108"/>
@@ -4099,7 +4099,7 @@ z
     </g>
    </g>
    <g id="text_31">
-    <!-- mlx5_1  192.168.10.81 -->
+    <!-- mlx5_1  203.0.113.81 -->
     <g style="fill:#666666;" transform="translate(427.3488 159.843675)scale(0.067 -0.067)">
      <use xlink:href="#DejaVuSansMono-109"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-108"/>
@@ -4213,7 +4213,7 @@ z
     </g>
    </g>
    <g id="text_37">
-    <!-- mlx5_0  192.168.10.84 -->
+    <!-- mlx5_0  203.0.113.84 -->
     <g style="fill:#666666;" transform="translate(627.0048 152.323203)scale(0.067 -0.067)">
      <use xlink:href="#DejaVuSansMono-109"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-108"/>
@@ -4239,7 +4239,7 @@ z
     </g>
    </g>
    <g id="text_38">
-    <!-- mlx5_1  192.168.10.83 -->
+    <!-- mlx5_1  203.0.113.83 -->
     <g style="fill:#666666;" transform="translate(627.0048 159.843675)scale(0.067 -0.067)">
      <use xlink:href="#DejaVuSansMono-109"/>
      <use x="60.205078" xlink:href="#DejaVuSansMono-108"/>

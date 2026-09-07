@@ -14,5 +14,5 @@ NVIDIA H100 NVL, 610.57.04, 95830 MiB
 ---
 podman version 5.8.2
 PRETTY_NAME="Rocky Linux 10.2 (Red Quartz)"
-ens4f1           UP             10.100.230.6/24 
-ens255np0        UP             192.168.10.60/24 
+ens4f1           UP             198.51.100.6/24 
+ens255np0        UP             203.0.113.60/24 

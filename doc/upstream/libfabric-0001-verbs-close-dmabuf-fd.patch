@@ -1,0 +1,47 @@
+From: kim.kyeung.pyo <kpkim@gluesys.com>
+Subject: [PATCH] prov/verbs: close the dma-buf fd after ibv_reg_dmabuf_mr()
+
+vrb_reg_hmem_dmabuf() obtains a dma-buf file descriptor from
+ofi_hmem_get_dmabuf_fd() and hands it to ibv_reg_dmabuf_mr(), but never
+closes it. The MR keeps its own reference to the dma-buf, so the fd is
+only needed for the duration of the call; leaving it open leaks one fd
+per registration.
+
+With the MR cache disabled (e.g. Mercury sets FI_MR_CACHE_MAX_COUNT=0)
+every RDMA of GPU memory registers anew, and a process reading 8 GiB in
+4 MiB chunks accumulates ~2000 dma-buf fds, hits the default nofile
+limit (1024) and cuMemGetHandleForAddressRange() starts failing with
+CUDA_ERROR_OPERATING_SYSTEM. Observed with DAOS/Mercury over
+verbs;ofi_rxm on H100 + ConnectX-7 (dmabuf-only platform, no peermem):
+634 open dma-buf fds after 1.5 s of I/O; 1 after this change.
+
+Close the fd right after the registration attempt, preserving errno for
+the failover path.
+
+Signed-off-by: kim.kyeung.pyo <kpkim@gluesys.com>
+---
+ prov/verbs/src/verbs_mr.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/prov/verbs/src/verbs_mr.c b/prov/verbs/src/verbs_mr.c
+--- a/prov/verbs/src/verbs_mr.c
++++ b/prov/verbs/src/verbs_mr.c
+@@
+ #include <ofi_util.h>
++#include <unistd.h>
+ #include "verbs_ofi.h"
+@@ static struct ibv_mr *vrb_reg_hmem_dmabuf(enum fi_hmem_iface iface,
+ 	mr = ibv_reg_dmabuf_mr(pd, offset, len, (uint64_t)(uintptr_t)buf/* iova */,
+ 			       fd, vrb_access);
++	/*
++	 * The MR holds its own reference to the dma-buf; keeping the fd open
++	 * leaks one descriptor per registration (fatal for long runs when the
++	 * MR cache is disabled). Preserve errno across close().
++	 */
++	saved_errno = errno;
++	close(fd);
++	errno = saved_errno;
++	saved_errno = 0;
+ 
+ 	if (!mr && failover_policy[iface] == TRY &&
+ 	    vrb_gl_data.peer_mem_support) {

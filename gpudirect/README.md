@@ -1228,7 +1228,7 @@ client-6, 이 측정은 client-5 다. **둘을 가르지 않았으므로 어느 
 **이것은 상류 DAOS 이슈다.** 재현기는 `../tests/test_rawio_integrity.py` 하나로
 충분하다 — DAOS + Python 만 필요하고 LMCache·GPU·torch·모델이 불필요하다.
 
-##### 부수 기록: CI 클러스터(192.168.35.40/41/42)는 대조군이 못 된다
+##### 부수 기록: CI 클러스터(198.18.0.40/41/42)는 대조군이 못 된다
 
 접근은 되지만 `provider: ofi+verbs;ofi_rxm` 이다 — v4 문서가 "대용량 RDMA read 를 조용히
 손상시킨다" 고 특정하고 UCX 로 전환해 해결한 **바로 그 provider**. 여기서 손상이
@@ -1251,7 +1251,7 @@ rank 0·3 Excluded, `daos_server` 전부 inactive, 클라이언트/서버 빌드
    상대로 실패한 전례가 있다.
 2. **서버까지 스톡 재구축** — reformat 이 필요하고 그것은 **`gdspool` 파기 + SPDK wedge
    위험**이며 client-6 의 다른 사용자에게도 영향이 간다. 파괴적이므로 지시 없이 하지 않는다.
-3. **별도 CI 클러스터(192.168.35.40/41/42)** — 살아 있으나 **SSH 접근 권한이 없다**
+3. **별도 CI 클러스터(198.18.0.40/41/42)** — 살아 있으나 **SSH 접근 권한이 없다**
    (`hgichon`·`root` 모두 거부).
 
 **3번이 압도적으로 싸다.** 그 클러스터가 스톡 DAOS 라면 `tests/test_rawio_integrity.py`

@@ -1,5 +1,9 @@
 # lmcache-daos
 
+> **주소 표기 안내.** 이 저장소의 IP 주소는 모두 문서용 대역으로 치환돼 있다(RFC 5737/RFC 2544):
+> 관리망 `198.51.100.x`, RoCE 패브릭 `203.0.113.x`, 구 CI 클러스터 `198.18.0.x`, ExaCI4 `192.0.2.x`, 그 밖의 실험망 `198.18.1.x`/`198.18.2.x`.
+> 호스트 suffix 는 원본과 같으므로 문서 안의 상호 참조는 그대로 유효하다. 실제 주소는 사내 문서를 참조할 것.
+
 LMCache의 KV cache 오프로딩 백엔드를 **DAOS**로 구현하는 프로젝트.
 LMCache의 `RemoteConnector` 인터페이스에 커넥터를 붙여, KV 청크를
 DAOS DFS(`dfs_sys` API) 네임스페이스의 self-describing 파일로 저장한다.
@@ -268,9 +272,9 @@ extra_config:
 
 ## 검증 결과 (2026-07-30, ExaCI5-4 CI)
 
-환경: 클라 192.168.35.40 (Rocky 8.10, NVIDIA A2 15356MiB, 드라이버 610.43.02,
+환경: 클라 198.18.0.40 (Rocky 8.10, NVIDIA A2 15356MiB, 드라이버 610.43.02,
 CUDA 13.3, torch 2.11.0+cu130) / DAOS 2.9.100 서버 4 rank (.41 rank0·1, .42 rank2·3,
-`ofi+verbs;ofi_rxm` on ib0 172.30.44.0/24) / vLLM 0.26.0 + LMCache 0.5.2 /
+`ofi+verbs;ofi_rxm` on ib0 198.18.1.0/24) / vLLM 0.26.0 + LMCache 0.5.2 /
 모델 Qwen3-1.7B.
 
 ### 기능 검증
