@@ -3,6 +3,8 @@
 > **주소 표기 안내.** 이 저장소의 IP 주소는 모두 문서용 대역으로 치환돼 있다(RFC 5737/RFC 2544):
 > 관리망 `198.51.100.x`, RoCE 패브릭 `203.0.113.x`, 구 CI 클러스터 `198.18.0.x`, ExaCI4 `192.0.2.x`, 그 밖의 실험망 `198.18.1.x`/`198.18.2.x`.
 > 호스트 suffix 는 원본과 같으므로 문서 안의 상호 참조는 그대로 유효하다. 실제 주소는 사내 문서를 참조할 것.
+>
+> **미러링.** 이 저장소는 사내 GitLab(`exastor/lmcache-daos`)이 상류이고, `main` 은 GitHub `gluesys/lmcache-daos` 로 자동 push mirror 된다. GitHub 쪽에 직접 푸시하지 말 것 — 미러가 덮어쓴다.
 
 LMCache의 KV cache 오프로딩 백엔드를 **DAOS**로 구현하는 프로젝트.
 LMCache의 `RemoteConnector` 인터페이스에 커넥터를 붙여, KV 청크를
