@@ -17,7 +17,7 @@ OUT=${1:?outdir}
 TRIES=${2:-6}
 ROUNDS=${3:-10}
 IFACE=${IFACE:-ens255np0}
-FILTER='tcp and (src host 192.168.10.82 or src host 192.168.10.84)'
+FILTER='tcp and (src host 203.0.113.82 or src host 203.0.113.84)'
 BIN=${BIN:-/root/obj_integrity_28}
 
 mkdir -p "$OUT"

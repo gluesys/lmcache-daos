@@ -30,18 +30,18 @@ client-6 의 `/root` 에만 있었다:
 ```
 client-6 (io500-6)   Rocky Linux 10.2, podman 5.8.2
                      H100 NVL 95830 MiB, driver 610.57.04
-                     ens4f1     10.100.230.6/24    관리
-                     ens255np0  192.168.10.60/24   RoCE 400GbE (mlx5_0)
+                     ens4f1     198.51.100.6/24    관리
+                     ens255np0  203.0.113.60/24   RoCE 400GbE (mlx5_0)
 
 client-7 (io500-7)   Rocky Linux 8.10, podman 4.9.4-rhel   ← Part C 에서 2번째 노드로 사용
                      H100 NVL, driver 610.43.02
-                     ens255np0  192.168.10.17/24
+                     ens255np0  203.0.113.17/24
 
-cell1  DAOS rank0    ens2 192.168.10.82 (mlx5_0), ens1 192.168.10.81 (mlx5_1)
-cell2  DAOS rank1    ens2 192.168.10.84,          ens1 192.168.10.83
+cell1  DAOS rank0    ens2 203.0.113.82 (mlx5_0), ens1 203.0.113.81 (mlx5_1)
+cell2  DAOS rank1    ens2 203.0.113.84,          ens1 203.0.113.83
 ```
 
-- 접속 경로: `tta1 → cell1 → client-*`. **client 노드끼리는 직결 SSH 가 없다** — 전송은 cell1 을 릴레이로 쓰고, 속도가 필요하면 RoCE IP(`192.168.10.x`)를 쓴다(실측 ~930 MB/s).
+- 접속 경로: `tta1 → cell1 → client-*`. **client 노드끼리는 직결 SSH 가 없다** — 전송은 cell1 을 릴레이로 쓰고, 속도가 필요하면 RoCE IP(`203.0.113.x`)를 쓴다(실측 ~930 MB/s).
 - `/etc/hosts` 상 `client-N` == `io500-N` (.1 ~ .7). **client-5 는 공개키가 등록되어 있지 않아** 사용 불가였다.
 - ⚠️ cell 노드의 **OS 디스크는 `nvme24n1`** 이다. `dd if=/dev/zero of=/dev/nvme*n1` 같은 와일드카드는 절대 쓰지 말 것 (한 번 GPT+ESP 를 날려 복구해야 했다).
 

@@ -237,7 +237,7 @@ arm 분리 플래그(한 번에 하나만 바꿀 때):
 ⚠️ 2026-09-01 에 서버를 2.8.0-rc3 으로 되돌렸다(§13.2). 아래는 그 전 상태이며, 접속 경로와
 운영 함정은 그대로 유효하다.
 
-접속: `ssh tta1` → cell1 (116.89.174.82:20022). client-* 는 cell1 을 릴레이로 접속.
+접속: `ssh tta1` → cell1 (203.0.113.10:20022). client-* 는 cell1 을 릴레이로 접속.
 **client 노드끼리 직결 SSH 없음.**
 
 | 호스트 | 역할 | 비고 |
@@ -261,7 +261,7 @@ cell1 빌드 트리:
 - ⚠️ **두 트리가 빌드 디렉터리를 공유**(`/var/daosbuild/build-gpu`). 패치 버전을 재빌드하려면
   패치를 다시 적용해야 한다.
 
-CI 클러스터 192.168.35.40/41/42 (`root`, 자격증명은 사용자가 세션에서 제공):
+CI 클러스터 198.18.0.40/41/42 (`root`, 자격증명은 사용자가 세션에서 제공):
 **대조군으로 쓰지 말 것.** provider 가 `ofi+verbs;ofi_rxm` — v4 문서가 "대용량 RDMA read
 를 조용히 손상시킨다" 고 특정해 UCX 로 전환한 그 provider다. 여기서 재현되면 RxM 버그를
 본 것이고 "스톡에서도 재현 → 우리 패치 무죄" 라는 거짓 결론이 된다. 추가로 VM(QEMU
@@ -612,7 +612,7 @@ wire 포맷 차이 때문일 가능성은 배제했다: 패치 mercury 와 스�
 3. drop-in 을 `/usr/bin/daos_server` 로 교체 + `daemon-reload`
 4. 2.9 메타데이터 제거: `/var/daos/control_meta/daos_control/control_raft`, `/mnt/daos0/*`,
    root shmem `ipcrm` → **여기서 풀이 파기된다**
-5. 기동 → `dmg -i storage format`(cell1) + **`dmg -i -l 10.100.230.82 storage format`**(cell2 는
+5. 기동 → `dmg -i storage format`(cell1) + **`dmg -i -l 198.51.100.82 storage format`**(cell2 는
    명시 필요) → 양 rank Joined
 6. `dmg -i pool create gdspool --scm-size=8G --nvme-size=200G` (416 GB)
 7. client-5: cell1 `/opt/daos` 를 **같은 경로로** rsync, `libna_plugin_ucx.so`→`/usr/lib64/mercury`,
@@ -1134,7 +1134,7 @@ clobber"(S4)는 계측으로 제거. §19.2 의 "chunk 전체 = 다른 객체" �
 
 # 20. ★★★ 손상이 안 나는 대조 클러스터 — 차이는 bio 백엔드 class (2026-09-01)
 
-사용자 제공: **192.168.34.30/31/32(ExaCI4)에서는 재현 안 됨.** 접속 `root/gluesys!!`(직결,
+사용자 제공: **192.0.2.30/31/32(ExaCI4)에서는 재현 안 됨.** 접속 root 직결(자격증명은 사내 문서 참조,
 dev 박스에서). 34.30=client(`ExaCI4-3J`), 34.31=server(`FlexA_3433_1-A`), access_points=[34.31].
 
 ## 20.1 두 환경 비교
@@ -1357,12 +1357,12 @@ targets 1 / helpers 0 유지.
 ## 23.1 절차 (재현용)
 
 ```bash
-# 34.31 (root/gluesys!!, dev 박스 직결). 두 데이터 디바이스 = 0000:00:03.0/04.0 = nvme0/1
+# 34.31 (root 직결, 자격증명은 사내 문서 참조). 두 데이터 디바이스 = 0000:00:03.0/04.0 = nvme0/1
 nvme id-ns /dev/nvme0n1 -H | grep "LBA Format"   # lbaf 4 = 4096B 지원 확인
 nvme format /dev/nvme{0,1}n1 --lbaf=4 --force    # 512B -> 4096B (내용 파기)
 cat /sys/block/nvme0n1/queue/logical_block_size   # 4096 확인
 ```
-기동 함정 4건: ① `ib0` 에 IPv4 없음 → `fabric_iface: ens19`(10.10.34.31), provider 는
+기동 함정 4건: ① `ib0` 에 IPv4 없음 → `fabric_iface: ens19`(198.18.2.31), provider 는
 §15.5 로 비-gate 이므로 `ofi+tcp` 로 대체 ② `/var/run/daos_server` 디렉터리 필요
 ③ nohup/setsid 로는 ssh 종료 시 죽음 → `systemd-run --unit=... --collect`
 ④ 34.31 은 daos-devel 없음 → cell1 의 `/var/daos-stockfull/include` 를 복사하고
@@ -3092,7 +3092,7 @@ Data Verification failed (object: [CSUM]OBJ (…3237998091.1.2, [8]) shard 1,
 - 구성이 평범하다 — MD-on-SSD, POSIX 컨테이너, 4 MiB 청크, RP_2G1/S1 무관(§45)
 
 **노출을 좁히는 것:**
-- **하드웨어 의존성.** VM/가상 NVMe 는 재현되지 않고, **다른 실물 클러스터(192.168.34.x)는
+- **하드웨어 의존성.** VM/가상 NVMe 는 재현되지 않고, **다른 실물 클러스터(192.0.2.x)는
   nvme blob 으로 통과**했다. 우리 드라이브는 Phison 5302(PASCARI). 즉 모든 DAOS 배포가
   아니라 특정 드라이브/펌웨어 계열일 가능성이 크다 — 끝까지 규명하지 못한 축이다
 - **포맷 경계.** 첫 런 21/21 대 이후 1/18(§34)
@@ -3164,7 +3164,7 @@ DAOS 는 체크섬이 기본 off 이므로, 이 기본값이 곧 노출이다.
 "배포 직후 한 번"이 아니다.
 
 노출을 실제로 좁히는 것은 이제 두 가지만 남는다:
-1. **하드웨어 의존성** — VM 은 재현되지 않고 다른 실물 클러스터(192.168.34.x)는 통과했다.
+1. **하드웨어 의존성** — VM 은 재현되지 않고 다른 실물 클러스터(192.0.2.x)는 통과했다.
    우리 드라이브는 Phison 5302. 끝까지 규명하지 못한 축이며 **가장 중요한 미지수**다.
 2. **체크섬**(§49) — 켜 두면 조용한 유실이 아니라 `DER_CSUM` + RAS 이벤트가 된다.
 
@@ -3178,7 +3178,7 @@ DAOS 는 체크섬이 기본 off 이므로, 이 기본값이 곧 노출이다.
 | **완화** | targets 를 낮추면 비율이 내려간다(§46, 10.8 배 축) — 성능 대가가 크므로 임시 수단 |
 
 ## 50.5 남은 것
-1. **하드웨어 축 규명** — 192.168.34.x 가 통과한 이유. 드라이브 모델/펌웨어/큐 특성 비교.
+1. **하드웨어 축 규명** — 192.0.2.x 가 통과한 이유. 드라이브 모델/펌웨어/큐 특성 비교.
    이제 이것이 "누가 영향을 받는가"를 결정하는 유일한 미지수다. **1 순위.**
 2. 업스트림 티켓 — §34 레시피 + `targets: 4`(53 %) + §50(초기 적재 전체가 창) +
    §49(체크섬이 잡는다)로 심각도와 완화책을 함께 제시한다.
@@ -3187,15 +3187,15 @@ DAOS 는 체크섬이 기본 off 이므로, 이 기본값이 곧 노출이다.
 
 # 51. ★★ 하드웨어 축 — "통과한 실물 클러스터"는 실물이 아니었다 (2026-09-02)
 
-§50.5 의 1 순위. §22 이후로 "다른 실물 클러스터(192.168.34.x)는 통과했다"를
+§50.5 의 1 순위. §22 이후로 "다른 실물 클러스터(192.0.2.x)는 통과했다"를
 노출을 좁히는 근거로 계속 인용해 왔다. **그 전제가 틀렸다.**
 
 ## 51.1 확인
 
 ```
-192.168.34.30  ExaCI4-3J        systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
-192.168.34.31  FlexA_3433_1-A   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
-192.168.34.32  FlexA_3433_1-B   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+192.0.2.30  ExaCI4-3J        systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+192.0.2.31  FlexA_3433_1-A   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
+192.0.2.32  FlexA_3433_1-B   systemd-detect-virt: kvm   Standard PC (i440FX + PIIX, 1996)
 ```
 
 NVMe 도 실물이 아니다:
@@ -3355,7 +3355,7 @@ DAOS 는 청크당 4 MiB 를 한 번에 쓰므로 bdev 계층이 **여러 NVMe �
 | 데이터 NVMe | **SAMSUNG MZQL23T8HCLS-00A07** ×2 (`d9`, `da`) | 동일 ×2 (`da`, `db`) | — |
 | 펌웨어 / MDTS | `GDC5602Q` / 9 (2 MiB) | 동일 | — |
 | OS | Rocky 8.10 (cell1 과 동일) | 동일 | 동일 |
-| 네트워크 | `ofi+tcp` over `ens3907f0`, 10.100.230.x | 동일 | 동일 |
+| 네트워크 | `ofi+tcp` over `ens3907f0`, 198.51.100.x | 동일 | 동일 |
 
 **400G NIC 은 필요하지 않았다** — cell1/cell2 도 `ofi+tcp` 평범한 이더넷으로 돌고,
 전송·프로바이더 축은 §17·§18 에서 이미 배제됐다.

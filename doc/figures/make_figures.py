@@ -182,7 +182,7 @@ def fig_arch():
         fill=FILL)
 
     box(ax, ix + iw * 0.16, 5.7, iw * 0.68, 4.0, tal="center", ts=7.6,
-        title="ConnectX  mlx5_0  ·  ens255np0  192.168.10.60/24",
+        title="ConnectX  mlx5_0  ·  ens255np0  203.0.113.60/24",
         mono_title=True, fill=FILL2)
 
     for y0, y1 in [(74.1, 72.5), (64.1, 62.5), (56.9, 55.3), (30.3, 28.7),
@@ -285,9 +285,9 @@ def fig_bed():
 
     # 서빙 노드 (세로 배치)
     for k, (nm, alt, ip, os_, drv, role) in enumerate([
-            ("client-6", "io500-6", "192.168.10.60/24", "Rocky 10.2 · podman 5.8.2",
+            ("client-6", "io500-6", "203.0.113.60/24", "Rocky 10.2 · podman 5.8.2",
              "driver 610.57.04", "주 측정 노드"),
-            ("client-7", "io500-7", "192.168.10.17/24", "Rocky 8.10 · podman 4.9.4",
+            ("client-7", "io500-7", "203.0.113.17/24", "Rocky 8.10 · podman 4.9.4",
              "driver 610.43.02", "크로스노드 검증")]):
         by = 72.5 - k * 17.5
         box(ax, 3.0, by, 21.5, 15.5, ts=9.0, ls=6.6,
@@ -298,7 +298,7 @@ def fig_bed():
                    ("lmcache-daos  DaosConnector", "m"),
                    ("daos_agent  (domain mlx5_0:1)", "m"),
                    ("ens255np0  " + ip + "   (RoCE)", "m"),
-                   ("ens4f1     10.100.230.x  (mgmt)", "m")],
+                   ("ens4f1     198.51.100.x  (mgmt)", "m")],
             fill=("white" if k == 0 else "#fbfaf9"),
             edge=(ACC if k == 0 else "#c9c6c0"), lw=(1.6 if k == 0 else 0.9))
         ax.text(23.0, by + 13.7, role, fontsize=6.9, color=(ACC if k == 0 else GREY),
@@ -306,15 +306,15 @@ def fig_bed():
 
     # 스위치
     box(ax, 30.0, 62.5, 12.0, 11.0, ts=9.2, tal="center", ha_body="center",
-        title="400GbE", lines=[("RoCE v2 switch", "m"), ("192.168.10.0/24", "m")],
+        title="400GbE", lines=[("RoCE v2 switch", "m"), ("203.0.113.0/24", "m")],
         fill=FILL2)
 
     # DAOS
     box(ax, 47.0, 51.0, 50.0, 37.0, fill="white", edge="#c9c6c0")
     ax.text(48.8, 86.4, "ExaStor 2.8  듀얼 컨트롤러  (DAOS 2 rank)", fontsize=9.4,
             color=INK, fontweight="bold", va="top")
-    for k, (nm, rk, p0, p1) in enumerate([("cell1", "rank 0", "192.168.10.82", "192.168.10.81"),
-                                          ("cell2", "rank 1", "192.168.10.84", "192.168.10.83")]):
+    for k, (nm, rk, p0, p1) in enumerate([("cell1", "rank 0", "203.0.113.82", "203.0.113.81"),
+                                          ("cell2", "rank 1", "203.0.113.84", "203.0.113.83")]):
         box(ax, 48.8 + k * 23.5, 65.5, 22.0, 16.2, ts=8.6, ls=6.7,
             title="%s  ·  %s" % (nm, rk),
             lines=[("daos_engine", "m"), ("targets 8", "m"),
