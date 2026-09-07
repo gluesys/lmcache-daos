@@ -1,5 +1,30 @@
---- prov/verbs/src/verbs_mr.c.orig	2026-09-06 00:20:24.809900845 +0900
-+++ prov/verbs/src/verbs_mr.c	2026-09-06 00:31:20.008014450 +0900
+Subject: [PATCH] prov/verbs: register CUDA memory via dma-buf, and close the fd
+
+Two fixes needed on a dmabuf-only platform (NVIDIA open kernel module, no
+peermem -- DOCA 3.4 does not export ib_register_peer_memory_client):
+
+1. vrb_mr_reg_common() routed only ZE/SYNAPSEAI/ROCR through the dma-buf
+   registration helper and fell back to ibv_reg_mr() for CUDA, which fails
+   with EFAULT (-14) when there is no peer-memory client. Add FI_HMEM_CUDA.
+   (Upstream main already does this via `iface != FI_HMEM_SYSTEM`; this
+   hunk is only needed for the 1.25 tree DAOS bundles.)
+
+2. vrb_reg_hmem_dmabuf() never closed the dma-buf fd obtained from
+   ofi_hmem_get_dmabuf_fd(). The MR holds its own reference, so the fd is
+   only needed for the call; leaving it open leaks one fd per registration.
+   With the MR cache disabled (Mercury forces FI_MR_CACHE_MAX_COUNT=0),
+   reading 8 GiB in 4 MiB chunks exhausts nofile=1024 and
+   cuMemGetHandleForAddressRange() then fails with
+   CUDA_ERROR_OPERATING_SYSTEM. Measured: 634 open dma-buf fds after 1.5 s
+   of I/O; 1 after this change.
+
+Applies to the libfabric 1.25 tree that DAOS builds as a prerequisite.
+See gpudirect/README.md, section "GDS over ofi+verbs".
+---
+diff --git a/prov/verbs/src/verbs_mr.c b/prov/verbs/src/verbs_mr.c
+index eb86c0272..f8bacfd41 100644
+--- a/prov/verbs/src/verbs_mr.c
++++ b/prov/verbs/src/verbs_mr.c
 @@ -32,6 +32,7 @@
   */
  
@@ -8,7 +33,7 @@
  #include "verbs_ofi.h"
  
  static int vrb_mr_close(fid_t fid)
-@@ -86,6 +87,13 @@
+@@ -86,6 +87,13 @@ static struct ibv_mr *vrb_reg_hmem_dmabuf(enum fi_hmem_iface iface,
  
  	mr = ibv_reg_dmabuf_mr(pd, offset, len, (uint64_t)buf/* iova */,
  			       fd, vrb_access);
@@ -22,7 +47,7 @@
  	if (!mr && failover_policy[iface] == TRY &&
  	    vrb_gl_data.peer_mem_support) {
  		saved_errno = errno;
-@@ -145,7 +153,8 @@
+@@ -145,7 +153,8 @@ vrb_mr_reg_common(struct vrb_mem_desc *md, int vrb_access, const void *base_addr
  	else if (vrb_gl_data.dmabuf_support &&
  		 (iface == FI_HMEM_ZE ||
  		  iface == FI_HMEM_SYNAPSEAI ||

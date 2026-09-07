@@ -2,8 +2,8 @@
 #
 # Apply the GPU-direct fixes to a DAOS source tree and its bundled deps.
 #
-# Two stages, because UCX and Mercury sources only exist after a first build
-# pass has downloaded them:
+# Two stages, because the bundled UCX, Mercury and libfabric sources only
+# exist after a first build pass has downloaded them:
 #
 #   ./apply-patches.sh daos <daos-src> [<build-root>]
 #   ./apply-patches.sh deps <daos-src> <build-root>
@@ -49,10 +49,20 @@ apply_git() {
 
 # Mercury's tree already carries DAOS's own patch series as uncommitted
 # changes, so a git-based check would see them too. Use plain patch(1) there.
+#
+# patch(1) also mis-reports the state once that series has shifted the
+# surrounding lines: BOTH the forward and the reverse dry-run then fail even
+# though the change is in, and the stage dies before it reaches the patches
+# that come after it. Take a marker string as a third argument -- a token the
+# patch introduces and nothing else uses -- and trust it over the dry-runs.
 apply_plain() {
-	local tree=$1 patch=$2 name
+	local tree=$1 patch=$2 marker=${3:-} name
 	name=$(basename "$patch")
 
+	if [ -n "$marker" ] && grep -rqF -- "$marker" "$tree" 2>/dev/null; then
+		say "$name: already applied (marker '$marker' present)"
+		return 0
+	fi
 	if patch -d "$tree" -p1 --dry-run --reverse --force <"$patch" >/dev/null 2>&1; then
 		say "$name: already applied"
 		return 0
@@ -98,20 +108,29 @@ deps)
 	[ $# -ge 3 ] || { echo "  deps stage needs <build-root>" >&2; usage; }
 	UCX=$BUILD_ROOT/external/release/ucx
 	HG=$BUILD_ROOT/external/release/mercury
+	OFI=$BUILD_ROOT/external/release/ofi
 	echo "== bundled deps under: $BUILD_ROOT"
-	for d in "$UCX" "$HG"; do
+	for d in "$UCX" "$HG" "$OFI"; do
 		[ -d "$d" ] || { echo "  $d not found -- run a build pass first" >&2; exit 1; }
 	done
 
 	apply_git "$UCX" "$PATCHES/ucx-0001-advertise-cuda-reg-via-dmabuf.patch"
-	apply_plain "$HG" "$PATCHES/mercury-0001-keep-cuda-memtype-tls.patch"
+	apply_plain "$HG" "$PATCHES/mercury-0001-keep-cuda-memtype-tls.patch" NA_UCX_EXTRA_TLS
+	apply_git "$OFI" "$PATCHES/libfabric-0001-verbs-cuda-dmabuf-and-close-fd.patch"
 
 	cat <<-'WARN'
 
 	  ---------------------------------------------------------------------
-	  These two patches exist to make dfs_read_gpu()/dfs_write_gpu() work.
-	  They are NOT wanted by the production (host-memory) path, and one of
-	  them used to break it.
+	  All three patches exist to make dfs_read_gpu()/dfs_write_gpu() work.
+
+	  The libfabric one is the safe one: it only affects registration of
+	  device memory (FI_HMEM_CUDA), which the host path never asks for, and
+	  it plugs an fd leak that would otherwise kill long GPU-direct runs.
+	  It is also inert unless libfabric is configured --with-cuda; see
+	  README.md, section "GDS over ofi+verbs", for that configure line.
+
+	  The UCX and Mercury pair is NOT wanted by the production (host-memory)
+	  path, and one of them used to break it.
 
 	  The Mercury patch adds UCX memory-type components (cuda_copy,
 	  cuda_ipc) to the TLS list. An earlier version did that by DEFAULT, and
@@ -136,16 +155,27 @@ deps)
 
 	cat <<-EOF
 
-	  Rebuild both components straight into PREFIX -- DAOS loads the prereq
+	  Rebuild the components straight into PREFIX -- DAOS loads the prereq
 	  .so by path, so it needs no relink:
 	    (cd $UCX && make -j"\$(nproc)" && make install)
 	    (cd $HG.build && make -j"\$(nproc)" && make install)
+	    (cd $OFI && make -j"\$(nproc)" && make install)
+
+	  libfabric only picks the dma-buf path up if it was configured with
+	  CUDA, and plain --with-cuda=DIR is not enough (its -lcudart probe
+	  fails). Reconfigure it once with:
+	    CPPFLAGS=-I/usr/local/cuda/include \\
+	    LDFLAGS="-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs" \\
+	      ./configure --prefix=<prefix> ... --with-cuda=/usr/local/cuda \\
+	      --enable-cuda-dlopen
+	  and make sure unversioned libcudart.so / libcuda.so exist on the
+	  runtime LD path -- libfabric dlopens those names.
 	  Then re-apply the RPATH scons uses, or the modules will not find libucs:
 	    patchelf --set-rpath '\$ORIGIN':<prefix>/prereq/release/ucx/lib64 \\
 	        <prefix>/prereq/release/ucx/lib64/{*.so*,ucx/*.so*}
 
 	  Do NOT run 'scons --build-deps=yes' after this. It does
-	  'git reset --hard' on the prereq trees, which silently discards both
+	  'git reset --hard' on the prereq trees, which silently discards these
 	  patches -- the build then succeeds and only fails at runtime, with
 	  ucp_mem_map() returning -EINVAL again. If you must re-run it, re-run
 	  this deps stage and the two rebuilds afterwards.
