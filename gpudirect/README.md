@@ -47,6 +47,7 @@ CUDA 는 필요 없다.
 | `daos-0004-replace-broken-rkey-patch` | `error: corrupt patch at line 97` | 초안의 `deps/patches/mercury/0006_import_rkey.patch` 가 손상돼 있다. 헝크 라인 수가 틀리고, diff 뒤 `--` 종료자 다음에 산문(`Design notes:`)이 붙어 git·GNU patch 모두 파싱하지 못한다. 헝크 헤더의 문맥 문자열이 *그 패치가 추가한 함수명* 이라 git 생성물이 아니다. 63줄 정본 스텁으로 교체 |
 | `ucx-0001-advertise-cuda-reg-via-dmabuf` | `ucp_mem_map()` = `Input/output error` | `uct_ib_check_gpudirect_driver()` 가 CUDA 등록 가능 여부를 **legacy peermem sysfs 3경로 존재로만** 판정한다. `uct_ib_md_check_dmabuf()` 는 dmabuf 지원을 따로 인식하지만 `reg_mem_types` 에 반영하지 않는다. DOCA 3.4 는 `ib_register_peer_memory_client` 를 export 하지 않아 이 게이트는 영구히 통과할 수 없다 |
 | `mercury-0001-keep-cuda-memtype-tls` | `ucp_mem_map()` = `Invalid parameter` | `na_ucp_config_init()` 이 UCX TLS 를 provider 프로토콜명(`rc_v`)으로 고정한다. `cuda_copy`/`cuda_ipc` 는 네트워크 전송이 아니라 메모리 타입 컴포넌트인데 같은 TLS 목록으로 걸러지므로, dmabuf FD 제공자가 사라지고 `ibv_reg_mr()` 이 device 주소에 대해 EINVAL 을 낸다 |
+| **`libfabric-0001-verbs-cuda-dmabuf-and-close-fd`** | `fi_mr_regattr()` = `-14 (Bad address)`, 그리고 긴 실행에서 `cuMemGetHandleForAddressRange: CUDA_ERROR_OPERATING_SYSTEM` | `vrb_mr_reg_common()` 이 dmabuf 등록 경로를 ZE/ROCR/SYNAPSEAI 에만 쓰고 CUDA 는 `ibv_reg_mr` 로 떨어뜨린다(peermem 없는 플랫폼에서 실패). 또 `vrb_reg_hmem_dmabuf()` 가 `ibv_reg_dmabuf_mr()` 뒤 dma-buf fd 를 닫지 않아 등록마다 1 개씩 누수된다 — MR 캐시가 꺼진 상태에서 nofile 한도에 걸린다. **libfabric 을 `--with-cuda` 로 빌드했을 때만 의미가 있다**(아래 configure 참조) |
 
 `0004` 의 스텁 교체가 정당한 근거는 DAOS 코드 자체에 있다. `crt_bulk.c` 는 provider 가
 UCX 면 `crt_bulk_import_rkey()` 를 **호출조차 하지 않고** HMEM 등록으로 넘어가며, OFI
@@ -58,7 +59,7 @@ UCX 면 `crt_bulk_import_rkey()` 를 **호출조차 하지 않고** HMEM 등록�
 
 ## 적용 순서
 
-UCX·Mercury 소스는 첫 빌드가 의존성을 내려받은 뒤에야 존재하므로 2단계로 나뉜다.
+UCX·Mercury·libfabric 소스는 첫 빌드가 의존성을 내려받은 뒤에야 존재하므로 2단계로 나뉜다.
 
 ```bash
 # 0) 초안 브랜치 + 서브모듈 (초안은 raft 서브모듈 없이 클론하면 빌드가 깨진다)
@@ -76,12 +77,13 @@ cd daos-gds && scons --jobs "$(nproc)" --config=force --build-deps=yes \
 scons --jobs "$(nproc)" --config=force --build-deps=yes install \
     BUILD_GPU_DIRECT=yes PREFIX=/opt/daos-gds-gpu BUILD_ROOT=$PWD/build-gpu
 
-# 4) 상류 패치 → UCX·Mercury 만 수동 재빌드 (scons 를 다시 돌리지 않는다)
+# 4) 상류 패치(UCX·Mercury·libfabric) → 세 컴포넌트만 수동 재빌드 (scons 를 다시 돌리지 않는다)
+#    libfabric 은 CUDA 로 재configure 해야 dmabuf 경로가 살아난다 — 아래 절 참조
 ../apply-patches.sh deps daos-gds "$PWD/build-gpu"
 ```
 
 **순서가 중요하다.** `scons --build-deps=yes` 는 prereq git 트리에 `git reset --hard` 를
-하므로, deps 단계 패치를 적용한 뒤 scons 를 다시 돌리면 **UCX·Mercury 패치가 조용히
+하므로, deps 단계 패치를 적용한 뒤 scons 를 다시 돌리면 **세 패치가 조용히
 사라진다.** 빌드는 그대로 성공하고 런타임에 `ucp_mem_map()` 이 다시 `-EINVAL` 을 낼 뿐이라
 알아채기 어렵다. DAOS 는 prereq 의 `.so` 를 경로로 적재하므로 두 컴포넌트를 PREFIX 로
 직접 `make install` 하면 DAOS 재링크가 필요 없다 — `apply-patches.sh deps` 가 정확한
