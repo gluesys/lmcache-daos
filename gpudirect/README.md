@@ -205,7 +205,7 @@ DAOS 2.9.100 초안, `provider: ucx+rc_v`, RoCE 400G NDR `mlx5_0`). el8 로 빌�
 | 16 | `host` | 16.79 | 31.97 | 0.742 | 1.20 |
 | 16 | `hostcopy` | 6.47 | 83.02 | 1.094 | 4.58 |
 
-`pinned` 이 16 워커에서 34.9 GB/s 로 메인 README 의 과거 기록(34.5 GB/s sustained read)을
+`pinned` 이 16 워커에서 34.9 GB/s 로 `doc/DESIGN-AND-VALIDATION.md` 의 과거 기록(34.5 GB/s sustained read)을
 재현한다 — 구성이 제대로 잡혔다는 확인이다.
 
 **GPU-direct 는 대역폭과 지연 모두 진다** — 16 워커에서 스테이징의 0.68배(24.4 vs 35.6),
