@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# What this pipeline can and cannot check.
+#
+# It runs the parts that need nothing but a Python interpreter: the on-disk
+# object formats, the license headers, and syntax across the tree. That is a
+# small slice of the repository, and deliberately so -- everything else needs a
+# live DAOS cluster (pool, container, agent) and, for the GPU-direct backend,
+# an H100 with a patched client stack. Those live in tests/ and are run by hand
+# against the testbed; see deploy/README.md. Do not add a job here that silently
+# skips when the cluster is missing: a green pipeline that checked nothing is
+# worse than no pipeline.
+
+stages: [check, test]
+
+# The shared runners are docker executors whose default image is alpine, which
+# has neither python3 nor git. Pin an image instead of inheriting that, and
+# list files with find rather than `git ls-files` -- with a docker executor the
+# clone is done by the helper container, so git is not in the build image.
+default:
+  image: python:3.12-slim
+  interruptible: true
+
+variables:
+  GIT_DEPTH: "20"
+
+.python: &python
+  before_script:
+    - command -v python3 >/dev/null || { echo "python3 not on this runner"; exit 1; }
+    - python3 --version
+
+# The package declares requires-python >= 3.8 and uses no third-party runtime
+# dependency, so the interpreter that happens to be on the runner is a fair
+# test of that claim.
+unit:
+  stage: test
+  <<: *python
+  script:
+    - python3 tests/test_serde.py
+    - python3 tests/test_serde_v2.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+syntax:
+  stage: check
+  <<: *python
+  script:
+    - echo "== python =="
+    - find . -path ./.git -prune -o -name '*.py' -print | xargs -r -n50 python3 -m py_compile
+    - echo "== shell =="
+    - find . -path ./.git -prune -o -name '*.sh' -print | xargs -r -n1 bash -n
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Guards the licensing work: every source file carries an SPDX identifier, and
+# the patches under gpudirect/ deliberately do not (they are diffs against
+# upstream projects and keep those projects' licenses -- see NOTICE).
+license-headers:
+  stage: check
+  script:
+    - test -f LICENSE && test -f NOTICE
+    - |
+      sources=$(find . -path ./.git -prune -o \
+        \( -name '*.py' -o -name '*.sh' -o -name '*.c' \) -print)
+      missing=$(for f in $sources; do
+          head -5 "$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || echo "$f";
+        done)
+      if [ -n "$missing" ]; then
+        echo "SPDX header missing in:"; echo "$missing"; exit 1
+      fi
+      echo "SPDX headers present in all $(echo "$sources" | wc -l) sources"
+    - |
+      if grep -l 'SPDX-License-Identifier' gpudirect/patches/*.patch 2>/dev/null; then
+        echo "patches must not carry our SPDX header (they are upstream derivatives)"; exit 1
+      fi
+      echo "patches clean"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
