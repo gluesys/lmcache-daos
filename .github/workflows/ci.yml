@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+#
+# The GitHub repository is a push mirror of the GitLab upstream, so this
+# workflow exists for the public copy: it lets anyone reading the repository
+# see what is actually verified. The authoritative pipeline is .gitlab-ci.yml
+# and the two check the same things.
+#
+# Scope is limited on purpose -- only what needs no more than a Python
+# interpreter. The rest of tests/ needs a live DAOS cluster (and, for the
+# GPU-direct backend, an H100 with a patched client stack), so it is run by
+# hand against the testbed. See deploy/README.md.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package claims requires-python >= 3.8 and pulls in no
+        # third-party runtime dependency; check both ends of that claim.
+        python: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unit tests (no DAOS required)
+        run: |
+          python3 tests/test_serde.py
+          python3 tests/test_serde_v2.py
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: python
+        run: git ls-files '*.py' | xargs -r -n50 python3 -m py_compile
+      - name: shell
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+  license-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: LICENSE and NOTICE present
+        run: test -f LICENSE && test -f NOTICE
+      - name: SPDX header on every source
+        run: |
+          missing=$(git ls-files '*.py' '*.sh' '*.c' \
+            | while read -r f; do
+                head -5 "$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || echo "$f";
+              done)
+          if [ -n "$missing" ]; then
+            echo "SPDX header missing in:"; echo "$missing"; exit 1
+          fi
+          echo "SPDX headers present in all $(git ls-files '*.py' '*.sh' '*.c' | wc -l) sources"
+      - name: patches carry no header of ours
+        run: |
+          if git ls-files 'gpudirect/patches/*.patch' | xargs -r grep -l 'SPDX-License-Identifier'; then
+            echo "patches must not carry our SPDX header (they are upstream derivatives)"; exit 1
+          fi
+          echo "patches clean"
