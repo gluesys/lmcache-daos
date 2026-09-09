@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Gluesys Co., Ltd.
 # client-5 in-process launcher with the GPU-direct DAOS storage plugin (DaosGdsBackend).
+#
+# EXPERIMENTAL. This drives an unsupported path: unmerged DAOS draft + out-of-tree
+# UCX/Mercury/libfabric patches, GPU-source writes to replicated containers broken
+# over verbs, single-GPU validation only. It is a testbed driver, not a deployment
+# template. See the README section "모드별 성숙도".
 # Needs on the host: /opt/daos-gds-gpu (GPU-direct DAOS client), /opt/ofi-cuda (CUDA libfabric,
 # verbs dmabuf patch), /usr/local/cuda-13.3 (libcudart for libfabric's dlopen), libgdrapi.
 # Env: MML (max model len), GDS_GB (GPU staging pool), GPU_UTIL, POOL/CONT, WORKERS, ASYNC (enable_async_loading:

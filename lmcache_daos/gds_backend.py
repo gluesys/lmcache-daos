@@ -4,6 +4,27 @@
 straight into GPU memory (``dfs_read_gpu``) and writes them from GPU memory
 (``dfs_write_gpu``), bypassing host staging.
 
+EXPERIMENTAL -- do not run this in production. Not because it is slow (a cold
+hit lands at the level of a warm hit served from pinned host L1) but because of
+what it depends on and how far it has been checked:
+
+* it needs an unmerged DAOS draft branch (``theodore/b_cufile``) plus the seven
+  patches in ``gpudirect/patches/``, which means rebuilt UCX, Mercury and
+  libfabric. The libfabric fix is not upstream yet (``doc/upstream/``), so there
+  is no shippable client stack;
+* writing from GPU memory to a replicated container (``RP_2``/``RP_3``) fails
+  over verbs: every update needing a bulk (>= 64 KiB) ends with the server's
+  bulk GET timing out after 14 s with ``HG_IO_ERROR``. S16, host-source writes
+  and inline 4 KiB writes are fine;
+* validation stops at a single GPU and a single client. The reason to want this
+  path -- host DRAM traffic of 0.09 vs 1.8 bytes per delivered byte -- pays off
+  with several GPUs per host, and that measurement does not exist;
+* the ``daosgds.*`` configuration keys and the v2 on-disk format carry no
+  compatibility promise.
+
+Constructing this backend logs a warning saying so. See the README section
+"모드별 성숙도" for the conditions that would make it supported.
+
 How it plugs in (LMCache 0.5.2, no upstream change)::
 
     storage_plugins: ["daosgds"]
@@ -185,6 +206,12 @@ class DaosGdsBackend(AllocatorBackendInterface):
         self._put_tasks: set = set()
         self.stats = {"put": 0, "put_bytes": 0, "get": 0, "get_bytes": 0, "miss": 0,
                       "alloc_fail": 0, "get_ms": 0.0, "put_ms": 0.0}
+        logger.warning(
+            "DaosGdsBackend is EXPERIMENTAL and unsupported: it requires an unmerged DAOS "
+            "draft branch plus out-of-tree UCX/Mercury/libfabric patches, GPU-source writes "
+            "to replicated containers (RP_2/RP_3) fail over verbs, validation stops at a "
+            "single GPU, and neither the daosgds.* keys nor the v2 on-disk format are "
+            "stable. Do not use it in production.")
         logger.info("DaosGdsBackend: pool=%s cont=%s root=%s device=%s gpu_buffer=%.1f GiB workers=%d",
                     pool, cont, self.root, self.dst_device, self.gpu_buffer_bytes / (1 << 30),
                     self.io_workers)
