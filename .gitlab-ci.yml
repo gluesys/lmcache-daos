@@ -14,7 +14,12 @@
 
 stages: [check, test]
 
+# The shared runners are docker executors whose default image is alpine, which
+# has neither python3 nor git. Pin an image instead of inheriting that, and
+# list files with find rather than `git ls-files` -- with a docker executor the
+# clone is done by the helper container, so git is not in the build image.
 default:
+  image: python:3.12-slim
   interruptible: true
 
 variables:
@@ -43,9 +48,9 @@ syntax:
   <<: *python
   script:
     - echo "== python =="
-    - git ls-files '*.py' | xargs -r -n50 python3 -m py_compile
+    - find . -path ./.git -prune -o -name '*.py' -print | xargs -r -n50 python3 -m py_compile
     - echo "== shell =="
-    - git ls-files '*.sh' | xargs -r -n1 bash -n
+    - find . -path ./.git -prune -o -name '*.sh' -print | xargs -r -n1 bash -n
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
@@ -58,16 +63,17 @@ license-headers:
   script:
     - test -f LICENSE && test -f NOTICE
     - |
-      missing=$(git ls-files '*.py' '*.sh' '*.c' \
-        | while read -r f; do
-            head -5 "$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || echo "$f";
-          done)
+      sources=$(find . -path ./.git -prune -o \
+        \( -name '*.py' -o -name '*.sh' -o -name '*.c' \) -print)
+      missing=$(for f in $sources; do
+          head -5 "$f" | grep -q 'SPDX-License-Identifier: Apache-2.0' || echo "$f";
+        done)
       if [ -n "$missing" ]; then
         echo "SPDX header missing in:"; echo "$missing"; exit 1
       fi
-      echo "SPDX headers present in all $(git ls-files '*.py' '*.sh' '*.c' | wc -l) sources"
+      echo "SPDX headers present in all $(echo "$sources" | wc -l) sources"
     - |
-      if git ls-files 'gpudirect/patches/*.patch' | xargs -r grep -l 'SPDX-License-Identifier' ; then
+      if grep -l 'SPDX-License-Identifier' gpudirect/patches/*.patch 2>/dev/null; then
         echo "patches must not carry our SPDX header (they are upstream derivatives)"; exit 1
       fi
       echo "patches clean"
