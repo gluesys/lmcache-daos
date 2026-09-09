@@ -37,6 +37,10 @@ submitted upstream without further permission. Submission drafts are kept in
 LMCache (Apache-2.0, https://github.com/LMCache/LMCache) for the purpose of
 describing a proposed change to it.
 
+`CODE_OF_CONDUCT.md` is the Contributor Covenant v2.1, reproduced verbatim apart
+from the reporting contact. It is licensed CC BY 4.0 by its authors
+(https://www.contributor-covenant.org), not under this repository's license.
+
 
 -------------------------------------------------------------------------------
 Interoperating projects

@@ -480,6 +480,14 @@ doc/              설계·검증 기록, 그림, 상류 제출 초안
 문서에 나오는 IP 주소는 모두 문서용 대역(RFC 5737 / RFC 2544)으로 치환돼 있다. 호스트
 suffix 는 원본과 같아 문서 안의 상호 참조는 그대로 유효하다.
 
+## 기여
+
+이 저장소의 상류는 사내 GitLab 이고 GitHub 는 **push mirror** 다. GitHub 에 직접 푸시하면
+다음 미러 실행 때 덮어써진다. 이슈·PR 을 여는 방법과 우리가 그걸 어떻게 받아 가는지는
+[`CONTRIBUTING.md`](CONTRIBUTING.md) 에 있다. 취약점 신고는 이슈가 아니라
+[`SECURITY.md`](SECURITY.md) 의 경로로. 행동 강령은 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md),
+변경 이력은 [`CHANGELOG.md`](CHANGELOG.md).
+
 ## 라이선스
 
 Apache License 2.0 — `LICENSE` 참조. 저작권 Gluesys Co., Ltd.
