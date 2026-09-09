@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmcache-daos"
-version = "0.0.1"
+# Single-sourced from lmcache_daos/__init__.py -- see [tool.setuptools.dynamic]
+dynamic = ["version"]
 description = "DAOS storage backends for LMCache: in-process connector, MP-mode L2 adapter, and an experimental GPU-direct backend"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -25,5 +26,13 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[project.urls]
+Homepage = "https://github.com/gluesys/lmcache-daos"
+Changelog = "https://github.com/gluesys/lmcache-daos/blob/main/CHANGELOG.md"
+Issues = "https://github.com/gluesys/lmcache-daos/issues"
+
 [tool.setuptools]
 packages = ["lmcache_daos", "lmcache_daos.mp"]
+
+[tool.setuptools.dynamic]
+version = { attr = "lmcache_daos.__version__" }
