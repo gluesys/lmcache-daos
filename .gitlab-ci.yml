@@ -14,12 +14,18 @@
 
 stages: [check, test]
 
-# The shared runners are docker executors whose default image is alpine, which
-# has neither python3 nor git. Pin an image instead of inheriting that, and
-# list files with find rather than `git ls-files` -- with a docker executor the
-# clone is done by the helper container, so git is not in the build image.
+# The runner pool is mixed: some are docker executors, at least one is a shell
+# executor on a host without python3. `image:` means nothing to the latter, so
+# a job landing there fails with "python3 not on this runner" -- which is what
+# happened until these jobs were pinned by tag.
+#
+# The 'Flexa' runner is the docker one. With a docker executor the default
+# image is alpine (no python3, no git) and the clone is done by the helper
+# container (so git is absent from the build image either way); hence both the
+# explicit image and listing files with find rather than `git ls-files`.
 default:
   image: python:3.12-slim
+  tags: [Flexa]
   interruptible: true
 
 variables:
