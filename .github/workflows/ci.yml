@@ -76,3 +76,31 @@ jobs:
             echo "patches must not carry our SPDX header (they are upstream derivatives)"; exit 1
           fi
           echo "patches clean"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build
+        run: |
+          pip install --quiet build twine
+          python -m build
+          ls -l dist/
+          python -m twine check dist/*
+      - name: version is single-sourced
+        run: |
+          pkg=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"',open('lmcache_daos/__init__.py').read()).group(1))")
+          built=$(ls dist/*.whl | sed -E 's/.*-([0-9][^-]*)-py3.*/\1/')
+          echo "package version: $pkg   built wheel: $built"
+          [ "$pkg" = "$built" ] || { echo "pyproject did not pick up __version__"; exit 1; }
+      - name: the wheel installs and imports
+        run: |
+          cd /tmp && pip install --quiet "$GITHUB_WORKSPACE"/dist/*.whl
+          python -c "import lmcache_daos; print('installed wheel imports, version', lmcache_daos.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

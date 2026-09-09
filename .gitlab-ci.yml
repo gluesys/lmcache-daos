@@ -12,7 +12,7 @@
 # skips when the cluster is missing: a green pipeline that checked nothing is
 # worse than no pipeline.
 
-stages: [check, test]
+stages: [check, test, package]
 
 # The runner pool is mixed: some are docker executors, at least one is a shell
 # executor on a host without python3. `image:` means nothing to the latter, so
@@ -84,5 +84,40 @@ license-headers:
       fi
       echo "patches clean"
   rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Builds the wheel and sdist on every merge request, so a packaging break is
+# caught when it is introduced rather than at release time. Nothing is
+# published: there is no package index configured for this project, and the
+# release artefacts are attached to the tag by hand.
+#
+# The version is single-sourced from lmcache_daos/__init__.py, so this also
+# checks that pyproject really reads it -- and on a tag pipeline, that the tag
+# and the package agree.
+package:
+  stage: package
+  script:
+    - pip install --quiet --disable-pip-version-check build twine
+    - python -m build
+    - ls -l dist/
+    - python -m twine check dist/*
+    - |
+      pkg=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"',open('lmcache_daos/__init__.py').read()).group(1))")
+      built=$(ls dist/*.whl | sed -E 's/.*-([0-9][^-]*)-py3.*/\1/')
+      echo "package version: $pkg   built wheel: $built"
+      [ "$pkg" = "$built" ] || { echo "pyproject did not pick up __version__"; exit 1; }
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        [ "v$pkg" = "$CI_COMMIT_TAG" ] || { echo "tag $CI_COMMIT_TAG != v$pkg"; exit 1; }
+        echo "tag matches package version"
+      fi
+    - |
+      cd /tmp && pip install --quiet "$CI_PROJECT_DIR"/dist/*.whl
+      python -c "import lmcache_daos; print('installed wheel imports, version', lmcache_daos.__version__)"
+  artifacts:
+    paths: [dist/]
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"

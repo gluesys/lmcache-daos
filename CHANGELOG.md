@@ -6,12 +6,18 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project intends [Semantic Versioning](https://semver.org/) from its first tag.
 
-**Nothing has been released yet.** There are no tags, `pyproject.toml` still
-says `0.0.1`, and no interface here carries a compatibility promise. What
-follows is the state of `main`, written so that the first release notes have a
-starting point.
+No interface here carries a compatibility promise yet; the leading `0.`
+is doing real work.
 
 ## [Unreleased]
+
+Nothing since 0.1.0.
+
+## [0.1.0] - 2026-09-09
+
+First tagged release. It marks the point where the repository became something
+another team could pick up -- licensed, CI-checked, with the maturity of each
+backend stated -- rather than any change in the code's capability.
 
 ### Backends
 
@@ -67,7 +73,7 @@ Kept here because each one changed a default:
 
 ### Not done
 
-- No tagged release, no published wheel.
+- Not published to any package index; the wheel is built from the tag.
 - No failure-mode testing: rank loss, network partition, pool exhaustion.
 - No multi-tenant enforcement beyond the key namespace.
 - No metrics export.
