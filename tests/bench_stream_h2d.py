@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """P4 gate: does completion-ordered streaming actually buy the overlap?
 
 The whole upstream RFC rests on one claim: if a backend yields chunks as they

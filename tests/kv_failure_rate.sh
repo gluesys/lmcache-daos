@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Measure how often a cache hit returns wrong KV, with a confidence interval,
 # and classify each failure.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """LMCache multiprocess (MP) mode support: a DAOS ``L2AdapterInterface``
 implementation and a server entry point that registers it.
 

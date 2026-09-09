@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request
 def ttft(prompt, mx=1):
     body=json.dumps({"model":"qwen3","prompt":prompt,"max_tokens":mx,"temperature":0,"stream":True}).encode()

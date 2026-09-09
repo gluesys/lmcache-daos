@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * dfs_integrity.c -- self-contained reproducer for silent data corruption in
  * DAOS 2.9.100's DFS read path.

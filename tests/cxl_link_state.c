@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* Report a CXL 1.1 RCD's negotiated link width and speed.
  *
  * There is no other way to get this. A CXL 1.1 device attaches as a Root

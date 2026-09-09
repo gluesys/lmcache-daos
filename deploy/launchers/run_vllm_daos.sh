@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # numactl --interleave=all is not a tuning guess. Measured with per-socket
 # memory-controller counters, the KV staging path put 81% of its host DRAM

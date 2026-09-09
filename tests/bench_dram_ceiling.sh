@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Measure the host DRAM ceiling twice over: once by the kernel's own byte
 # accounting, once by the memory controllers. The second one is the number to

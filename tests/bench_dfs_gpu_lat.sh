@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Phase B sweep: does removing the H2D copy actually shorten the time to fetch
 # a KV working set? Sweeps chunk size and concurrency for the three arms that

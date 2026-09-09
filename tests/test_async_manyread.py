@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """P1 gate: the async read engine + pending table, under the integrity bar.
 
 This is test_manyread.py's 30 x 28 MB integrity check, re-run through the

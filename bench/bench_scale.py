@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request, threading, sys
 KVPT = 160*1024   # 14B: 160 KiB/token
 def req(prompt, mx=1):

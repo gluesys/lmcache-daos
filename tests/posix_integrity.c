@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * posix_integrity.c -- does the corruption reach ordinary POSIX file I/O?
  *

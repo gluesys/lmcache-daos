@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Unit tests for the v2 page-aligned object format (no LMCache/DAOS needed).
 
     python3 tests/test_serde_v2.py

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Gate: a torn object reads back as a miss, not as an error or as garbage.
 
 The zero-copy read path reads straight into the MemoryObj buffer, so the buffer

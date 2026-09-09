@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 # Two vLLM instances sharing ONE LMCache MP server (L1 pinned + DAOS L2).
 # Demonstrates the MP-mode property the in-process connector cannot have:
 # KV stored by instance A (port 8001) is served to instance B (port 8002)

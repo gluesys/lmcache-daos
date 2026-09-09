@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """How many event queues, how many pollers each? Find the eqx_lock sweet spot.
 
 Source evidence (DAOS 2.8 src/client/api/event.c):

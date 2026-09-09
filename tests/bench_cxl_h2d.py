@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Can CXL-backed host memory serve as a KV staging tier? H2D and read bandwidth by NUMA node.
 
 client-6 has a 128 GiB CXL memory expander onlined as `system-ram` on NUMA node

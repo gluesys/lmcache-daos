@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """DAOS event / event-queue bindings — P0 of the async refactor.
 
 Why this module exists

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """End-to-end plugin routing through LMCache's own connector factory (T3).
 
 This is the piece the README listed as unverified: does LMCache actually route

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request, urllib.error
 PORT=8001
 def build(n): return "Passage. " + " ".join(f"tok{i}" for i in range(n))

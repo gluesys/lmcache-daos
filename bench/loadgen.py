@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request, threading, os
 def post(p,o):
     b=json.dumps(o).encode()

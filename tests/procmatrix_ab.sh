@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Thread-vs-process crossover (plan §4 P0 #3): does the corruption need
 # client-process-shared state?

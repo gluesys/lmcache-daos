@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 # Phase 3 (cont.): two independent vLLM replicas sharing one DAOS L2 container.
 #
 # SCOPE -- read this before quoting the numbers. Both replicas run on the SAME

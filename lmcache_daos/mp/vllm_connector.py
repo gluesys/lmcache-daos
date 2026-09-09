@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """vLLM-side connector shim for MP mode.
 
 vLLM 0.18 bundles its own copy of ``LMCacheMPConnector`` and resolves the

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """lmcache-daos 아키텍처 / 실험환경 도식 (연구자 공유용, 저채도)."""
 import os
 import sys

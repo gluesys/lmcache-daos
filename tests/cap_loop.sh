@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Capture-until-corrupt: run the raw-object reproducer under tcpdump until a
 # run reports corruption, keeping only that run's capture.

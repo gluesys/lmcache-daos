@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """TTFT for a prompt whose KV was stored by a *previous* server lifetime.
 
 bench_value.py measures miss -> hit inside one process; in MP mode that hit is

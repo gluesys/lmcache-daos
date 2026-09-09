@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request
 PORT=8001
 def build(n): return "Alpha. " + " ".join(f"w{i}a{i%97}" for i in range(n))

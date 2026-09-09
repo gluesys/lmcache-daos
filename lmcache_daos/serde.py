@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Length-framing for the DAOS LMCache backend's on-disk objects.
 
 Each stored object is one DFS file laid out as::

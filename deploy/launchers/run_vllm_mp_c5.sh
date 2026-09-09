@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 # client-5 launcher for LMCache MP mode: one container, two processes.
 #   1. lmcache_daos.mp.server  -- ZMQ cache server owning L1 (pinned CPU) and
 #      the DAOS L2 adapter (type "daos", registered by our entry point)

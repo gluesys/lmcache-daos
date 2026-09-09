@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """VAST long-doc-qa 조건 재현: 100GB KV working set, 12 inflight.
 VAST 공개: 평균 TTFT 2.8x 개선, peak 9.79 GB/s (모델/기준선 미공개).
 우리 조건 명시: Qwen3-14B, KV 160KiB/token → 149 docs x 4096 tok = 100GB.

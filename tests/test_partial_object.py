@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Partial / torn KV objects must never be served as a hit (T4).
 
 A writer that dies mid-store leaves a short file behind. Because `exists()` is

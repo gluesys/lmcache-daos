@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Enumeration and deletion: list() and remove_sync() (T7).
 
 These two are what capacity management is built on. Before this, `list()`

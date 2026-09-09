@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Wait until LMCache's stores have actually landed in DAOS.
 
 Needed because ``batched_put()`` is an async submit: LMCache logs

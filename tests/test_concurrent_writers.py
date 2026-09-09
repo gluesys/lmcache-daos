@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Concurrent writers on the same key must never yield a corrupt hit (T5).
 
 Two things are exercised:

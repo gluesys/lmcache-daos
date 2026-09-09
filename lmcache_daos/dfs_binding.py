@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """ctypes binding to the DAOS ``dfs_sys`` API (libdfs / libdaos).
 
 Grounded in DAOS 2.9.100 headers:

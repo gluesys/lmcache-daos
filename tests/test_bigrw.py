@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import os, sys
 sys.path.insert(0, "/lmd")
 from lmcache_daos.dfs_binding import DfsSys

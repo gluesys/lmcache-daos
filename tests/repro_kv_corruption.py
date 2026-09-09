@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Minimal reproducer for the KV corruption, without vLLM and without a GPU.
 
 Why this exists. End-to-end, a cache hit returns wrong KV 30-85% of the time

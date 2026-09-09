@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Integration test against a real DAOS runtime.
 
 Skipped automatically unless DAOS_TEST_POOL and DAOS_TEST_CONT are set AND the

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 # client-5 performance launcher: kvsup-ucx-lmc (c_ops + UCX 1.20), stockfull DAOS libs, ucx+rc_v servers.
 MML=${MML:-32768}
 podman rm -f vllm-daos >/dev/null 2>&1; sleep 15

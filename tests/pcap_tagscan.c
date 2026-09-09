@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * pcap_tagscan.c -- count tagged-payload bytes per (tid, round, chunk) in a
  * tcpdump capture, so the wire itself testifies in the corruption fault split.
