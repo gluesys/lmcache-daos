@@ -30,6 +30,28 @@ vLLM·LMCache 상류를 고치지 않는다 — `plugin://` 스킴과 `remote_st
 측정 수치와 그 조건, 설계 근거는 [`doc/DESIGN-AND-VALIDATION.md`](doc/DESIGN-AND-VALIDATION.md)
 에 있다.
 
+### 모드별 성숙도
+
+| 모드 | 상태 | 무엇을 뜻하나 |
+|---|---|---|
+| in-process (`DaosConnector`) | **지원** | stock DAOS 클라이언트로 동작. 설정 형식과 온디스크 포맷(v1)을 유지한다 |
+| MP (`lmcache_daos.mp`) | **지원** | 위와 같음. 추가 빌드 없음 |
+| GDS (`DaosGdsBackend`) | ⚠️ **실험적(experimental)** | 아래 조건이 해소될 때까지 운영에 쓰지 말 것 |
+
+GDS 를 실험적으로 두는 이유는 성능이 아니라 **의존성과 검증 범위**다.
+
+- 상류에 병합되지 않은 DAOS 초안 브랜치(`theodore/b_cufile`)와 이 저장소의 패치 7개에
+  의존한다. UCX·Mercury·libfabric 재빌드가 필요하고, 그중 libfabric 수정은 아직
+  upstream 제출 전이다([`doc/upstream/`](doc/upstream/)). 즉 **배포 가능한 형태가 아니다.**
+- 복제 컨테이너(`RP_2`/`RP_3`)에 GPU 소스로 쓰면 verbs 에서 실패한다(64 KiB 이상 update 마다
+  서버 bulk GET 이 14 s 뒤 `HG_IO_ERROR`). S16·호스트 소스·인라인 4 KiB 는 정상.
+- 검증은 **단일 GPU·단일 클라이언트**까지다. 이 경로의 가치 명제인 호스트 DRAM 절감
+  (0.09 vs 1.8 B/B)은 다중 GPU 에서 의미가 커지는데 그 측정이 없다.
+- 설정 키(`daosgds.*`)와 v2 포맷은 **하위 호환을 보장하지 않는다.**
+
+성능 자체는 좋다 — 재시작 후 콜드 hit 가 pinned L1 warm hit 수준이다. 위 세 조건이
+풀리면 지원 대상으로 올린다.
+
 ## 동작 방식
 
 ![lmcache-daos 소프트웨어 / 하드웨어 스택](doc/figures/fig1b_lmcache_daos_stack.png)
@@ -219,7 +241,8 @@ salt 가 달라 **같은 prompt 가 다른 청크 키를 만든다**. 결과적�
 ## 다른 동작 모드
 
 위의 in-process `DaosConnector` 가 기본 경로다. 같은 저장소에 두 개의 다른 데이터 평면이
-더 있고, **MP 는 추가 빌드가 없고 GDS 만 컴파일이 필요하다.**
+더 있고, **MP 는 추가 빌드가 없고 GDS 만 컴파일이 필요하다.** GDS 는 실험적이다
+([모드별 성숙도](#모드별-성숙도)).
 
 ### MP 모드 (multiprocess)
 
@@ -266,7 +289,11 @@ vllm serve <model> --kv-transfer-config '{"kv_connector":"DaosMPConnector",
 설계·계약·측정 결과는 [`doc/MP-MODE-PLAN.md`](doc/MP-MODE-PLAN.md) 와
 [`deploy/README.md`](deploy/README.md) §11 에 있다.
 
-### GDS 모드 (GPU-direct)
+### GDS 모드 (GPU-direct) — ⚠️ 실험적
+
+> 상류 미병합 DAOS 초안 + 미제출 패치에 의존하고, 복제 컨테이너 쓰기에 알려진 결함이
+> 있으며, 검증은 단일 GPU 까지다. 운영에 쓰지 말 것 — 근거는
+> [모드별 성숙도](#모드별-성숙도).
 
 `dfs_read_gpu`/`dfs_write_gpu` 로 KV 청크를 DAOS ↔ GPU 메모리에 직접 읽고 쓴다. 호스트
 DRAM 이 데이터 경로에서 빠진다. LMCache 의 `RemoteConnector` 가 아니라 storage plugin

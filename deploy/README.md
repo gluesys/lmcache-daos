@@ -313,7 +313,11 @@ cell1 `02,03,04,05`, cell2 `06,07,08,09`, `targets 8 / helpers 2 / scm(ram) 80 G
 mercury/UCX 송신 경로에 머묾, 서버 무죄, 쓰기+15 s 에 풀림; §7.7b). `ofi+tcp` 로 바꾸면 0/8 로 사라져 **UCX 한정**(§7.7c). `ofi+verbs;ofi_rxm` 은 스톨 0/6 에 대역폭 동일(35~38 GB/s), 정합성 통과 → 클러스터를 verbs 로 전환(§7.7d). **근본 원인 확정(§7.7e)**: mercury NA-UCX 가 서버 xstream 에 처음 RPC 를 보낼 때 rdma_cm 으로 지연 연결하는데, store 중(클→서 방향 포화, PFC 없는 손실형 RoCE)에 첫 접촉이 일어나면 CM `RTU` 가 유실되고 서버 커널 CM 의 `REP` 재전송(~16 s)까지 그 rank:tag 의 RPC 가 모두 대기. 어댑터 기동 프로브를 SX 오브젝트로 바꿔 모든 타깃 연결을 기동 시 조용할 때 맺도록 수정(`probe_chunks`, 기본 64) → ucx 에서도 10/10 스톨 없음. in-process `DaosConnector` 도 같은 워밍업을 기동 시 수행한다(`dfs_binding.warm_up_all_targets`, env `DAOS_PROBE_CHUNKS` 기본 64, 0 이면 끔; 검증 2026-09-05 verbs: 64 타깃 149 ms, 게이트 PASS). L1 < working set 의 p95 꼬리는 대역폭 포화 큐잉이며
 (12 inflight p95 456 → 6 inflight 152 ms, 처리량 동일 30 GB/s) 레버는 서버당 동시 요청 수(§7.6).
 
-## 12. GDS(GPU-direct) in-process 백엔드 (2026-09-06)
+## 12. GDS(GPU-direct) in-process 백엔드 (2026-09-06) — ⚠️ 실험적
+
+> 운영 금지. 상류 미병합 DAOS 초안 + 미제출 libfabric 패치에 의존해 배포 가능한
+> 클라이언트 스택이 없고, 복제 컨테이너 GPU 소스 쓰기가 verbs 에서 실패하며, 검증은
+> 단일 GPU 까지다. 조건은 저장소 README 의 "모드별 성숙도" 참조.
 
 `deploy/launchers/run_vllm_gds_c5.sh` — vLLM in-process + `storage_plugins: ["daosgds"]`(`lmcache_daos.gds_backend.DaosGdsBackend`). KV 청크를 DAOS 에서
 GPU 메모리로 직접 읽고(`dfs_read_gpu`) GPU 에서 직접 쓴다. 호스트 전제: `/opt/daos-gds-gpu`(b_cufile 초안 클라이언트, `gpudirect/README.md`),

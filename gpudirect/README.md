@@ -1,8 +1,15 @@
-# GPUDirect 스택 (`dfs_read_gpu` / `dfs_write_gpu`)
+# GPUDirect 스택 (`dfs_read_gpu` / `dfs_write_gpu`) — ⚠️ 실험적
+
+> **이 스택 위에 올라가는 `DaosGdsBackend` 는 실험적이며 운영에 쓰지 않는다.** 상류에
+> 병합되지 않은 DAOS 초안과 아직 제출하지 않은 libfabric 수정에 의존해 배포 가능한
+> 클라이언트 스택이 없고, 복제 컨테이너에 GPU 소스로 쓰면 verbs 에서 실패하며, 검증은
+> 단일 GPU 까지다. 조건은 저장소 README 의 "모드별 성숙도" 에 정리돼 있다. 이 문서는
+> 그 상태에 이르기까지의 작업 기록이자 재현 절차다.
 
 DAOS upstream 의 GPU-direct 초안을 **실제로 동작하는 상태**까지 올리는 데 필요한 패치와
 검증 도구. 초안은 Draft 품질이라 그대로는 빌드조차 되지 않고, 빌드가 되어도 GPU 버퍼
-등록이 실패한다. 여기 있는 6개 패치와 런타임 조건을 모두 갖췄을 때 GPU 왕복이 통과한다.
+등록이 실패한다. 여기 있는 7개 패치(DAOS 4 + UCX 1 + Mercury 1 + libfabric 1)와 런타임
+조건을 모두 갖췄을 때 GPU 왕복이 통과한다.
 
 ## 왜 cuFile 이 아닌가
 
