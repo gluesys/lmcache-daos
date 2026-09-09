@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Apply the GPU-direct fixes to a DAOS source tree and its bundled deps.
 #

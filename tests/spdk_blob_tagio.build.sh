@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Build tests/spdk_blob_tagio.c against the SPDK build tree that DAOS bundles.
 #

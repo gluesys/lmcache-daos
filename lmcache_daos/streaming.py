@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Completion-ordered streaming over a thread pool — the P4 mechanism.
 
 The upstream RFC asks for chunks to be delivered *as they complete* so the

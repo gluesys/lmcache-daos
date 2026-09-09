@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Committed as the reproducible Phase 3 harness. Override via env:
 #   POOL=nvme_pool CONT=lmcache_nvme PROMPT_TOKENS=4096 MAXLEN=8192 \

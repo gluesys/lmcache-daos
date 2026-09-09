@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import os, sys, time, ctypes, threading
 import concurrent.futures as cf
 sys.path.insert(0, "/root/lmcache-daos")

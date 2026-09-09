@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """DAOS L2 adapter for LMCache multiprocess (MP) mode.
 
 MP mode runs the cache engine in a separate ZMQ server process that owns L1

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Pure-Python unit tests for the object length-framing.
 
 Runs anywhere -- no DAOS runtime or LMCache install required.

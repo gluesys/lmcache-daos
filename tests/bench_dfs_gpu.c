@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* GPU-direct vs host-staging read path on DAOS DFS.
  *
  * The point of GPU-direct here is not peak bandwidth -- pinned host streaming

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """``DaosGdsBackend`` -- LMCache storage plugin that reads KV chunks from DAOS
 straight into GPU memory (``dfs_read_gpu``) and writes them from GPU memory
 (``dfs_write_gpu``), bypassing host staging.

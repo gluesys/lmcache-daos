@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """v2 on-disk object format: page-aligned payload for GPU-direct I/O.
 
 v1 (``serde.py``) is ``[8-byte prefix][meta][payload]`` -- the payload starts at

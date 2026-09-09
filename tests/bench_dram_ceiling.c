@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * Host DRAM bandwidth ceiling -- the denominator for every "DRAM bytes per
  * byte delivered" claim in gpudirect/README.md.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Single-node raw read throughput vs working-set size.
 
 Why: Part C claimed the 2-node aggregate (32.8 GB/s, end-to-end vLLM retrieve

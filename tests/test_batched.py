@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Batched interface: get / put, plus the inherited prefix semantics (T8).
 
 Only batched_get and batched_put are overridden (measured 1.3-3.5x). This test

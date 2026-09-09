@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Why is the event path slower? Isolate the confounds.
 
 The earlier comparison (async ~7.8 vs sync 15.7 GB/s) changed THREE things at

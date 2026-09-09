@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Can we get completion-ordered delivery WITHOUT DAOS event queues?
 
 diag_async_serialize established that DAOS event queues give asynchronous

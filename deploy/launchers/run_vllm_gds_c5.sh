@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 # client-5 in-process launcher with the GPU-direct DAOS storage plugin (DaosGdsBackend).
 # Needs on the host: /opt/daos-gds-gpu (GPU-direct DAOS client), /opt/ofi-cuda (CUDA libfabric,
 # verbs dmabuf patch), /usr/local/cuda-13.3 (libcudart for libfabric's dlopen), libgdrapi.

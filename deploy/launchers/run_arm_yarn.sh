@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 ARM=$1; MML=${MML:-66560}; FACTOR=${FACTOR:-2.0}
 podman rm -f vllm-daos >/dev/null 2>&1; sleep 12
 Y=/root/lmc/arm.yaml

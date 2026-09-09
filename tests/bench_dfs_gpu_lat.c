@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* Per-chunk latency of the GPU-direct and host-staging read paths.
  *
  * Phase B of gpudirect/PLAN.md. The throughput bench (bench_dfs_gpu.c) cannot

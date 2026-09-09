@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, os, urllib.request
 ARM=os.environ.get("ARM","?"); CTXS=[int(x) for x in os.environ.get("CTXS","65536").split(",")]
 CACHED=os.environ.get("CACHED","1")=="1"; KVPT=160*1024

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """How do DFS metadata operations scale with object count in one flat directory?
 
 `_key_to_path` puts every chunk in the container root as `/<sha256>`, and the

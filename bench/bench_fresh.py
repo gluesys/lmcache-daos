@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time,json,urllib.request
 def send(p):
     b=json.dumps({"model":"qwen3","prompt":p,"max_tokens":1,"temperature":0}).encode()

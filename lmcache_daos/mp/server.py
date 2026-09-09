@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """LMCache MP cache server with the DAOS L2 adapter registered.
 
 LMCache resolves ``--l2-adapter '{"type": ...}'`` against a registry that is

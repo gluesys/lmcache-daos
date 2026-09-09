@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """dfs_sys mount flags vs bulk-read thread scaling — merge decision for NO_LOCK.
 
 Two lines of work fixed the same safety problem differently:

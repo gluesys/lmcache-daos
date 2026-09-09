@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * obj_integrity.c -- the dfs_integrity.c workload rebuilt on the raw object
  * API, with no DFS and no dc_array (plan §6.2).

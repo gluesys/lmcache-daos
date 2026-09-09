@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """The configuration we never tried: ONE event queue, MANY poller threads.
 
 Source reading (DAOS 2.8 src/client/api/event.c) reframes the problem:

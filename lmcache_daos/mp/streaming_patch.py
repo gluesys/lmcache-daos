@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """PROTOTYPE: overlap L2 (DAOS) loading with the L1->GPU transfer in MP mode.
 
 Why this exists

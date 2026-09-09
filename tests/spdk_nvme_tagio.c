@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /*
  * spdk_nvme_tagio.c -- DAOS-free minimal reproducer for the silent read
  * corruption, straight on SPDK's userspace NVMe driver.

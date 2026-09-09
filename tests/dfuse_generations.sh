@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Independent check of the overwrite-generation corruption, using no code of
 # ours: dfuse + cp + md5sum only.

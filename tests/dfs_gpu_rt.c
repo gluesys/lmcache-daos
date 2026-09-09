@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* GPU-direct round-trip gate for DAOS dfs_write_gpu()/dfs_read_gpu().
  *
  * Writes a pattern from CUDA device memory into a DFS file, reads it back into

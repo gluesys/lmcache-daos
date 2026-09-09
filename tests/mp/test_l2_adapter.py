@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Unit test for the MP-mode DAOS L2 adapter against an in-memory fake DFS.
 
 Runs anywhere LMCache is importable (no DAOS needed):

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* Reproduce ucp_mem_map() on CUDA device memory outside DAOS, so UCX's own
  * logging is not swallowed by CaRT's log handler. This is the exact call
  * Mercury's na_ucx_mem_register() makes for a GPU bulk buffer.

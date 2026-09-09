@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Does the event-queue path scale with poller threads?
 
 Motivation: a single-poller async engine measured ~4.8 GB/s where the existing

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 import time, json, urllib.request, threading
 PORT=8001
 def build(tag,n): return f"{tag}. " + " ".join(f"{tag}x{i}y{i%89}" for i in range(n))

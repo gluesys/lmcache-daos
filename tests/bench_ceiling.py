@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Stage 0: isolate the raw dfs read ceiling over UCX.
 
 Separates three costs that the older bench conflated:

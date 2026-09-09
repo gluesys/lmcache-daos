@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Real connector-level roundtrip against a live DAOS pool (T2).
 
 Requires LMCache installed + a DAOS client (agent) + a POSIX container.

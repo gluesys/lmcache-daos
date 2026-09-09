@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Profile connector-side retrieve (batched_get) in isolation, over UCX.
 
 Stores N large chunks then times conn.batched_get(keys) — the exact path vLLM's

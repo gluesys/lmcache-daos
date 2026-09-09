@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 podman rm -f vllm-daos 2>/dev/null
 podman run -d --name vllm-daos --net host --security-opt label=disable --device nvidia.com/gpu=all --ipc host \
   --device /dev/infiniband --ulimit memlock=-1:-1 --cap-add=IPC_LOCK \

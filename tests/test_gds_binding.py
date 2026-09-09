@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """GPU-direct round-trip gate through the Python binding (needs a GPU, torch, and
 the GPU-direct DAOS client bundle -- see gpudirect/README.md "Phase 1").
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """LMCache RemoteConnector backed by a DAOS DFS (dfs_sys) namespace.
 
 Pinned to LMCache **v0.5.2**. Verified against that tag:

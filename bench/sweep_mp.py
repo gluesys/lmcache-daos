@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Part-A style context sweep for MP mode, with a cold-L1 (DAOS) leg.
 
 sweep2.py measures miss -> hit in one process. In MP mode that hit is served

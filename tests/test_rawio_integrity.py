@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Byte-level integrity of the DFS read/write path under concurrency.
 
 Written to localise a real failure: with the DAOS remote backend, vLLM restores

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 #
 # Balanced-crossover A/B for two environment configurations of the same
 # reproducer. Replaces dfs_integrity_ab.sh for arm comparisons, fixing the

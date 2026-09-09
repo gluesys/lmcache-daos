@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Merge decision: main's read path vs this branch's, on the same objects.
 
 The two lines of work wrote `_get_sync` differently and both choices are

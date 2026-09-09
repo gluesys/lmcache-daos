@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Expose LMCache's per-phase timers, which it measures but does not print.
 
 LMCache 0.5.2 reports store as a single ``offload_time`` that is actually

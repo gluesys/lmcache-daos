@@ -82,7 +82,8 @@ Rocky 9 처럼 시스템 `python3` 이 3.9 인 배포판에서는 커넥터만 �
 # upstream 배포 — EL8/EL9 동일 레이아웃. 릴리스는 v2.8 까지 올라와 있다
 curl -so /etc/yum.repos.d/daos.repo \
     https://packages.daos.io/v2.8/EL9/packages/x86_64/daos_packages.repo
-dnf -y --allowerasing install daos-client
+dnf -y --allowerasing install daos-client mercury-libfabric   # 아래 주의 참조
+#   C 산출물(shim, tests/*.c)을 빌드하려면 daos-devel 도 필요하다
 
 cp <your>/daos_agent.yml /etc/daos/    # access_points, transport_config, fabric_ifaces
 mkdir -p /var/run/daos_agent           # ★ 없으면 소켓 bind 실패
@@ -101,6 +102,16 @@ python3 -c "import ctypes; ctypes.CDLL('libdfs.so')"   # 커넥터가 보는 것
 - `daos_agent.yml` 의 `fabric_ifaces.domain` 은 **포트 접미사까지** 필요하다
   (`mlx5_0` 이 아니라 `mlx5_0:1`). 접미사 없이 주면 클라이언트가
   `ucp_init() failed (No such device)` 로 죽는다.
+- **`mercury-libfabric` 를 같이 깔아야 한다.** 이 패키지가 `libna_plugin_ofi.so` 를 준다.
+  호스트에 `mercury-ucx` 만 이미 깔려 있으면 dnf 는 `mercury` 만 올리고 ofi 플러그인을
+  넣지 않으며, 그러면 **`ofi+*` provider 가 전부 사라진다.** 증상은
+  `daos_agent net-scan` 에 `ucx+*` 만 나오고 클라이언트가
+  `no fabric interfaces found with provider ofi+tcp`(또는 `ofi+verbs;ofi_rxm`) 로 실패하는 것이다.
+  설치 후 `daos_agent -o /etc/daos/daos_agent.yml net-scan` 으로 서버 provider 가 목록에
+  있는지 먼저 확인할 것.
+- **`daos-devel` 이 없으면 C 코드가 빌드되지 않는다.** `shim/daos_evshim.c` 와
+  `tests/*.c` 는 `daos.h` 를 include 하므로 클라이언트만 깐 상태에서는
+  `fatal error: daos.h: No such file or directory` 가 난다.
 - `daos` CLI 는 **에이전트가 있는 클라이언트에서** 실행한다. 서버 노드에서는
   `daos_eq_lib_init` 이 `DER_HG` 로 실패하고, 그쪽에서 도는 것은 `dmg` 다.
 - 측정 당시 쓴 RPM 스냅샷은 [`deploy/env/daos-repo.listing.txt`](deploy/env/daos-repo.listing.txt)
@@ -131,8 +142,12 @@ event queue 경로는 현재 미사용이므로 PoC 에는 필요 없다. 제품
 C 쪽에서 가져오는 편이 안전하다:
 
 ```bash
+dnf -y install daos-devel      # daos.h — 없으면 컴파일 실패
 gcc -O2 -fPIC -shared -o libdaos_evshim.so shim/daos_evshim.c -ldaos
 export DAOS_EVSHIM_PATH=$PWD/libdaos_evshim.so
+
+# 확인: shim 경유 크기 조회 + canary + negative control
+DAOS_TEST_POOL=<pool> DAOS_TEST_CONT=<cont> python3 tests/test_event_abi.py
 ```
 
 ## 사용법 (in-process 모드)
@@ -437,3 +452,12 @@ doc/              설계·검증 기록, 그림, 상류 제출 초안
 
 문서에 나오는 IP 주소는 모두 문서용 대역(RFC 5737 / RFC 2544)으로 치환돼 있다. 호스트
 suffix 는 원본과 같아 문서 안의 상호 참조는 그대로 유효하다.
+
+## 라이선스
+
+Apache License 2.0 — `LICENSE` 참조. 저작권 Gluesys Co., Ltd.
+
+LMCache(Apache-2.0)의 확장점에 붙는 플러그인이고, DAOS 클라이언트
+라이브러리는 ctypes 로 런타임에 링크할 뿐 재배포하지 않는다. `gpudirect/patches/`
+의 패치들은 상류 프로젝트(DAOS·UCX·Mercury·libfabric)에 대한 diff 이므로 인용된
+문맥 줄은 각 상류 라이선스를 따른다 — 자세한 내용은 `NOTICE`.

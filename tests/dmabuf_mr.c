@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Gluesys Co., Ltd. */
 /* Minimal check: can the NIC register CUDA device memory via a dma-buf FD?
  * This is the exact operation UCX's ucp_mem_map() performs for GPU buffers,
  * isolated from DAOS, Mercury and UCX so the failure has one possible source.

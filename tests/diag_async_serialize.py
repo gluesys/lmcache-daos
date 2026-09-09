@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
 """Is the async read actually asynchronous? Time submit vs poll.
 
 bench_async_vs_sync showed async throughput is FLAT (~7 GB/s) from in-flight 1
