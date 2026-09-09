@@ -1,5 +1,19 @@
 # LMCache: make the async-loading prefetch serializer selectable
 
+> **보류 (2026-09-09).** 제안 자체는 유효하다. `dev` 를 다시 확인했고 `AsyncSingleSerializer` 하드코딩과
+> `AsyncMultiSerializer` 미사용 상태가 그대로였다. 폐기된 경로도 아니다 — `storage_manager.py` 에
+> 파일 차원의 deprecation 표시는 없고 `StorageManager.put` 하나만 `batched_put` 으로 대체됐다고 적혀
+> 있다. `storage_backend/connector/` 에는 RemoteConnector 계열 구현이 21 개 있어 여전히 활발하다.
+>
+> 낮춘 이유는 근거의 폭이다. 이 직렬화기를 지나는 우리 백엔드는 둘인데, in-process `DaosConnector`
+> 에서는 async loading 이 이득이 없었고(집계 평평, 단건 172→288 ms 악화 — `lmcache_daos/connector.py`
+> 의 `support_batched_get_non_blocking` 주석 참조) 이득이 나온 곳은 **experimental** 로 표시한 GDS
+> 백엔드뿐이다(Part B 집계 21.7 → 27.7 GB/s). 실험적 백엔드 한 곳의 수치로 상류 API 변경을 요구하는
+> 모양새가 된다.
+>
+> 다시 집는다면 순서는 이렇다. 먼저 이슈로 띄워 `AsyncMultiSerializer` 가 왜 사장돼 있는지 상류 의중을
+> 묻고, 근거를 "prefetch 지연이 병목인 in-process 백엔드" 로 일반화한 뒤 PR 을 낸다.
+
 **Where**: `lmcache/v1/storage_backend/storage_manager.py`, `StorageManager.__init__` (0.5.2 and `dev` as of 2026-09-06):
 
 ```python
