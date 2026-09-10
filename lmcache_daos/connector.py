@@ -131,7 +131,13 @@ class DaosConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
-        self._workers = 16
+        # 16 was measured as the sweet spot for the 40 MiB objects this
+        # connector normally sees. It is a knob because layerwise mode
+        # (use_layerwise) shrinks objects by the layer count, which changes
+        # the in-flight byte budget -- see doc/LAYERWISE-MEASUREMENT.md,
+        # where raising it to 128 made things 9-10% WORSE, showing the cost
+        # is serialised rather than concurrency-bound.
+        self._workers = int(os.environ.get("DAOS_WORKERS", "16"))
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._workers, thread_name_prefix="daos-io")
         self._warm_up()
