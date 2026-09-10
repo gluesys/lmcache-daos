@@ -1,0 +1,62 @@
+From 9ff19109437b549445ab7f24f71d70a8179117e4 Mon Sep 17 00:00:00 2001
+From: Kyeongpyo Kim <kpkim@gluesys.com>
+Date: Wed, 9 Sep 2026 23:55:57 +0900
+Subject: [PATCH] prov/verbs: release the dma-buf fd after registration
+
+vrb_reg_hmem_dmabuf() obtains a dma-buf file descriptor from
+ofi_hmem_get_dmabuf_fd() and passes it to ibv_reg_dmabuf_mr(), but never
+releases it. The MR holds its own reference to the dma-buf, so the fd is
+only needed for the duration of the registration call, and every
+registration leaks one descriptor.
+
+ofi_hmem_put_dmabuf_fd() was added for this purpose in #10716, and the
+cxi, opx and efa providers all use it. verbs is the only in-tree caller
+of ofi_hmem_get_dmabuf_fd() that never releases the fd. A bare close()
+would not be correct here: rocr_hmem_put_dmabuf_fd() releases through
+hsa_amd_portable_close_dmabuf().
+
+The leak is unbounded when the MR cache is disabled. Mercury's na_ofi
+sets FI_MR_CACHE_MAX_COUNT=0, so a DAOS client reading into GPU memory
+registers anew on every operation. Reading 8 GiB in 4 MiB chunks then
+exhausts nofile=1024, after which cuMemGetHandleForAddressRange() fails
+with CUDA_ERROR_OPERATING_SYSTEM and the transport goes down. Measured
+on H100 + ConnectX-7 over verbs;ofi_rxm on a dmabuf-only platform
+(NVIDIA open kernel module, no peer-memory client): 634 open dma-buf fds
+after 1.5 s of I/O, and 1 with this change. That measurement was taken
+with a direct close(fd); cuda_put_dmabuf_fd() is exactly that close, so
+it applies to this patch unchanged.
+
+errno is preserved across the release call because the failover path
+below reports the registration errno.
+
+Signed-off-by: Kyeongpyo Kim <kpkim@gluesys.com>
+---
+ prov/verbs/src/verbs_mr.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/prov/verbs/src/verbs_mr.c b/prov/verbs/src/verbs_mr.c
+index e452c2c..60caa30 100644
+--- a/prov/verbs/src/verbs_mr.c
++++ b/prov/verbs/src/verbs_mr.c
+@@ -87,6 +87,18 @@ static struct ibv_mr *vrb_reg_hmem_dmabuf(enum fi_hmem_iface iface,
+ 	mr = ibv_reg_dmabuf_mr(pd, offset, len, (uint64_t)(uintptr_t)buf/* iova */,
+ 			       fd, vrb_access);
+ 
++	/*
++	 * The MR holds its own reference to the dma-buf, so the fd is only
++	 * needed for the registration call above.  Release it here, as the
++	 * efa provider does; otherwise every registration leaks a descriptor.
++	 * ofi_hmem_put_dmabuf_fd() may set errno, and the failover path below
++	 * reports the registration errno, so preserve it.
++	 */
++	saved_errno = errno;
++	(void) ofi_hmem_put_dmabuf_fd(iface, fd);
++	errno = saved_errno;
++	saved_errno = 0;
++
+ 	if (!mr && failover_policy[iface] == TRY &&
+ 	    vrb_gl_data.peer_mem_support) {
+ 		saved_errno = errno;
+-- 
+2.25.1
+

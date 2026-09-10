@@ -7,7 +7,7 @@ peermem -- DOCA 3.4 does not export ib_register_peer_memory_client):
    registration helper and fell back to ibv_reg_mr() for CUDA, which fails
    with EFAULT (-14) when there is no peer-memory client. Add FI_HMEM_CUDA.
    (Upstream main already does this via `iface != FI_HMEM_SYSTEM`; this
-   hunk is only needed for the 1.25 tree DAOS bundles.)
+   hunk is only needed for the v1.22.0 tree DAOS bundles.)
 
 2. vrb_reg_hmem_dmabuf() never closed the dma-buf fd obtained from
    ofi_hmem_get_dmabuf_fd(). The MR holds its own reference, so the fd is
@@ -18,7 +18,17 @@ peermem -- DOCA 3.4 does not export ib_register_peer_memory_client):
    CUDA_ERROR_OPERATING_SYSTEM. Measured: 634 open dma-buf fds after 1.5 s
    of I/O; 1 after this change.
 
-Applies to the libfabric 1.25 tree that DAOS builds as a prerequisite.
+Applies to the libfabric v1.22.0 tree that DAOS builds as a prerequisite
+(utils/build.config: ofi=v1.22.0).
+
+Note on hunk 2 vs. the upstream submission: upstream releases the fd with
+ofi_hmem_put_dmabuf_fd(), which dispatches per HMEM iface -- close() for
+CUDA, hsa_amd_portable_close_dmabuf() for ROCR. That helper was added
+after v1.22.0 and does not exist in this tree, so close() is used here.
+It is correct for CUDA, which is the only iface this stack registers.
+See doc/upstream/libfabric-0001-verbs-put-dmabuf-fd.patch for the form
+sent upstream.
+
 See gpudirect/README.md, section "GDS over ofi+verbs".
 ---
 diff --git a/prov/verbs/src/verbs_mr.c b/prov/verbs/src/verbs_mr.c

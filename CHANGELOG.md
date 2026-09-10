@@ -11,7 +11,32 @@ is doing real work.
 
 ## [Unreleased]
 
-Nothing since 0.1.0.
+### Changed
+
+- The libfabric `prov/verbs` dma-buf fd fix is prepared for upstream submission
+  against `main` and is no longer a sketch: it releases the descriptor with
+  `ofi_hmem_put_dmabuf_fd()` rather than `close()`, because that helper
+  dispatches per HMEM interface and ROCR must go through
+  `hsa_amd_portable_close_dmabuf()`. verbs turns out to be the only in-tree
+  caller of `ofi_hmem_get_dmabuf_fd()` that never releases the fd. See
+  `doc/upstream/`.
+- The patch kept in `gpudirect/patches/` still uses `close()` and is unchanged.
+  `ofi_hmem_put_dmabuf_fd()` was added after v1.22.0, which is the libfabric
+  DAOS bundles, so the helper does not exist in that tree. The patch header now
+  says so.
+
+### Fixed
+
+- Corrected the bundled libfabric version throughout the docs and patch headers.
+  It was written as 1.25, a release that does not exist. DAOS
+  `utils/build.config` pins `ofi=v1.22.0`.
+
+### Deferred
+
+- The LMCache async-serializer proposal is on hold with the reasoning recorded
+  in `doc/upstream/lmcache-async-serializer-option.md`. The in-process path it
+  targets is not deprecated, but the only measured benefit comes from the
+  experimental GPU-direct backend.
 
 ## [0.1.0] - 2026-09-09
 

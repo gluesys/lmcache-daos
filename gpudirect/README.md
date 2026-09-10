@@ -1384,7 +1384,7 @@ UCX 경로의 16~20 GB/s 를 "GPU BAR write 의 QP 당 하드웨어 천장" 으�
 1. **cart 에 메모리 디바이스 지원 켜기**: `D_MEM_DEVICE=1`(또는 `D_GPU_DIRECT=1`). 초안의 cart 는
    `crt_mem_device_enabled()` 가 참일 때만 mercury 에 `request_mem_device` 를 넘기고, 그래야 na_ofi 가 도메인을 `FI_HMEM` 으로 연다.
    없으면 `NA_Mem_register() failed (NA_OPNOTSUPPORTED)`.
-2. **libfabric 을 CUDA 지원으로 빌드**: 초안 빌드의 libfabric 1.25 는 `--with-cuda` 없이 빌드돼 `FI_HMEM_CUDA not supported`.
+2. **libfabric 을 CUDA 지원으로 빌드**: 초안 빌드의 libfabric v1.22.0 은 `--with-cuda` 없이 빌드돼 `FI_HMEM_CUDA not supported`.
    `CPPFLAGS=-I/usr/local/cuda/include LDFLAGS="-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs" ./configure … --with-cuda=/usr/local/cuda --enable-cuda-dlopen`
    (기본 `--with-cuda=DIR` 만으로는 configure 가 `-lcudart` 를 못 찾는다). 런타임에 `libcudart.so`·`libcuda.so`(버전 없는 이름) 를 dlopen 하므로
    LD 경로에 심볼릭 링크가 필요하다(`/opt/ofi-cuda/lib64/libcudart.so -> /usr/local/cuda/lib64/libcudart.so.13`).
