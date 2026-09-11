@@ -25,6 +25,17 @@ is doing real work.
 - `deploy/launchers/run_vllm_layerwise_ab.sh` — the A/B launcher used for it.
 - `DAOS_WORKERS` environment override for the connector's IO thread pool.
   Default stays 16, so behaviour is unchanged.
+- `tests/obj_latency.c` — the follow-up that reframes the result above. The
+  layerwise penalty is a DFS cost, not a DAOS one. Rebuilt on the raw object
+  API with dkey = chunk and akey = layer, the same 4800 x 1 MiB reads take
+  245 ms instead of 3343 ms, and the fixed cost per object falls from
+  ~0.63 ms to ~0.0137 ms. That clears the 0.056 ms the earlier note said
+  layerwise would need to beat the best non-layerwise path. Folding all 40
+  layers into one RPC as an iod array reaches 204 ms, a shape DFS cannot
+  express. Unexpectedly, the arm that mimics today's layout (one akey
+  holding all 40 MiB) is the slowest of the three at 571 ms.
+  The DFS control arm does not yet complete; see the doc for what is
+  therefore still unconfirmed.
 - `nixl/` — a DAOS backend plugin for
   [NIXL](https://github.com/ai-dynamo/nixl). NIXL ships 16 backends and none of
   them speaks DAOS. Registration and transfer both work against a live pool;
