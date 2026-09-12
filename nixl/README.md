@@ -8,8 +8,8 @@ ships 16 backends; none of them speaks DAOS, which is what this adds.
 
 Status: **registration and transfer work, and it has been measured.** On the
 400G verbs testbed it reaches **34.17 GB/s** reading 4.69 GiB; see
-`doc/NIXL-DAOS-MEASUREMENT.md`. Both test programs in `tests/` pass. It has not
-been run under a NIXL agent yet, only driven directly.
+`doc/NIXL-DAOS-MEASUREMENT.md`. All three programs in `tests/` pass, including
+one that drives the backend through a real `nixlAgent`.
 
 ## Why the object API and not DFS
 
@@ -72,7 +72,6 @@ there is a second workload to tune it against.
   group and the pool's mutex. Folding hides it -- 5% of a folded transfer,
   60% of an unfolded one -- but it is the next thing to attack. The figure
   comes from comparing two different harnesses, so it is an estimate.
-- **No NIXL agent.** The tests drive the backend directly.
 
 ## Threads
 
@@ -118,9 +117,19 @@ probe fails.
 Both need a reachable pool and a container; neither needs a NIXL agent.
 
 ```bash
-./test_reg  <pool> <container>   # register/deregister, oid stability, refcount
-./test_xfer <pool> <container>   # write/read round trip, integrity, miss detection
+./test_reg   <pool> <container>   # register/deregister, oid stability, refcount
+./test_xfer  <pool> <container>   # write/read round trip, integrity, miss detection
+NIXL_PLUGIN_DIR=<build>/src/plugins/daos \
+./test_agent <pool> <container>   # the same through a real nixlAgent
 ```
+
+`test_agent` is the one that catches contract violations the other two cannot.
+A backend driven directly never has `loadLocalMD()` called, so omitting it --
+which the base class answers with an error, not a default -- passed every
+direct test and every benchmark while failing *every* `registerMem()` the agent
+made. It also confirms what the other tests only assume: `createXferReq()`
+hands the backend `nixlBasicDesc`, with no metadata pointer, so the agent must
+match a transfer descriptor back to a registered object by `devId` alone.
 
 `test_xfer` writes a self-describing payload -- every 8-byte word encodes its
 own (descriptor, offset) -- so a region that comes back wrong names where it
