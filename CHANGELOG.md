@@ -13,6 +13,34 @@ is doing real work.
 
 ### Added
 
+- `doc/NIXL-DAOS-MEASUREMENT.md` — the NIXL DAOS backend measured on the 400G
+  verbs testbed: **34.17 GB/s** reading 4.69 GiB with 40 layers folded into one
+  RPC, against 14.40 GB/s unfolded. Separating the two variables showed that
+  effective concurrency is `min(threads, requests in flight)` and flattens at
+  64, which is now the default pool size (`NIXL_DAOS_THREADS`).
+
+  The document also retracts two readings made while measuring, both of which
+  compared runs at mismatched concurrency. Thread *creation* was never the
+  bottleneck — replacing thread-per-request with a pool moved the unfolded arm
+  by 1.3% — and the NIXL layer is not free: matched against the raw object API
+  at the same shape and thread count it costs roughly 0.076 ms per request,
+  which folding hides (5% of a folded transfer, 60% of an unfolded one).
+- `nixl/tests/bench_nixl.cpp` — the harness, shaped like `tests/obj_latency.c`
+  so the two are comparable.
+
+### Changed
+
+- The NIXL DAOS backend runs transfers on a fixed thread pool instead of one
+  thread per posted request. Completion moved from a `std::future` to an atomic
+  counter, since one request can span several RPCs, and the first error wins so
+  a later group cannot mask an earlier failure.
+- The plugin's `meson.build` resolves DAOS itself rather than trusting the
+  parent's `find_library('daos')`, which reports existence without a path and
+  produced a configure that succeeded and a link that failed. It now searches
+  for a prefix carrying `daos.h` and takes both header and library from it, so
+  a packaged DAOS under `/usr` and a source build under `/var/daos-stockfull`
+  both build with no arguments.
+
 - `doc/LAYERWISE-MEASUREMENT.md` — measured LMCache's `use_layerwise` mode
   against the DAOS connector. It attaches with no code change and hits 100%,
   but at the same `chunk_size` the hit TTFT is 11.5x worse, because the object
