@@ -207,11 +207,20 @@ nixlDaosEngine::registerMem(const nixlBlobDesc &mem,
                             nixlBackendMD *&out) {
     out = nullptr;
 
-    /* DRAM is the transfer source/sink, not something DAOS holds: the buffer
-     * is handed to daos_obj_fetch() as an sgl at transfer time and needs no
-     * registration of its own. Accept it so the agent can pair a DRAM
-     * descriptor with a FILE one, and return no metadata. */
+    /* Host and device buffers are the transfer source/sink, not something DAOS
+     * holds: the buffer is handed to the fetch as an sgl at transfer time and
+     * needs no registration of its own. Accept them so the agent can pair one
+     * with a FILE descriptor, and return no metadata.
+     *
+     * Device memory needs no registration here either. CaRT registers the
+     * buffer when it builds the bulk handle, unless a pre-registered RDMA key
+     * is supplied in daos_mem_attr_t::ma_rkey -- which is the path that avoids
+     * double registration when cuFile already owns the buffer, and is left for
+     * when there is a cuFile-registered pool to test against. */
     if (nixl_mem == DRAM_SEG) return NIXL_SUCCESS;
+#ifdef NIXL_DAOS_HAVE_GPU
+    if (nixl_mem == VRAM_SEG) return NIXL_SUCCESS;
+#endif
 
     if (nixl_mem != FILE_SEG) return NIXL_ERR_NOT_SUPPORTED;
 
@@ -310,6 +319,7 @@ nixlDaosEngine::prepXfer(const nixl_xfer_op_t &operation,
         uint64_t akey;
         size_t len;
         void *buf;
+        uint64_t localDev; /* CUDA ordinal when the local side is VRAM */
     };
     std::map<std::pair<uint64_t, uint64_t>, std::pair<daos_handle_t, std::vector<entry>>>
         buckets;
@@ -333,12 +343,20 @@ nixlDaosEngine::prepXfer(const nixl_xfer_op_t &operation,
         const uint64_t akey = ri->addr % dkeySpan_;
         auto &slot = buckets[{md->devId_, dkey}];
         slot.first = md->oh_;
-        slot.second.push_back({akey, ri->len, reinterpret_cast<void *>(li->addr)});
+        slot.second.push_back(
+            {akey, ri->len, reinterpret_cast<void *>(li->addr), li->devId});
     }
 
     auto req = std::make_unique<nixlDaosBackendReqH>();
     req->op = operation;
     req->groups.reserve(buckets.size());
+
+#ifdef NIXL_DAOS_HAVE_GPU
+    /* The descriptor list carries the segment type, so the local side tells us
+     * whether these buffers are device memory. devId on a VRAM descriptor is
+     * the CUDA ordinal. */
+    const bool localIsGpu = local.getType() == VRAM_SEG;
+#endif
 
     for (auto &kv : buckets) {
         const auto &ents = kv.second.second;
@@ -371,6 +389,18 @@ nixlDaosEngine::prepXfer(const nixl_xfer_op_t &operation,
             g.sgls[i].sg_nr_out = 0;
             g.sgls[i].sg_iovs = &g.iovs[i];
         }
+
+#ifdef NIXL_DAOS_HAVE_GPU
+        if (localIsGpu) {
+            g.memAttrs.resize(n);
+            for (size_t i = 0; i < n; i++) {
+                g.memAttrs[i] = daos_mem_attr_t{};
+                g.memAttrs[i].ma_mem_type = DAOS_MEM_TYPE_CUDA;
+                g.memAttrs[i].ma_device_id = ents[i].localDev;
+                /* ma_rkey left zeroed: CaRT registers the buffer itself. */
+            }
+        }
+#endif
         req->groups.push_back(std::move(g));
     }
 
@@ -414,14 +444,29 @@ nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
             daos_key_t dkey;
             d_iov_set(&dkey, &gp->dkeyVal, sizeof(uint64_t));
 
-            const int rc =
-                req->op == NIXL_READ
-                    ? daos_obj_fetch(gp->oh, DAOS_TX_NONE, 0, &dkey,
-                                     static_cast<unsigned>(gp->iods.size()),
-                                     gp->iods.data(), gp->sgls.data(), nullptr, nullptr)
-                    : daos_obj_update(gp->oh, DAOS_TX_NONE, 0, &dkey,
-                                      static_cast<unsigned>(gp->iods.size()),
-                                      gp->iods.data(), gp->sgls.data(), nullptr);
+            const unsigned nr = static_cast<unsigned>(gp->iods.size());
+            int rc;
+#ifdef NIXL_DAOS_HAVE_GPU
+            if (!gp->memAttrs.empty()) {
+                /* The GPU entry points are synchronous only -- no event queue
+                 * -- which is why the work is on a thread here to begin with. */
+                rc = req->op == NIXL_READ
+                         ? daos_obj_fetch_gpu(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
+                                              gp->iods.data(), gp->sgls.data(),
+                                              gp->memAttrs.data(), nullptr, nullptr)
+                         : daos_obj_update_gpu(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
+                                               gp->iods.data(), gp->sgls.data(),
+                                               gp->memAttrs.data(), nullptr);
+            } else
+#endif
+            {
+                rc = req->op == NIXL_READ
+                         ? daos_obj_fetch(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
+                                          gp->iods.data(), gp->sgls.data(), nullptr,
+                                          nullptr)
+                         : daos_obj_update(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
+                                           gp->iods.data(), gp->sgls.data(), nullptr);
+            }
 
             if (rc != 0) {
                 NIXL_ERROR << (req->op == NIXL_READ ? "daos_obj_fetch" : "daos_obj_update")

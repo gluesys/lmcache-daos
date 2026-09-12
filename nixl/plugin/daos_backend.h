@@ -95,6 +95,11 @@ struct nixlDaosIoGroup {
     std::vector<daos_recx_t> recxs;
     std::vector<d_sg_list_t> sgls;
     std::vector<d_iov_t> iovs;
+#ifdef NIXL_DAOS_HAVE_GPU
+    /* One per sgl, as daos_obj_fetch_gpu() requires; empty for host memory,
+     * which is how the call is told to take the ordinary path. */
+    std::vector<daos_mem_attr_t> memAttrs;
+#endif
 };
 
 /*
@@ -187,10 +192,11 @@ public:
      * between agents on our behalf: local only, no notification channel.
      * These are the same answers POSIX and GDS give.
      *
-     * VRAM_SEG is deliberately absent. daos_obj_fetch_gpu() exists in the
-     * theodore/b_cufile client and is the reason to add it later, but the
-     * development host has no nvidia_fs loaded, so claiming it here would
-     * advertise a path that cannot yet be exercised.
+     * VRAM_SEG appears only when the client actually exports
+     * daos_obj_fetch_gpu(). Those entry points live in the unmerged b_cufile
+     * branch, so a stock DAOS cannot serve them, and advertising a capability
+     * the library does not have turns a clean "unsupported" into a failure
+     * further down. meson decides this, not a runtime check.
      */
     bool
     supportsRemote() const override {
@@ -209,7 +215,11 @@ public:
 
     nixl_mem_list_t
     getSupportedMems() const override {
+#ifdef NIXL_DAOS_HAVE_GPU
+        return {FILE_SEG, DRAM_SEG, VRAM_SEG};
+#else
         return {FILE_SEG, DRAM_SEG};
+#endif
     }
 
     /* ---- lifecycle no-ops (final) ---------------------------------------

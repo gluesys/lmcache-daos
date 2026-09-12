@@ -63,15 +63,41 @@ there is a second workload to tune it against.
 
 ## What it does not do yet
 
-- **No VRAM_SEG.** `daos_obj_fetch_gpu()` / `daos_obj_update_gpu()` exist in the
-  `theodore/b_cufile` client and are the reason to add it, but the development
-  host has no `nvidia_fs` loaded, so claiming the capability would advertise a
-  path that cannot be exercised.
+- **`VRAM_SEG` is off by default, and should stay off for now.** It works --
+  device-to-device round trips are bit-identical -- but it is 3.4x *slower*
+  than staging through host memory, because CaRT re-registers the GPU buffer
+  on every transfer at about 0.43 ms per sgl entry. The escape hatch for that,
+  `daos_mem_attr_t::ma_rkey`, is only reachable from cuFile's plugin callback,
+  which a backend that calls DAOS directly never sees. See
+  `doc/NIXL-DAOS-VRAM.md`.
 - **Per-request overhead in the NIXL path**, roughly 0.076 ms, from the
   `dynamic_cast`, the `std::map` in `prepXfer()`, five vector allocations per
   group and the pool's mutex. Folding hides it -- 5% of a folded transfer,
   60% of an unfolded one -- but it is the next thing to attack. The figure
   comes from comparing two different harnesses, so it is an estimate.
+
+## GPU memory
+
+The plugin advertises `VRAM_SEG` only when the client it was built against
+actually exports `daos_obj_fetch_gpu()`, which lives in the unmerged
+`theodore/b_cufile` branch. meson checks for the symbol; `DAOS_PREFIX` in the
+environment picks which client to build against, because a host can carry both
+a stock client and the draft and choosing between them is a deployment
+decision rather than something to guess from a search order.
+
+```bash
+DAOS_PREFIX=/opt/daos-gds-gpu meson setup build-gpu ...
+#  -> "DAOS GPU-direct: available (VRAM_SEG enabled)"
+```
+
+Running it also needs the GDS transport stack: `D_MEM_DEVICE=1` and a
+CUDA-built libfabric ahead of the stock one on `LD_LIBRARY_PATH`. Without
+those Mercury refuses the bulk handle with `HG_OPNOTSUPPORTED` rather than
+falling back, so a GPU run either exercises the GPU path or fails outright --
+it cannot quietly measure a host bounce.
+
+Read `doc/NIXL-DAOS-VRAM.md` before building anything on this. It works, and
+it is slower than not using it.
 
 ## Threads
 

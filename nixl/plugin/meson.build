@@ -14,8 +14,17 @@ cxx = meson.get_compiler('cpp')
 daos_incdirs = [nixl_inc_dirs, utils_inc_dirs]
 daos_lib = daos_dep
 
-if not cxx.has_header('daos.h')
+# DAOS_PREFIX in the environment wins, because the GPU-direct entry points only
+# exist in the unmerged b_cufile client and a host can carry both: a stock
+# client for ordinary use and the draft under a second prefix. Choosing between
+# them is a deployment decision, not something to guess from a search order.
+daos_prefix_env = run_command('sh', '-c', 'printf %s "$DAOS_PREFIX"', check: false).stdout().strip()
+
+if not cxx.has_header('daos.h') or daos_prefix_env != ''
     daos_prefixes = ['/var/daos-stockfull', '/opt/daos-gds-gpu', '/opt/daos', '/usr/local']
+    if daos_prefix_env != ''
+        daos_prefixes = [daos_prefix_env] + daos_prefixes
+    endif
     found_prefix = ''
     foreach pfx : daos_prefixes
         if found_prefix == '' and fs.exists(pfx / 'include' / 'daos.h')
@@ -38,6 +47,19 @@ if not cxx.has_header('daos.h')
     daos_incdirs += [include_directories(found_prefix / 'include', is_system: true)]
 endif
 
+# GPU-direct support is compiled in only when the client actually exports it.
+# daos_obj_fetch_gpu() lives in the b_cufile draft branch, not in a released
+# DAOS, so VRAM_SEG must not be advertised against a stock client -- claiming a
+# capability the library cannot serve turns a clean "unsupported" into a link
+# error or worse. Everything GPU sits behind NIXL_DAOS_HAVE_GPU.
+daos_gpu_args = []
+if cxx.has_function('daos_obj_fetch_gpu', dependencies: daos_lib)
+    message('DAOS GPU-direct: available (VRAM_SEG enabled)')
+    daos_gpu_args += ['-DNIXL_DAOS_HAVE_GPU']
+else
+    message('DAOS GPU-direct: not in this client (VRAM_SEG disabled)')
+endif
+
 if not daos_lib.found()
     error('DAOS plugin requires libdaos (install daos-devel, or put its lib dir on LIBRARY_PATH)')
 endif
@@ -50,7 +72,7 @@ if 'DAOS' in static_plugins
     daos_backend_lib = static_library('DAOS',
         daos_sources,
         dependencies: plugin_deps,
-        cpp_args: compile_flags,
+        cpp_args: compile_flags + daos_gpu_args,
         include_directories: daos_incdirs,
         install: false,
         name_prefix: 'libplugin_')
@@ -58,7 +80,7 @@ else
     daos_backend_lib = shared_library('DAOS',
         daos_sources,
         dependencies: plugin_deps,
-        cpp_args: ['-fPIC'],
+        cpp_args: ['-fPIC'] + daos_gpu_args,
         include_directories: daos_incdirs,
         install: true,
         name_prefix: 'libplugin_',
