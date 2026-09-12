@@ -35,12 +35,16 @@
 #ifndef NIXL_SRC_PLUGINS_DAOS_DAOS_BACKEND_H
 #define NIXL_SRC_PLUGINS_DAOS_DAOS_BACKEND_H
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
-#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <daos.h>
@@ -93,6 +97,40 @@ struct nixlDaosIoGroup {
     std::vector<d_iov_t> iovs;
 };
 
+/*
+ * A fixed pool of worker threads.
+ *
+ * The first implementation spawned a thread per posted request. Measured on
+ * the testbed at 400G, that cost about 0.096 ms per layer -- roughly seven
+ * times a DAOS RPC's own fixed cost of 0.0137 ms -- and it is why the
+ * unfolded arm of the benchmark collapsed to 8.06 GB/s against 31.16 GB/s
+ * folded. Folding hid the cost because it left only 120 requests; nothing
+ * guarantees a real workload folds that well, so the threads had to go.
+ *
+ * Blocking DAOS calls on a pool, rather than a DAOS event queue: the event
+ * path serialises on the per-EQ eqx_lock and has been measured to cap around
+ * 7-12 GB/s however the queues are arranged.
+ */
+class nixlDaosThreadPool {
+public:
+    explicit nixlDaosThreadPool(unsigned n);
+    ~nixlDaosThreadPool();
+
+    nixlDaosThreadPool(const nixlDaosThreadPool &) = delete;
+    void
+    operator=(const nixlDaosThreadPool &) = delete;
+
+    void
+    submit(std::function<void()> job);
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> q_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
+
 class nixlDaosBackendReqH : public nixlBackendReqH {
 public:
     nixlDaosBackendReqH() = default;
@@ -101,10 +139,39 @@ public:
     nixl_xfer_op_t op = NIXL_READ;
     std::vector<nixlDaosIoGroup> groups;
 
-    /* Set once postXfer() hands the work to a thread. Absent means prepared
-     * but not posted, which checkXfer() reports as still in progress. */
-    std::future<nixl_status_t> fut;
+    /* One outstanding count per request; workers decrement as groups finish.
+     * The first non-success wins, so a later group cannot mask an earlier
+     * failure. */
+    std::atomic<unsigned> pending{0};
+    std::atomic<int> status{NIXL_SUCCESS};
     bool posted = false;
+
+    void
+    finishOne() {
+        if (pending.fetch_sub(1) == 1) {
+            /* Taking the lock before notifying is what makes waitDone() safe:
+             * a waiter that has already evaluated the predicate is inside
+             * wait() holding nothing, and this hands off cleanly. */
+            std::lock_guard<std::mutex> g(doneMtx);
+            doneCv.notify_all();
+        }
+    }
+
+    void
+    waitDone() {
+        std::unique_lock<std::mutex> g(doneMtx);
+        doneCv.wait(g, [this] { return pending.load() == 0; });
+    }
+
+    void
+    recordError(nixl_status_t st) {
+        int expected = NIXL_SUCCESS;
+        status.compare_exchange_strong(expected, static_cast<int>(st));
+    }
+
+private:
+    std::mutex doneMtx;
+    std::condition_variable doneCv;
 };
 
 class nixlDaosEngine : public nixlBackendEngine {
@@ -217,6 +284,13 @@ private:
     mutable std::mutex mtx_;
     std::map<std::string, contHandles> conts_;
     bool daosInited_ = false;
+
+    /* Worker threads. Mutable because postXfer() is const: the interface
+     * treats a transfer as not mutating the engine, which is true of every
+     * field except this one. Sized from NIXL_DAOS_THREADS, default 64, which
+     * is where throughput stops improving on the testbed -- see
+     * doc/NIXL-DAOS-MEASUREMENT.md. */
+    mutable std::unique_ptr<nixlDaosThreadPool> pool_;
 
     /* Offset span that maps to one dkey. 64 MiB by default: large enough that a
      * request's descriptors usually share a dkey and fold into one RPC, small

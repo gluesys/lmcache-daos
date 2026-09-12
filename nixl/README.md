@@ -6,9 +6,10 @@
 A storage backend plugin for [NIXL](https://github.com/ai-dynamo/nixl). NIXL
 ships 16 backends; none of them speaks DAOS, which is what this adds.
 
-Status: **registration and transfer work against a live pool.** Both test
-programs in `tests/` pass on the development host. It has not been run under a
-NIXL agent yet, only driven directly, and it has not been measured.
+Status: **registration and transfer work, and it has been measured.** On the
+400G verbs testbed it reaches **34.17 GB/s** reading 4.69 GiB; see
+`doc/NIXL-DAOS-MEASUREMENT.md`. Both test programs in `tests/` pass. It has not
+been run under a NIXL agent yet, only driven directly.
 
 ## Why the object API and not DFS
 
@@ -66,14 +67,23 @@ there is a second workload to tune it against.
   `theodore/b_cufile` client and are the reason to add it, but the development
   host has no `nvidia_fs` loaded, so claiming the capability would advertise a
   path that cannot be exercised.
-- **One thread per posted request**, not a pool. `prepXfer()` has already
-  folded the descriptor list down to a handful of RPCs, so the thread count
-  tracks requests rather than descriptors, but a pool belongs here once there
-  is a throughput test to size it against. A DAOS event queue was rejected on
-  purpose: it serialises on the per-EQ `eqx_lock` and caps around 7-12 GB/s
-  however the queues are arranged.
-- **Not measured.** The development host is 1 GbE with no RDMA; numbers have to
-  come from the testbed.
+- **Per-request overhead in the NIXL path**, roughly 0.076 ms, from the
+  `dynamic_cast`, the `std::map` in `prepXfer()`, five vector allocations per
+  group and the pool's mutex. Folding hides it -- 5% of a folded transfer,
+  60% of an unfolded one -- but it is the next thing to attack. The figure
+  comes from comparing two different harnesses, so it is an estimate.
+- **No NIXL agent.** The tests drive the backend directly.
+
+## Threads
+
+Work runs on a fixed pool, sized by `NIXL_DAOS_THREADS` (default 64). A DAOS
+event queue was rejected on purpose: it serialises on the per-EQ `eqx_lock` and
+caps around 7-12 GB/s however the queues are arranged.
+
+64 is where the ladder flattens: unfolded, the backend reaches 8.3 GB/s at 16
+threads, 11.3 at 32, 14.4 at 64 and 14.3 at 128. Effective concurrency is
+`min(threads, requests in flight)`, so a caller that keeps fewer requests
+outstanding is capped by its own depth, not by this setting.
 
 ## Building
 
@@ -89,7 +99,19 @@ ninja -C build
 NIXL requires C++20 and meson >= 0.64. GCC 11.5 is enough. On an older UCX or
 libfabric the transport plugins fail to compile (`UCS_BIT_GET`,
 `fi_mr_attr::rocr`); add `-Ddisable_plugins=UCX,LIBFABRIC` when only the
-storage backends are wanted.
+storage backends are wanted. UCX 1.21 builds them fine.
+
+The plugin finds DAOS itself. `find_library('daos')` answers only "is it
+somewhere the linker already looks" and returns no path, which produces a
+configure that succeeds and a link that fails with `cannot find -ldaos`. So
+`meson.build` searches `/var/daos-stockfull`, `/opt/daos-gds-gpu`, `/opt/daos`
+and `/usr/local` for a prefix that actually carries `daos.h`, and takes both
+the header and the library from it. A packaged DAOS under `/usr` and a source
+build under `/var` both work with no arguments.
+
+On a host without meson packaged (Rocky 10 has none), `python3 -m ensurepip`
+then `pip install meson ninja` works. `nvcc` must be on `PATH` or meson's CUDA
+probe fails.
 
 ## Tests
 

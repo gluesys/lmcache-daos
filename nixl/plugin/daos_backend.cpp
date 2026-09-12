@@ -4,6 +4,7 @@
  */
 #include "daos_backend.h"
 
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 
@@ -62,6 +63,44 @@ parseTarget(const std::string &meta, daosTarget &out) {
 
 } // namespace
 
+nixlDaosThreadPool::nixlDaosThreadPool(unsigned n) {
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; i++) {
+        workers_.emplace_back([this] {
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> g(m_);
+                    cv_.wait(g, [this] { return stop_ || !q_.empty(); });
+                    if (stop_ && q_.empty()) return;
+                    job = std::move(q_.front());
+                    q_.pop();
+                }
+                job();
+            }
+        });
+    }
+}
+
+nixlDaosThreadPool::~nixlDaosThreadPool() {
+    {
+        std::lock_guard<std::mutex> g(m_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto &t : workers_)
+        if (t.joinable()) t.join();
+}
+
+void
+nixlDaosThreadPool::submit(std::function<void()> job) {
+    {
+        std::lock_guard<std::mutex> g(m_);
+        q_.push(std::move(job));
+    }
+    cv_.notify_one();
+}
+
 nixl_b_params_t
 nixlDaosEngine::getPluginParams() {
     /* Nothing yet. "pool" and "container" will land here so a deployment can
@@ -82,9 +121,27 @@ nixlDaosEngine::nixlDaosEngine(const nixlBackendInitParams *init_params)
     } else if (rc != -DER_ALREADY) {
         NIXL_ERROR << "daos_init() failed: " << rc;
     }
+
+    /* 64 is where the concurrency ladder flattens on the testbed: at 400G
+     * verbs the unfolded arm reaches 8.3 GB/s at 16 threads, 11.3 at 32,
+     * 14.4 at 64, and 14.3 at 128. Effective concurrency is min(threads,
+     * requests in flight), so a caller that keeps fewer requests outstanding
+     * is capped by its own depth rather than by this number. */
+    unsigned nthreads = 64;
+    if (const char *env = std::getenv("NIXL_DAOS_THREADS")) {
+        const int v = std::atoi(env);
+        if (v > 0 && v <= 512) nthreads = static_cast<unsigned>(v);
+        else NIXL_WARN << "NIXL_DAOS_THREADS=" << env << " ignored (expected 1..512)";
+    }
+    pool_ = std::make_unique<nixlDaosThreadPool>(nthreads);
+    NIXL_DEBUG << "DAOS backend: " << nthreads << " IO threads";
 }
 
 nixlDaosEngine::~nixlDaosEngine() {
+    /* Workers touch container handles through the object handles they were
+     * given, so they have to be gone before anything below is closed. */
+    pool_.reset();
+
     {
         std::lock_guard<std::mutex> g(mtx_);
         for (auto &kv : conts_) {
@@ -345,42 +402,47 @@ nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
                          const nixl_opt_b_args_t *opt_args) const {
     auto *req = dynamic_cast<nixlDaosBackendReqH *>(handle);
     if (req == nullptr) return NIXL_ERR_INVALID_PARAM;
+    if (req->groups.empty()) return NIXL_SUCCESS;
 
+    req->status.store(NIXL_SUCCESS);
+    req->pending.store(static_cast<unsigned>(req->groups.size()));
     req->posted = true;
-    req->fut = std::async(std::launch::async, [req]() -> nixl_status_t {
-        for (auto &g : req->groups) {
+
+    for (auto &g : req->groups) {
+        nixlDaosIoGroup *gp = &g;
+        pool_->submit([req, gp]() {
             daos_key_t dkey;
-            d_iov_set(&dkey, &g.dkeyVal, sizeof(uint64_t));
+            d_iov_set(&dkey, &gp->dkeyVal, sizeof(uint64_t));
 
             const int rc =
                 req->op == NIXL_READ
-                    ? daos_obj_fetch(g.oh, DAOS_TX_NONE, 0, &dkey,
-                                     static_cast<unsigned>(g.iods.size()), g.iods.data(),
-                                     g.sgls.data(), nullptr, nullptr)
-                    : daos_obj_update(g.oh, DAOS_TX_NONE, 0, &dkey,
-                                      static_cast<unsigned>(g.iods.size()), g.iods.data(),
-                                      g.sgls.data(), nullptr);
+                    ? daos_obj_fetch(gp->oh, DAOS_TX_NONE, 0, &dkey,
+                                     static_cast<unsigned>(gp->iods.size()),
+                                     gp->iods.data(), gp->sgls.data(), nullptr, nullptr)
+                    : daos_obj_update(gp->oh, DAOS_TX_NONE, 0, &dkey,
+                                      static_cast<unsigned>(gp->iods.size()),
+                                      gp->iods.data(), gp->sgls.data(), nullptr);
+
             if (rc != 0) {
                 NIXL_ERROR << (req->op == NIXL_READ ? "daos_obj_fetch" : "daos_obj_update")
                            << " failed: " << rc;
-                return NIXL_ERR_BACKEND;
-            }
-
-            /* A fetch of a key that was never written returns success with
-             * iod_size 0. Silence there would be a miss reported as a hit, and
-             * this project has already paid for one of those. */
-            if (req->op == NIXL_READ) {
-                for (size_t i = 0; i < g.iods.size(); i++) {
-                    if (g.iods[i].iod_size == 0) {
-                        NIXL_ERROR << "DAOS: read of an absent key (dkey " << g.dkeyVal
-                                   << ", akey " << g.akeyVals[i] << ")";
-                        return NIXL_ERR_NOT_FOUND;
+                req->recordError(NIXL_ERR_BACKEND);
+            } else if (req->op == NIXL_READ) {
+                /* A fetch of a key that was never written returns success with
+                 * iod_size 0. Silence there would be a miss reported as a hit,
+                 * and this project has already paid for one of those. */
+                for (size_t i = 0; i < gp->iods.size(); i++) {
+                    if (gp->iods[i].iod_size == 0) {
+                        NIXL_ERROR << "DAOS: read of an absent key (dkey " << gp->dkeyVal
+                                   << ", akey " << gp->akeyVals[i] << ")";
+                        req->recordError(NIXL_ERR_NOT_FOUND);
+                        break;
                     }
                 }
             }
-        }
-        return NIXL_SUCCESS;
-    });
+            req->finishOne();
+        });
+    }
 
     return NIXL_IN_PROG;
 }
@@ -393,12 +455,10 @@ nixlDaosEngine::checkXfer(nixlBackendReqH *handle) const {
     /* Prepared but not posted: nothing is running, so nothing can have
      * finished. Saying SUCCESS here would let a caller act on data that was
      * never fetched. */
-    if (!req->posted || !req->fut.valid()) return NIXL_IN_PROG;
+    if (!req->posted) return NIXL_IN_PROG;
+    if (req->pending.load() != 0) return NIXL_IN_PROG;
 
-    if (req->fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-        return NIXL_IN_PROG;
-
-    return req->fut.get();
+    return static_cast<nixl_status_t>(req->status.load());
 }
 
 nixl_status_t
@@ -407,9 +467,9 @@ nixlDaosEngine::releaseReqH(nixlBackendReqH *handle) const {
     if (req == nullptr) return NIXL_ERR_INVALID_PARAM;
 
     /* DAOS has no cancel for a blocking call already in flight, so the only
-     * safe way out is to let it finish: the group vectors it is reading from
-     * die with this object. */
-    if (req->fut.valid()) req->fut.wait();
+     * safe way out is to let it finish: the group vectors the workers read
+     * from die with this object. */
+    if (req->posted) req->waitDone();
 
     delete req;
     return NIXL_SUCCESS;
