@@ -11,7 +11,22 @@ is doing real work.
 
 ## [Unreleased]
 
+### Fixed
+
+- The NIXL DAOS backend implements `loadLocalMD()`. It declared
+  `supportsLocal()` true without it, and the base class answers that with an
+  error rather than a default, so **every** `registerMem()` made through a
+  `nixlAgent` failed and took transfers down with it. Nothing calls that method
+  when the backend is driven directly, which is how it survived two test
+  programs, a benchmark and a 34 GB/s measurement.
+
 ### Added
+
+- `nixl/tests/test_agent.cpp` — drives the backend through a real `nixlAgent`
+  rather than directly. It found the bug above, and it confirms the descriptor
+  contract the other tests could only assume: `createXferReq()` passes
+  `nixlBasicDesc` with no metadata pointer, so the agent matches a transfer
+  descriptor back to its registered object by `devId` alone.
 
 - `doc/NIXL-DAOS-MEASUREMENT.md` — the NIXL DAOS backend measured on the 400G
   verbs testbed: **34.17 GB/s** reading 4.69 GiB with 40 layers folded into one

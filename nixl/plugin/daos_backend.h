@@ -226,6 +226,19 @@ public:
         return NIXL_SUCCESS;
     }
 
+    /* Required whenever supportsLocal() is true, and the base class returns
+     * an error rather than a default -- a backend that declares local support
+     * and skips this fails every registerMem() the agent makes, which is what
+     * happened here. For a loopback transfer the "remote" metadata is the same
+     * object, so the handle passes straight through. POSIX and GDS do the
+     * same. Nothing exercises it when the backend is driven directly, which is
+     * why it survived until the first agent-level test. */
+    nixl_status_t
+    loadLocalMD(nixlBackendMD *input, nixlBackendMD *&output) override {
+        output = input;
+        return NIXL_SUCCESS;
+    }
+
     nixl_status_t
     unloadMD(nixlBackendMD *input) override {
         return NIXL_SUCCESS;
