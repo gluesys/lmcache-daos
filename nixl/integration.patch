@@ -1,0 +1,31 @@
+Build-system integration for the DAOS plugin, against ai-dynamo/nixl main.
+
+Three edits; the plugin sources themselves live in plugin/ and are copied to
+src/plugins/daos/. Kept as a patch rather than a fork because it is small and
+because upstream may take the plugin, at which point this file disappears.
+
+--- a/meson.build
++++ b/meson.build
+@@ all_plugins
+-all_plugins = ['UCX', 'LIBFABRIC', 'POSIX', 'OBJ', ...
++all_plugins = ['UCX', 'LIBFABRIC', 'POSIX', 'DAOS', 'OBJ', ...
+
+@@ before "# Check for POSIX aio"
++# DAOS client library. Looked up here rather than in the plugin so the gate in
++# src/plugins/meson.build can skip the subdir when it is absent.
++daos_dep = meson.get_compiler('cpp').find_library('daos', required: false)
++
+ # Check for POSIX aio
+
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ before the OBJ block
++if enabled_plugins.get('DAOS')
++    subdir('daos')
++endif
++
+ if enabled_plugins.get('OBJ')
+
+Note: `cc` is not yet defined at that point in the root meson.build -- it is
+introduced later, in src/plugins/meson.build -- so the lookup must use
+meson.get_compiler('cpp') directly.
