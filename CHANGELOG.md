@@ -11,6 +11,29 @@ is doing real work.
 
 ## [Unreleased]
 
+### Added
+
+- `VRAM_SEG` in the NIXL DAOS backend: transfers straight between DAOS objects
+  and GPU memory via `daos_obj_fetch_gpu()` / `daos_obj_update_gpu()`. It is
+  compiled in only when the client exports those symbols (meson checks;
+  `DAOS_PREFIX` selects the client), so a stock DAOS never advertises a
+  capability it cannot serve.
+
+  It is **off by default and should stay off.** `doc/NIXL-DAOS-VRAM.md` has the
+  measurement: device-to-device round trips are bit-identical, but the path is
+  3.4x *slower* than staging through host memory. The cost is not bandwidth and
+  not RPC count -- holding the bytes fixed and cutting the sgl entries from
+  4800 to 1200 cut the time by 4.03x, which puts about 0.43 ms on every entry.
+  That is CaRT re-registering the GPU buffer per transfer. The field meant to
+  avoid it, `daos_mem_attr_t::ma_rkey`, carries a descriptor that only cuFile's
+  plugin callback receives, so a backend calling DAOS directly cannot supply
+  it; and Mercury pins `FI_MR_CACHE_MAX_COUNT=0`, so caching the registration
+  is closed too.
+- `nixl/tests/test_gpu.cpp` — the device-to-device round trip. The payload is
+  produced on the device and compared from the device, so a silent fallback to
+  a host bounce cannot pass it.
+- `-g` in `nixl/tests/bench_nixl.cpp` to stage through GPU memory.
+
 ### Fixed
 
 - The NIXL DAOS backend implements `loadLocalMD()`. It declared
