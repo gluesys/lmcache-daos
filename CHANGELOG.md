@@ -11,6 +11,27 @@ is doing real work.
 
 ## [Unreleased]
 
+### Added
+
+- `nixl/` — a DAOS backend plugin for
+  [NIXL](https://github.com/ai-dynamo/nixl). NIXL ships 16 backends and none of
+  them speaks DAOS. Registration and transfer both work against a live pool;
+  the two programs in `nixl/tests/` pass. It has not been run under a NIXL
+  agent yet, only driven directly, and it has not been measured — the
+  development host is 1 GbE with no RDMA.
+
+  It is built on the raw object API rather than DFS, for the reason the
+  layerwise measurement turned up: DFS pays ~0.63 ms of fixed cost per object
+  against 0.0137 ms for dkey/akey, and the object API can fold a whole
+  descriptor list into one `daos_obj_fetch()` through its iod array, which is
+  the shape `prepXfer()` hands us. Offsets are cut at a 64 MiB span into
+  dkey and akey so that descriptors in one span fold into a single RPC while
+  separate spans still spread across targets.
+
+  Not yet: `VRAM_SEG` (the host has no `nvidia_fs`, so the GPU-direct entry
+  points cannot be exercised), a thread pool (one thread per posted request),
+  and any performance number.
+
 ### Changed
 
 - The libfabric `prov/verbs` dma-buf fd fix is prepared for upstream submission
