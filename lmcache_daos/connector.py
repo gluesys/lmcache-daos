@@ -49,9 +49,21 @@ try:
     from lmcache.v1.memory_management import MemoryObj  # noqa: F401
     from lmcache.v1.protocol import RemoteMetadata
 
+    from lmcache.logging import init_logger
+
     _HAS_LMCACHE = True
 except Exception:  # pragma: no cover - exercised only off the serving host
     _HAS_LMCACHE = False
+
+# This module is importable without LMCache on purpose (see above), so the
+# logger has to survive that too: falling back to the stdlib keeps the module
+# inspectable off the serving host, which is where the unit tests run.
+if _HAS_LMCACHE:
+    logger = init_logger(__name__)
+else:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger(__name__)
 
     class RemoteConnector:  # minimal stand-in so the class body imports
         def __init__(self, *a, **k):
@@ -108,6 +120,33 @@ def _key_to_path(key) -> str:
     return "/" + hashlib.sha256(s.encode()).hexdigest()
 
 
+# Probed by ping(). A name that no key can produce: _key_to_path() returns
+# "/" + sha256 hexdigest, so a leading dot never collides with real data.
+_PING_PATH = "/.daos-ping"
+
+# base_connector's ping() contract is "0 means success"; anything non-zero is
+# an error code. DAOS returns negative DER_* values, so a positive sentinel
+# cannot be confused with one.
+PING_UNKNOWN_ERROR = 1
+
+# LMCache's health monitor already reserves these two for the cases it detects
+# itself (health_monitor/constants.py), so reusing them keeps one vocabulary in
+# the metric rather than inventing a second one for the same conditions.
+PING_TIMEOUT_ERROR = -1
+
+# How long a ping may take before it is called a failure. LMCache's health
+# monitor applies its own timeout of 5 s (DEFAULT_PING_TIMEOUT) around the
+# future, so this is deliberately shorter: whoever times out first should be
+# the one that can also stop waiting for the thread, and that is us.
+#
+# Why any timeout at all: DAOS retries an RPC internally for a long time before
+# giving up. With the server down, a ping took well over three minutes to
+# return DER_TIMEDOUT in testing -- long past the point where the answer was
+# still useful. The monitor's own timeout would return control to it, but the
+# executor thread would stay blocked for those minutes, which is how a probe
+# meant to report on the I/O path ends up consuming it.
+PING_TIMEOUT_SECS = float(os.environ.get("DAOS_PING_TIMEOUT", "3.0"))
+
 class DaosConnector(RemoteConnector):
     def __init__(self, url=None, loop=None, local_cpu_backend=None, config=None):
         # LMCache's DynamicConnectorAdapter instantiates us as
@@ -140,6 +179,16 @@ class DaosConnector(RemoteConnector):
         self._workers = int(os.environ.get("DAOS_WORKERS", "16"))
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._workers, thread_name_prefix="daos-io")
+
+        # Health probes get their own thread, deliberately not the IO pool. A
+        # ping against a dead server sits in libdaos for minutes, and if it
+        # were competing for the same 16 workers then the probe meant to report
+        # on the data path would be taking capacity away from it -- the failure
+        # would make its own reporting worse. One thread also bounds the damage:
+        # at most one blocked thread, ever, however long the outage lasts.
+        self._ping_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="daos-ping")
+        self._ping_inflight = False
         self._warm_up()
 
     def _warm_up(self) -> None:
@@ -233,6 +282,80 @@ class DaosConnector(RemoteConnector):
     # read⊕H2D ≈ 19 GB/s even though read alone does 34 and H2D 46).
     # Contract (per base_connector): return only the CONSECUTIVE prefix of
     # successfully retrieved objects; release anything after the first miss.
+    # -- health ----------------------------------------------------------
+    # Until this existed, LMCache's RemoteBackendHealthCheck read
+    # support_ping() as False and took the documented shortcut:
+    #
+    #     # If connector doesn't support ping, assume it's healthy
+    #     if not connector.support_ping():
+    #         return True
+    #
+    # So the backend reported healthy no matter what DAOS was doing. That
+    # matters more here than for most connectors, because every DAOS error in
+    # this file is caught and turned into a cache miss -- correct behaviour for
+    # a cache, but it means an outage and a cold cache look identical from the
+    # outside: the hit rate drops, nothing else changes, and vLLM just gets
+    # slower. Answering the ping is what separates the two.
+    def support_ping(self) -> bool:
+        return True
+
+    # Deliberately a metadata operation, not a data round trip. LMCache runs
+    # this on a timer and already has _put_and_get_check() for exercising the
+    # data path; a ping that moved bytes would add load in proportion to how
+    # worried the operator is. Looking up a name that cannot exist reaches the
+    # container -- pool handle, container handle, DFS namespace -- and comes
+    # back ENOENT, which is the cheapest end-to-end answer available.
+    #
+    # Return value is an error code, 0 for healthy, per base_connector. The
+    # DAOS rc is passed through rather than flattened to 1 so the recorded
+    # code says *how* it failed: the monitor feeds it to
+    # update_remote_ping_error_code(), and -1005 (DER_NONEXIST, container
+    # gone) is a different operational problem from -1020 (DER_UNREACH,
+    # network) even though both stop the cache working.
+    async def ping(self) -> int:
+        # A ping that is already stuck answers the next one too. run_in_executor
+        # futures cannot really be cancelled -- wait_for() below stops waiting
+        # but the thread keeps running inside libdaos until DAOS gives up -- so
+        # without this, a dead server would queue one blocked thread per probe
+        # interval. Reporting the outstanding failure immediately is both
+        # cheaper and more accurate: the backend is still unreachable.
+        if self._ping_inflight:
+            return PING_TIMEOUT_ERROR
+
+        self._ping_inflight = True
+        try:
+            await asyncio.wait_for(
+                self.loop.run_in_executor(self._ping_pool, self._ping_sync),
+                timeout=PING_TIMEOUT_SECS)
+            return 0
+        except asyncio.TimeoutError:
+            logger.warning("DAOS ping timed out after %.1fs", PING_TIMEOUT_SECS)
+            # Leave _ping_inflight set: the thread is still in libdaos, and the
+            # finally block below only clears it when the call actually
+            # returned. _ping_done() is what releases it.
+            return PING_TIMEOUT_ERROR
+        except DaosError as e:
+            self._ping_inflight = False
+            logger.warning("DAOS ping failed: rc=%s", e.rc)
+            return e.rc if e.rc != 0 else PING_UNKNOWN_ERROR
+        except Exception as e:  # transport gone, handle closed, anything else
+            self._ping_inflight = False
+            logger.warning("DAOS ping failed: %s", e)
+            return PING_UNKNOWN_ERROR
+
+    def _ping_sync(self) -> None:
+        # ENOENT is the expected answer and means the path was resolved, so
+        # exists() returning False is success. Any DaosError other than ENOENT
+        # propagates, because exists() only swallows that one.
+        try:
+            self._dfs.exists(_PING_PATH)
+        finally:
+            # Runs on the ping thread, so it clears the flag whenever the call
+            # actually came back -- including long after wait_for() gave up.
+            # That is what lets a recovered backend start answering again
+            # instead of being stuck reporting the old timeout forever.
+            self._ping_inflight = False
+
     # MEASURED (2026-08-25): enabling this path did NOT unlock read↔H2D
     # pipelining — the API returns a list, so all chunks must still be read
     # before LMCache starts H2D. Aggregate was flat (conc4 +6%) and single
@@ -533,6 +656,12 @@ class DaosConnector(RemoteConnector):
 
     async def close(self):
         self._pool.shutdown(wait=True)
+        # wait=False on purpose: a ping can be stuck inside libdaos for minutes
+        # when the backend is down, and shutdown is exactly the moment we must
+        # not block on it. The thread is a daemon of the interpreter's pool and
+        # goes away with the process; holding up close() to watch it finish
+        # would turn an outage into a hang on the way out.
+        self._ping_pool.shutdown(wait=False)
         try:
             self._dfs.close()
         except Exception:
