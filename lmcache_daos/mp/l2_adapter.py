@@ -194,7 +194,11 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         workers: int = 8,
         max_capacity_gb: float = 0.0,
         verify_size: bool = True,
-        status_interval_s: float = 0.0,
+        # Defaulted off, which meant the status thread never started and a
+        # default deployment reported nothing at all. 60 s is quiet enough to
+        # leave on and frequent enough that an outage is noticed within a
+        # minute; 0 still disables it.
+        status_interval_s: float = 60.0,
         task_workers: int = 32,
         load_schedule: str = "fifo",
         probe_chunks: int = 64,
@@ -356,6 +360,19 @@ class DaosL2Adapter(L2AdapterInterface):
             "load_failed": 0, "deleted": 0, "errors": 0,
             "load_bytes": 0, "load_seconds": 0.0, "lookup_seconds": 0.0,
             "store_bytes": 0, "store_seconds": 0.0,
+            # Counts alone cannot tell an outage from an idle node: when DAOS
+            # goes away the adapter turns every error into a miss and the task
+            # counters simply stop moving, which looks exactly like nobody
+            # asking. These three carry the timeline that separates them.
+            #
+            # errors_by_op splits what "errors" lumps together, because
+            # "stores are failing" and "loads are failing" are different
+            # tickets, and last_error keeps the text so the operator does not
+            # have to go find the log line that already scrolled past.
+            "errors_by_op": {"store": 0, "lookup": 0, "load": 0, "delete": 0},
+            "last_ok": 0.0,
+            "last_error": "",
+            "last_error_at": 0.0,
         }
         self._closing = False
         self._status_thread = None
@@ -426,6 +443,23 @@ class DaosL2Adapter(L2AdapterInterface):
             self._inflight += 1
             return tid
 
+    # -- health accounting --------------------------------------------------
+    # Both take the lock themselves: they are called from the task pool, the
+    # I/O pool and the caller's thread.
+    def _note_ok(self) -> None:
+        with self._lock:
+            self._stats["last_ok"] = time.time()
+
+    def _note_error(self, op: str, err: object) -> None:
+        with self._lock:
+            self._stats["errors"] += 1
+            self._stats["errors_by_op"][op] += 1
+            # Type as well as text: a DaosError carries an rc saying which
+            # failure this was, and "DaosError: rc=-1005" is a different
+            # problem from "OSError: ...".
+            self._stats["last_error"] = "%s: %s" % (type(err).__name__, err)
+            self._stats["last_error_at"] = time.time()
+
     def _finish(self) -> None:
         with self._lock:
             self._inflight -= 1
@@ -470,6 +504,7 @@ class DaosL2Adapter(L2AdapterInterface):
             return n
         except (DaosError, OSError, ValueError) as e:
             logger.warning("daos store failed %s: %s", path, e)
+            self._note_error("store", e)
             return -1
 
     def _execute_store(self, keys, objects, tid: L2TaskId) -> None:
@@ -490,10 +525,10 @@ class DaosL2Adapter(L2AdapterInterface):
                     total += r
                     stored_keys.append(key)
                     sizes.append(r)
-        except Exception:
+        except Exception as e:
             logger.exception("daos store task %d failed", tid)
             success = False
-            self._stats["errors"] += 1
+            self._note_error("store", e)
         with self._lock:
             self._completed_store[tid] = L2StoreResult(success, total)
             self._stats["store_tasks"] += 1
@@ -501,6 +536,7 @@ class DaosL2Adapter(L2AdapterInterface):
             self._stats["store_bytes"] += total
             self._stats["store_seconds"] += time.monotonic() - t0
         if stored_keys:
+            self._note_ok()
             self._notify_keys_stored(stored_keys, sizes)
         self._finish()
         self._store_efd.notify()
@@ -527,7 +563,7 @@ class DaosL2Adapter(L2AdapterInterface):
             size = self._dfs.stat_size(path)
         except (DaosError, OSError) as e:
             logger.warning("daos stat failed %s: %s", path, e)
-            self._stats["errors"] += 1
+            self._note_error("lookup", e)
             return False
         if size is None:
             return False
@@ -548,14 +584,16 @@ class DaosL2Adapter(L2AdapterInterface):
                         self._stats["lookup_hits"] += 1
                     else:
                         self._stats["lookup_misses"] += 1
-        except Exception:
+        except Exception as e:
             logger.exception("daos lookup task %d failed", tid)
-            self._stats["errors"] += 1
+            self._note_error("lookup", e)
         el = time.monotonic() - t0
         with self._lock:
             self._completed_lookup[tid] = bitmap
             self._stats["lookup_tasks"] += 1
             self._stats["lookup_seconds"] += el
+        if bitmap is not None and self._stats["lookup_hits"]:
+            self._note_ok()
         if el > 0.05:
             logger.info("daos l2 lookup task %d: %d keys in %.1f ms", tid, len(keys), el * 1e3)
         self._finish()
@@ -598,6 +636,7 @@ class DaosL2Adapter(L2AdapterInterface):
             return True
         except (DaosError, OSError, ValueError) as e:
             logger.warning("daos load failed %s: %s", path, e)
+            self._note_error("load", e)
             return False
 
     def _execute_load(self, keys, objects, tid: L2TaskId) -> None:
@@ -617,15 +656,17 @@ class DaosL2Adapter(L2AdapterInterface):
                     nbytes += len(objects[i].byte_array)
                 else:
                     self._stats["load_failed"] += 1
-        except Exception:
+        except Exception as e:
             logger.exception("daos load task %d failed", tid)
-            self._stats["errors"] += 1
+            self._note_error("load", e)
         el = time.monotonic() - t0
         with self._lock:
             self._completed_load[tid] = bitmap
             self._stats["load_tasks"] += 1
             self._stats["load_bytes"] += nbytes
             self._stats["load_seconds"] += el
+        if nbytes:
+            self._note_ok()
         if nbytes:
             logger.info(
                 "daos l2 load task %d: %d/%d keys, %.1f MiB in %.1f ms (%.2f GB/s)",
@@ -660,9 +701,10 @@ class DaosL2Adapter(L2AdapterInterface):
                     sizes.append(size)
             except (DaosError, OSError) as e:
                 logger.warning("daos delete failed %s: %s", path, e)
-                self._stats["errors"] += 1
+                self._note_error("delete", e)
         if deleted:
             self._stats["deleted"] += len(deleted)
+            self._note_ok()
             self._notify_keys_deleted(deleted, sizes)
 
     def report_status(self) -> dict:
@@ -680,15 +722,61 @@ class DaosL2Adapter(L2AdapterInterface):
                     "bytes_used": self._total_bytes_used,
                 }
             )
+            st["healthy"] = self._healthy_locked()
+            last_ok = float(self._stats["last_ok"])
+            st["since_last_success_s"] = (
+                round(time.time() - last_ok, 1) if last_ok > 0 else None)
         return st
+
+    def _healthy_locked(self):
+        """True / False / None, with the lock already held.
+
+        None until something has happened. Reporting False before the first
+        operation would make every start-up look like an outage, and "no
+        opinion yet" is the honest answer.
+
+        Otherwise: healthy unless the most recent event was a failure and
+        nothing has succeeded since. Kept this simple deliberately -- a ratio
+        over a sliding window needs a window length nobody here has measured,
+        and this already separates the case that matters, "some keys are
+        missing" versus "the backend is gone".
+        """
+        last_ok = float(self._stats["last_ok"])
+        last_err = float(self._stats["last_error_at"])
+        if last_ok == 0.0 and last_err == 0.0:
+            return None
+        if last_err == 0.0:
+            return True
+        return last_ok > last_err
 
     def _status_loop(self, interval: float) -> None:
         last = None
+        was_healthy = None
         while not self._closing:
             time.sleep(interval)
             st = self.report_status()
             sig = (st["store_tasks"], st["lookup_tasks"], st["load_tasks"], st["deleted"])
-            if sig != last:
+            healthy = st["healthy"]
+
+            # Emitting only on a change of task counts was the original rule,
+            # and it goes quiet at exactly the wrong moment: when DAOS is gone
+            # the adapter turns errors into misses, the task counters stop
+            # advancing, and an outage becomes indistinguishable from an idle
+            # node. So an unhealthy backend reports on every tick regardless,
+            # and each transition is called out once at WARNING.
+            if healthy is False and was_healthy is not False:
+                logger.warning(
+                    "daos l2 UNHEALTHY: last error %s, %s since last success",
+                    st["last_error"],
+                    "never succeeded" if st["since_last_success_s"] is None
+                    else "%.1fs" % st["since_last_success_s"])
+            elif healthy is True and was_healthy is False:
+                logger.warning("daos l2 recovered: %s", st)
+            was_healthy = healthy
+
+            if healthy is False:
+                logger.warning("daos l2 status (unhealthy): %s", st)
+            elif sig != last:
                 last = sig
                 logger.info("daos l2 status: %s", st)
 

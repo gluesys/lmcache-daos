@@ -250,6 +250,87 @@ def test_fair_schedule_loads_concurrent_tasks():
     ad.close()
 
 
+def test_health_starts_with_no_opinion():
+    """A fresh adapter must not claim to be unhealthy.
+
+    The constructor runs a warm-up probe, so "nothing has happened yet" is
+    briefly true and briefly false; what must never happen is reporting
+    False at start-up, which would make every launch look like an outage.
+    """
+    ad, _ = make()
+    try:
+        assert ad.report_status()["healthy"] is not False
+    finally:
+        ad.close()
+
+
+def test_health_turns_false_when_daos_fails_and_back_when_it_recovers():
+    """The signal this whole change exists for.
+
+    The adapter converts DAOS errors into cache misses -- right for a cache,
+    and the reason an outage is invisible from outside: the hit rate drops
+    and nothing else changes. report_status() has to say which it is.
+    """
+    ad, dfs = make()
+    try:
+        ks = [key(i) for i in range(2)]
+        objs = [FakeObj(256) for _ in ks]
+        tid = ad.submit_store_task(ks, objs)
+        wait_fd(ad.get_store_event_fd())
+        assert set(ad.pop_completed_store_tasks()) == {tid}
+        assert ad.report_status()["healthy"] is True
+
+        # Break the backend the way a dead server does: every call raises.
+        def boom(*a, **kw):
+            raise OSError("daos down")
+
+        saved = dfs.open_rdwr_create
+        dfs.open_rdwr_create = boom
+        tid = ad.submit_store_task([key(9)], [FakeObj(256)])
+        wait_fd(ad.get_store_event_fd())
+        ad.pop_completed_store_tasks()
+
+        st = ad.report_status()
+        assert st["healthy"] is False, st
+        assert st["errors_by_op"]["store"] >= 1, st
+        # The text has to survive: the log line it came from has scrolled away
+        # by the time anyone looks.
+        assert "OSError" in st["last_error"], st
+        assert st["since_last_success_s"] is not None
+
+        dfs.open_rdwr_create = saved
+        tid = ad.submit_store_task([key(10)], [FakeObj(256)])
+        wait_fd(ad.get_store_event_fd())
+        ad.pop_completed_store_tasks()
+        assert ad.report_status()["healthy"] is True
+    finally:
+        ad.close()
+
+
+def test_errors_are_attributed_to_the_operation():
+    """'errors' alone cannot tell stores failing from loads failing."""
+    ad, dfs = make()
+    try:
+        def boom(*a, **kw):
+            raise OSError("daos down")
+
+        dfs.open_rdonly = boom
+        ks = [key(i) for i in range(2)]
+        objs = [FakeObj(256) for _ in ks]
+        tid = ad.submit_store_task(ks, objs)
+        wait_fd(ad.get_store_event_fd())
+        ad.pop_completed_store_tasks()
+
+        tid = ad.submit_load_task(ks, objs)
+        wait_result(ad.query_load_result, tid, ad.get_load_event_fd())
+
+        st = ad.report_status()
+        assert st["errors_by_op"]["load"] >= 1, st
+        assert st["errors_by_op"]["store"] == 0, st
+    finally:
+        ad.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
