@@ -176,6 +176,56 @@ class DaosPoolWedged(DaosError):   # rc = EBUSY
 오버헤드 76 µs 의 **0.78 %**, DFS 객체당 630 µs 에 비하면 무시할 수준이다.
 추정이 아니라 `timeit` 20만 회다.
 
+## 저수준 객체 API 는 다른가 — 측정
+
+DFS 를 dkey/akey 로 바꾸자는 이유는 성능이다. 객체당 고정비가 **0.63 ms 대
+0.0137 ms** 로 46배 차이다 (`doc/LAYERWISE-MEASUREMENT.md`). 그런데 같은 결함
+아래서 저수준이 어떻게 행동하는지는 아무도 재지 않았고, "다른 API 니까"는 근거가
+아니다. `tests/obj_failure.c` 가 그걸 잰다. 위와 똑같은 결함 — 쓰기 도중
+`daos_server` SIGKILL, 스레드 16개, 8 MiB 업데이트.
+
+| arm | 결과 | 잃은 스레드 |
+|---|---|---|
+| `sync` — `daos_obj_update(..., NULL)` | **16/16 이 150 초 뒤에도 호출 안** | **16** |
+| `async` — 이벤트 큐 + `daos_eq_poll` 타임아웃 | 16/16 이 **5.01 초**에 스스로 포기, 총 5.4 초 | **0** |
+| `async-abort` — 위 + `daos_event_abort`/`fini` | 같음. **abort 0.00 s, fini 0.00 s** | **0** |
+
+**차이는 "저수준이냐 DFS 냐"가 아니라 "블로킹이냐 이벤트 큐냐"다.** 저수준의
+블로킹 형태는 DFS 와 정확히 똑같이 고착된다 — 16/16, 구분이 안 된다. DFS 가
+아예 못 하는 것은 이벤트 큐 쪽이다.
+
+그리고 **지금 NIXL 플러그인은 블로킹 형태를 쓴다.** `nixl/plugin/daos_backend.cpp`
+가 `daos_obj_update(..., nullptr)` 로 부른다. 즉 저수준으로 옮기는 것만으로는
+장애 거동이 하나도 나아지지 않는다. 이벤트 큐까지 가야 한다.
+
+### 이게 왜 위의 미해결 질문과 독립인가
+
+앞에서 무한 고착이 단일 랭크 인공물일 가능성을 열어 뒀다 — SWIM 이 죽은 랭크를
+축출할 정족수가 없어서. **`async` 결과는 그 질문에 영향을 받지 않는다.** 5.01 초
+경계는 DAOS 가 포기해서 생긴 게 아니라 **호출자가 정한 것**이기 때문이다. DAOS 가
+영원히 재시도하든 60 초에 포기하든 결과는 같다. 지금 커넥터가 고착 감지기로
+흉내 내야 했던 성질을, 이벤트 큐는 그냥 갖고 있다.
+
+### 값은 치른다
+
+`daos_eq_poll` 이 타임아웃으로 돌아왔을 때 **RPC 는 여전히 진행 중이다.**
+스레드는 회수되지만 연산은 취소되지 않는다. 이벤트를 그냥 버리면 DAOS 가 곧 죽을
+스택 프레임을 가리키게 된다 — 처음 측정한 `async` arm 이 정확히 그랬고, 그래서
+`async-abort` arm 을 따로 만들었다. 결과는 **abort 도 fini 도 0.00 초**라 정리
+비용은 없다. 탈출구가 막힘을 다른 데로 옮기지 않는다.
+
+### 확인 못 한 것: GPU 진입점
+
+`daos_obj_fetch_gpu` / `daos_obj_update_gpu` 가 이벤트를 받는지는 **여기서 재지
+못했다.** cxl2 는 stock DAOS 2.8.0 이라 그 진입점이 없다.
+
+플러그인 안에는 "GPU 진입점은 동기 전용 — 이벤트 큐 없음"이라는 주석이 있는데,
+**호출부의 인자 개수를 세어 보면 그 주석과 맞지 않는다.** GPU 형태는 비-GPU 형태에
+`mem_attrs` 하나가 더 붙은 모양이고 마지막 인자는 여전히 `ev` 자리로 보인다.
+주석이 틀렸거나, 초안 구현이 `ev` 를 무시한다는 뜻일 수 있다. 둘 중 무엇인지는
+GPU 호스트에서 헤더를 봐야 정해진다. 그때까지 `VRAM_SEG` 경로에 이 탈출구가
+있다고 가정하면 안 된다.
+
 ## 답하지 못한 것
 
 이건 한계이지 TODO 가 아니다. 지금 장비에서 답할 수 없다.
@@ -183,7 +233,8 @@ class DaosPoolWedged(DaosError):   # rc = EBUSY
 | 질문 | 왜 못 하나 | 필요한 것 |
 |---|---|---|
 | 크래시 때 날아가던 객체가 디스크에 **절단**(→ miss, 정답)으로 남나, **완전한데 틀리게** 남나 | SCM 이 램디스크라 복구 = 재포맷. 증거가 같이 사라진다 | MD-on-SSD |
-| 무한 재시도가 **단일 랭크 특성**인가 | 랭크가 하나뿐이라 SWIM 이 죽은 랭크를 축출할 정족수가 없다. 다중 랭크 클러스터라면 축출 후 오류가 떴을 수 있다 | cell1/cell2 |
+| 무한 재시도가 **단일 랭크 특성**인가 | 랭크가 하나뿐이라 SWIM 이 죽은 랭크를 축출할 정족수가 없다. 다중 랭크 클러스터라면 축출 후 오류가 떴을 수 있다 (단 위 `async` 결과는 이 질문과 무관하다) | cell1/cell2 |
+| GPU 진입점이 이벤트를 받나 | cxl2 는 stock DAOS 라 그 심볼이 없다 | GPU 호스트 |
 | 랭크 손실 · 네트워크 분단 | 노드가 하나다 | cell1/cell2 |
 
 
@@ -198,6 +249,11 @@ class DaosPoolWedged(DaosError):   # rc = EBUSY
 ```bash
 sudo bash tests/failure_modes.sh [pool] [container]     # 전체 행렬 (파괴적!)
 python3 tests/test_wedge.py                             # 고착 감지 (DAOS 불필요)
+
+# 저수준 경로 (파괴적!) -- arm: sync | async | async-abort
+gcc -O2 -pthread -o obj_failure tests/obj_failure.c \
+    -I/usr/include -L/usr/lib64 -ldaos -ldaos_common -lgurt -luuid
+./obj_failure --pool kvpool --cont nixltest --arm async --kill-after 0.3
 ```
 
 구동기는 단일 노드 DAOS 를 **부수고 복구한다.** 공유 클러스터에 절대 돌리지 마라.

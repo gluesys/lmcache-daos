@@ -13,6 +13,23 @@ is doing real work.
 
 ### Added
 
+- `tests/obj_failure.c` measures the low-level object API under the same fault,
+  because switching to dkey/akey for its 46x lower per-object cost should not be
+  decided without knowing what it does when the engine dies.
+
+  The answer is that the interesting axis is not the one people assume.
+  `daos_obj_update(..., NULL)` wedges exactly like DFS -- 16 of 16 threads still
+  inside the call at 150 s, indistinguishable. What DFS cannot do at all is the
+  event queue: with `daos_eq_poll` on a timeout, all 16 threads gave up at
+  5.01 s and none was lost, and `daos_event_abort` + `daos_event_fini` then cost
+  0.00 s each, so the tidy version of that pattern is bounded too.
+
+  That bound does not depend on the open question of whether the endless retry
+  is a single-rank artifact, because the deadline belongs to the caller rather
+  than to DAOS. The NIXL plugin currently passes `nullptr`, so it has the
+  blocking behaviour today; moving to the raw API buys performance and, on its
+  own, changes nothing about failure.
+
 - A fault matrix for the DAOS backend -- `tests/failure_modes.py` (one scenario
   per process), its driver `tests/failure_modes.sh`, and the record in
   [doc/FAILURE-MODES.md]. Every number in this repo up to now came from a
