@@ -11,6 +11,31 @@ is doing real work.
 
 ## [Unreleased]
 
+### Changed
+
+- The MP-mode L2 adapter can now say it is broken. It already counted work --
+  seventeen counters and a periodic status thread -- but nothing in that told
+  an outage from an idle node: the adapter turns every DAOS error into a cache
+  miss, so when the backend goes away the task counters simply stop advancing,
+  which is exactly what an unused node looks like. Three fields close that:
+  `last_ok`, `last_error` with its timestamp, and `errors_by_op` splitting what
+  `errors` lumped together. `report_status()` derives `healthy` and
+  `since_last_success_s` from them.
+
+  The status thread also stopped being silent at the worst moment. It only
+  logged when task counts changed, which during an outage is never; it now
+  reports on every tick while unhealthy and calls out each transition at
+  WARNING. And it runs by default: `status_interval_s` was 0, so a default
+  deployment started no status thread and reported nothing at all. It is now
+  60 s.
+
+  This is MP-only and stays in our tree because upstream has nowhere to put it.
+  LMCache's health machinery hangs entirely off `RemoteConnector` --
+  `health_monitor/checks/` holds one file, for remote backends -- while
+  `L2AdapterInterface` has eleven abstract methods and not one of them asks
+  whether the backend is alive. Proposing that contract upstream is the longer
+  fix; this is what can be done without waiting for it.
+
 ### Added
 
 - The in-process connector answers LMCache's health probe: `support_ping()` and
