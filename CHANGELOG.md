@@ -11,6 +11,52 @@ is doing real work.
 
 ## [Unreleased]
 
+### Added
+
+- A fault matrix for the DAOS backend -- `tests/failure_modes.py` (one scenario
+  per process), its driver `tests/failure_modes.sh`, and the record in
+  [doc/FAILURE-MODES.md]. Every number in this repo up to now came from a
+  healthy pool, which says nothing about the case that decides shippability.
+
+  Good news first: **no scenario produced wrong bytes.** A destroyed container
+  raises `DER_NO_HDL` immediately, a full pool raises `ENOSPC` in 0.01 s and
+  goes on serving reads, and killing `daos_agent` under an open handle changes
+  nothing at all -- the agent is not on the I/O path once the handles exist.
+
+  The bad one: **a DAOS call whose engine has died does not return.** SIGKILL of
+  `daos_server` during a `batched_put` left 16 of 16 `daos-io` threads inside
+  `dfs_sys_write`, still there 16 minutes later, spinning ~13 cores.
+  `CRT_TIMEOUT=10` changed nothing. A thread inside a C call cannot be cancelled
+  from Python, so the pool is finished for the life of the process.
+
+### Fixed
+
+- `close()` no longer joins threads that are never coming back. It called
+  `self._pool.shutdown(wait=True)` and hung there -- the comment two lines below
+  had already worked this out for the ping pool and chosen `wait=False`, while
+  the data pool kept `wait=True`. Note this does not make the process
+  *exitable*: `concurrent.futures` joins every worker at interpreter shutdown
+  regardless, verified directly.
+
+### Changed
+
+- The connector notices when its IO pool is wedged and fails immediately
+  instead of queuing behind it (`DaosPoolWedged`, rc `EBUSY`; threshold
+  `DAOS_STALL_SECS`, default 60 s). Queuing forever is strictly worse than
+  failing: LMCache treats a raised `get`/`put` as a miss and serves from the
+  model, while a submission that never returns takes the request with it.
+
+  The test is "every worker busy AND no completion in the window", not
+  saturation -- a large store legitimately occupies all 16 workers for minutes,
+  and a detector that could not tell load from a wedge would disable the
+  backend under the load it exists to serve. `ping()` reports it too, since the
+  probe runs on its own thread and would otherwise return a cheerful 0 from a
+  dead data path. Cost is 0.59 us per operation, 0.78% of the measured 76 us
+  per-request NIXL overhead.
+
+  Same structure exists in the MP adapter, the NIXL plugin and the GDS path;
+  only the in-process connector is guarded so far.
+
 ### Changed
 
 - `doc/upstream/` records what actually happened to the submissions rather than
@@ -31,6 +77,7 @@ is doing real work.
   is not something a contributor can satisfy, which is worth knowing before
   assuming a red check needs fixing.
 
+[doc/FAILURE-MODES.md]: doc/FAILURE-MODES.md
 [PR #12828]: https://github.com/ofiwg/libfabric/pull/12828
 [issue #2245]: https://github.com/ai-dynamo/nixl/issues/2245
 [PR #2246]: https://github.com/ai-dynamo/nixl/pull/2246

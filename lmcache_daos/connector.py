@@ -32,8 +32,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import ctypes
+import errno
 import hashlib
 import os
+import sys
+import threading
+import time
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -147,6 +151,43 @@ PING_TIMEOUT_ERROR = -1
 # meant to report on the I/O path ends up consuming it.
 PING_TIMEOUT_SECS = float(os.environ.get("DAOS_PING_TIMEOUT", "3.0"))
 
+
+# A DAOS call whose engine has died does not come back. Measured on cxl2
+# (doc/FAILURE-MODES.md): SIGKILL of daos_server during a batched_put left 16
+# of 16 daos-io threads inside dfs_sys_write, still there 16 minutes later and
+# spinning at ~1300% CPU across the pool. CRT_TIMEOUT=10 changed nothing. A
+# thread blocked inside a C call cannot be cancelled from Python -- asyncio's
+# wait_for() abandons the await and the thread stays gone -- so at that point
+# the pool is finished for the life of the process and every later submission
+# queues behind it forever.
+#
+# Queuing forever is strictly worse than failing. LMCache treats a raised
+# get/put as a miss and serves the request from the model; a submission that
+# never returns takes the request with it. So once the pool is provably
+# wedged, say so at once instead of joining the queue.
+#
+# "Provably wedged" is: every worker busy AND nothing has completed for
+# DAOS_STALL_SECS. Saturation on its own is not evidence -- a large store keeps
+# all 16 workers busy for minutes quite legitimately -- but under load
+# completions keep arriving, and under a wedge there are exactly none.
+STALL_SECS = float(os.environ.get("DAOS_STALL_SECS", "60"))
+
+
+class DaosPoolWedged(DaosError):
+    """Every IO worker is inside a DAOS call that is not going to return.
+
+    A distinct type so callers can tell "this one object is unreadable" from
+    "this backend is over"; rc is EBUSY so the existing ``e.rc`` paths (ping's
+    return code, the MP adapter's error tally) keep working unchanged.
+    """
+
+    def __init__(self, workers: int, stalled_s: float):
+        self.rc = errno.EBUSY
+        OSError.__init__(
+            self, errno.EBUSY,
+            "daos-io pool wedged: all %d workers are inside a DAOS call and "
+            "none has completed in %.0fs" % (workers, stalled_s))
+
 class DaosConnector(RemoteConnector):
     def __init__(self, url=None, loop=None, local_cpu_backend=None, config=None):
         # LMCache's DynamicConnectorAdapter instantiates us as
@@ -189,6 +230,13 @@ class DaosConnector(RemoteConnector):
         self._ping_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="daos-ping")
         self._ping_inflight = False
+
+        # Wedge detection -- see STALL_SECS. Two ints and a timestamp under a
+        # lock, touched twice per operation; the cost is measured in
+        # doc/FAILURE-MODES.md rather than assumed.
+        self._io_lock = threading.Lock()
+        self._inflight = 0
+        self._last_done = time.monotonic()
         self._warm_up()
 
     def _warm_up(self) -> None:
@@ -220,7 +268,35 @@ class DaosConnector(RemoteConnector):
         _s.stderr.flush()
 
     def _run(self, fn, *args):
-        return self.loop.run_in_executor(self._pool, fn, *args)
+        with self._io_lock:
+            stalled = time.monotonic() - self._last_done
+            if self._inflight >= self._workers and stalled > STALL_SECS:
+                # Raised rather than returned: this is the coroutine's own
+                # failure, and awaiting a future that will never be scheduled
+                # is the thing being avoided.
+                raise DaosPoolWedged(self._workers, stalled)
+            self._inflight += 1
+        return self.loop.run_in_executor(self._pool, self._tracked, fn, args)
+
+    def _tracked(self, fn, args):
+        """Run one blocking DAOS call and record that it finished.
+
+        The completion timestamp is the whole signal: a wedged pool is not one
+        that is busy, it is one where nothing finishes.
+        """
+        try:
+            return fn(*args)
+        finally:
+            with self._io_lock:
+                self._inflight -= 1
+                self._last_done = time.monotonic()
+
+    def _wedged_for(self) -> float:
+        """Seconds the pool has been saturated with no completion, else 0.0."""
+        with self._io_lock:
+            stalled = time.monotonic() - self._last_done
+            return stalled if (self._inflight >= self._workers
+                               and stalled > STALL_SECS) else 0.0
 
     # -- RemoteConnector interface -----------------------------------------
     async def exists(self, key) -> bool:
@@ -313,6 +389,17 @@ class DaosConnector(RemoteConnector):
     # gone) is a different operational problem from -1020 (DER_UNREACH,
     # network) even though both stop the cache working.
     async def ping(self) -> int:
+        # A wedged IO pool is an unhealthy backend even while the control path
+        # still answers. The probe runs on its own thread, so it can come back
+        # a cheerful 0 from a pool where every data worker has been inside
+        # libdaos for minutes -- which is the one report that must never
+        # happen, since the health check is what decides whether LMCache keeps
+        # sending work here.
+        wedged = self._wedged_for()
+        if wedged:
+            logger.warning("DAOS ping: IO pool wedged, no completion in %.0fs", wedged)
+            return errno.EBUSY
+
         # A ping that is already stuck answers the next one too. run_in_executor
         # futures cannot really be cancelled -- wait_for() below stops waiting
         # but the thread keeps running inside libdaos until DAOS gives up -- so
@@ -655,12 +742,29 @@ class DaosConnector(RemoteConnector):
         return self._dfs.remove(_key_to_path(key))
 
     async def close(self):
-        self._pool.shutdown(wait=True)
-        # wait=False on purpose: a ping can be stuck inside libdaos for minutes
-        # when the backend is down, and shutdown is exactly the moment we must
-        # not block on it. The thread is a daemon of the interpreter's pool and
-        # goes away with the process; holding up close() to watch it finish
-        # would turn an outage into a hang on the way out.
+        # wait=False on BOTH pools, for one reason: a DAOS call whose engine
+        # has died does not return, so joining its thread does not terminate.
+        # This was `wait=True` and it hung exactly that way -- the process sat
+        # in shutdown() -> Thread.join() while 16 daos-io threads stayed inside
+        # dfs_sys_write, and close() never came back. cancel_futures drops the
+        # work that has not started yet, which is the only part still
+        # cancellable; the threads already inside libdaos are not ours to
+        # reclaim.
+        #
+        # Note this does NOT make the process exitable. Even with wait=False --
+        # and even though these threads are daemon threads --
+        # concurrent.futures registers _python_exit, which joins every worker at
+        # interpreter shutdown. Verified: a process whose only stuck worker was
+        # a 30 s sleep lived the full 30 s after shutdown(wait=False) returned.
+        # Escaping that needs the call itself to be bounded, which is a DAOS
+        # question, not a Python one.
+        if sys.version_info >= (3, 9):
+            # cancel_futures landed in 3.9 and pyproject still declares >=3.8.
+            # A version check rather than catching TypeError, which would also
+            # swallow a real one from inside shutdown().
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._pool.shutdown(wait=False)
         self._ping_pool.shutdown(wait=False)
         try:
             self._dfs.close()
