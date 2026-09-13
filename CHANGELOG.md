@@ -13,6 +13,45 @@ is doing real work.
 
 ### Added
 
+- The in-process connector answers LMCache's health probe: `support_ping()` and
+  `ping()`. This is less a new feature than switching one on. LMCache's
+  `RemoteBackendHealthCheck` opens with
+
+      # If connector doesn't support ping, assume it's healthy
+      if not connector.support_ping():
+          return True
+
+  so until now the backend reported healthy no matter what DAOS was doing. That
+  matters here more than for most connectors, because every DAOS error in
+  `connector.py` is caught and turned into a cache miss — right for a cache,
+  but it makes an outage and a cold cache look identical from outside: the hit
+  rate falls and nothing else changes.
+
+  Answering it turns on machinery that already existed upstream — periodic
+  probing, reconnect attempts, `update_remote_ping_latency`,
+  `update_remote_ping_error_code`, the `lmcache_is_healthy` gauge and the
+  fallback policy. The DAOS `rc` is passed through rather than flattened, so
+  the recorded code distinguishes a missing container from an unreachable
+  network.
+
+  The probe carries its own 3 s timeout (`DAOS_PING_TIMEOUT`), under LMCache's
+  own 5 s so that whoever gives up first is also the one that can stop waiting
+  on the thread. Without it a probe against a stopped server ran past three
+  minutes, well beyond the 30 s poll interval. It runs on a dedicated
+  single-thread pool: a stuck probe must not take capacity from the data path
+  it exists to report on, and one thread bounds that to one.
+- `tests/test_ping.py`. `--kill` stops the local `daos_server` and re-probes,
+  which is the half that matters — a test proving only that ping returns 0 when
+  things work would not have caught the shortcut above.
+
+### Fixed
+
+- `connector.py` had no `logger`; the other modules in the package take one from
+  `lmcache.logging`. It now does too, with a stdlib fallback so the module stays
+  importable without LMCache, which is what the unit tests rely on.
+
+### Added
+
 - `VRAM_SEG` in the NIXL DAOS backend: transfers straight between DAOS objects
   and GPU memory via `daos_obj_fetch_gpu()` / `daos_obj_update_gpu()`. It is
   compiled in only when the client exports those symbols (meson checks;
