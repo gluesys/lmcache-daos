@@ -45,6 +45,11 @@ unit:
   script:
     - python3 tests/test_serde.py
     - python3 tests/test_serde_v2.py
+    # No DAOS needed: the wedge detector is a lock, two counters and a clock,
+    # and the fault it looks for -- a thread that does not return -- is modelled
+    # by an Event. Worth guarding here precisely because the real version of
+    # that fault can only be reproduced by destroying a cluster.
+    - python3 tests/test_wedge.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
