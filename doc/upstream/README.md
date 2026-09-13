@@ -5,9 +5,11 @@
 
 | 대상 | 파일 | 상태 |
 |---|---|---|
-| libfabric `prov/verbs` — dma-buf fd 누수 | `libfabric-0001-verbs-put-dmabuf-fd.patch`, `libfabric-pr-body.md` | **제출 준비 완료.** 브랜치 `hgichon/libfabric:verbs-put-dmabuf-fd` 푸시됨, PR 개설만 남음 |
+| libfabric `prov/verbs` — dma-buf fd 누수 | `libfabric-0001-verbs-put-dmabuf-fd.patch`, `libfabric-pr-body.md` | **제출 완료** — [PR #12828](https://github.com/ofiwg/libfabric/pull/12828). DCO 통과, 서명 Verified, 리뷰 대기 |
 | DAOS `theodore/b_cufile` 초안 — 복제 컨테이너 GPU 소스 쓰기 실패 | `daos-gds-replicated-write-report.md` | 재현 절차·서버측 증거·후보 기전 |
 | LMCache — async prefetch 직렬화기 선택 옵션 | `lmcache-async-serializer-option.md` | 보류. 근거 실측이 experimental GDS 백엔드에서만 나와 우선순위를 낮춤 |
+| NIXL — `nixlBackendEngine` 이 `customParams` 널 역참조 | (별도 파일 없음) | **제출 완료** — [이슈 #2245](https://github.com/ai-dynamo/nixl/issues/2245), [PR #2246](https://github.com/ai-dynamo/nixl/pull/2246). 서명 Verified, 관리자 `/build` 대기 |
+| LMCache — 모든 캐시 적중이 `Double unpin` 경고 | (별도 파일 없음) | **제출 완료** — [이슈 #5090](https://github.com/LMCache/LMCache/issues/5090). 우리 백엔드 없이 재현 확인 |
 
 ## libfabric fd 누수 — 제출 전 확인한 것
 
@@ -35,16 +37,38 @@
 호스트에 verbs 헤더와 libtool 이 없어 하지 못했고 상류 CI 에 맡긴다. 새 include 는 필요 없다
 (`ofi_util.h` → `ofi_mr.h` → `ofi_hmem.h` 로 선언이 이미 들어온다).
 
-### 남은 절차
+### 제출 결과
 
-포크에 브랜치까지 올라가 있다. PR 은 다음 주소에서 열면 되고, 본문은 `libfabric-pr-body.md` 를
-그대로 붙이면 된다.
+[PR #12828](https://github.com/ofiwg/libfabric/pull/12828). 상류가 `bb46b95` 까지
+진전한 뒤에도 패치는 그대로 적용되고, 열린 중복 이슈·PR 도 없다.
 
-```
-https://github.com/ofiwg/libfabric/compare/main...hgichon:libfabric:verbs-put-dmabuf-fd
-```
+보관 중인 `.patch` 는 상류 커밋(`4d905c9`)에서 `git format-patch` 로 다시 뽑은 것이라
+제출본과 바이트 단위로 같다. 손으로 고치지 않는다 — 어긋나면 나중에 어느 쪽이 맞는지
+알 수 없게 된다.
 
-제목: `prov/verbs: release the dma-buf fd after registration`
+## 상류별 제출 조건 (겪어보고 알게 된 것)
+
+저장소마다 요구가 다르고, 미리 알면 왕복을 줄일 수 있다.
+
+| 상류 | 서명 | 그 외 |
+|---|---|---|
+| ofiwg/libfabric | 불필요 | DCO (`Signed-off-by`) 필수 |
+| daos-stack/daos | 불필요 | DCO 필수. **Jira 티켓**이 붙어야 분류가 된다 |
+| ai-dynamo/nixl | **GPG 서명 필수** | `clang-format` 엄격. 외부 기여자는 서명이 있어도 관리자 `/build` 필요 |
+
+NVIDIA 계열(nixl)의 Blossom-CI 는 두 단계로 막는다. 먼저 서명 없는 커밋을 거부하고
+(`Commit signature not verified (reason=unsigned)`), 서명을 붙이면 그다음 소속을 본다
+(`no @nvidia.com email for LDAP; declining auto-trigger`). 두 번째는 외부 기여자가
+해결할 수 없고, 관리자가 `/build` 댓글을 달아야 한다. 코드 문제가 아니므로 기다리면 된다.
+
+GitHub 이 서명을 **Verified** 로 표시하려면 두 가지가 함께 맞아야 한다. 공개키가 계정에
+등록돼 있어야 하고, **커밋 작성자 이메일이 계정의 인증된 이메일과 같아야 한다.** 키만
+등록하고 작성자가 다른 주소면 `unknown_key` 가 아니라 그냥 Unverified 로 남는다. 그래서
+이 저장소의 상류 제출은 작성자를 `hgichon@gmail.com` 으로 통일한다.
+
+`clang-format` 은 저장소의 `.clang-format` 을 따른다. nixl 은 `BreakBeforeTernaryOperators:
+false` 라 삼항의 `:` 가 앞 줄 끝에 와야 한다. CI 가 기대 출력을 그대로 알려주므로, 버전이
+다른 로컬 clang-format 으로 추측하느니 그 출력을 쓰는 편이 정확하다.
 
 ## 환경 요약 (제출 시 첨부)
 

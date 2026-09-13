@@ -13,6 +13,31 @@ is doing real work.
 
 ### Changed
 
+- `doc/upstream/` records what actually happened to the submissions rather than
+  what was prepared. The libfabric fix is [PR #12828]; the NIXL null-deref is
+  [issue #2245] and [PR #2246]; the LMCache double-unpin is [issue #5090].
+
+  The stored `.patch` is now regenerated from the upstream commit with
+  `git format-patch` instead of being edited by hand, so it matches what was
+  submitted byte for byte. The author address on it changed to
+  `hgichon@gmail.com`, because GitHub only marks a signature Verified when the
+  commit author email is a verified address on the signing account -- a
+  registered key alone is not enough.
+
+  Also written down: what each upstream actually requires. libfabric and DAOS
+  want DCO and nothing else (DAOS additionally routes review by Jira ticket);
+  NVIDIA repositories require GPG-signed commits and then, separately, decline
+  external contributors until a maintainer comments `/build`. That second gate
+  is not something a contributor can satisfy, which is worth knowing before
+  assuming a red check needs fixing.
+
+[PR #12828]: https://github.com/ofiwg/libfabric/pull/12828
+[issue #2245]: https://github.com/ai-dynamo/nixl/issues/2245
+[PR #2246]: https://github.com/ai-dynamo/nixl/pull/2246
+[issue #5090]: https://github.com/LMCache/LMCache/issues/5090
+
+### Changed
+
 - The MP-mode L2 adapter can now say it is broken. It already counted work --
   seventeen counters and a periodic status thread -- but nothing in that told
   an outage from an idle node: the adapter turns every DAOS error into a cache

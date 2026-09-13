@@ -1,6 +1,6 @@
-From 9ff19109437b549445ab7f24f71d70a8179117e4 Mon Sep 17 00:00:00 2001
-From: Kyeongpyo Kim <kpkim@gluesys.com>
-Date: Wed, 9 Sep 2026 23:55:57 +0900
+From 4d905c9d95b4dbd32d0df64e6fa65a832d2feb01 Mon Sep 17 00:00:00 2001
+From: Kyeongpyo Kim <hgichon@gmail.com>
+Date: Sun, 13 Sep 2026 20:29:38 +0900
 Subject: [PATCH] prov/verbs: release the dma-buf fd after registration
 
 vrb_reg_hmem_dmabuf() obtains a dma-buf file descriptor from
@@ -29,7 +29,7 @@ it applies to this patch unchanged.
 errno is preserved across the release call because the failover path
 below reports the registration errno.
 
-Signed-off-by: Kyeongpyo Kim <kpkim@gluesys.com>
+Signed-off-by: Kyeongpyo Kim <hgichon@gmail.com>
 ---
  prov/verbs/src/verbs_mr.c | 12 ++++++++++++
  1 file changed, 12 insertions(+)
