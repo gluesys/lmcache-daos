@@ -101,14 +101,52 @@ it is slower than not using it.
 
 ## Threads
 
-Work runs on a fixed pool, sized by `NIXL_DAOS_THREADS` (default 64). A DAOS
-event queue was rejected on purpose: it serialises on the per-EQ `eqx_lock` and
-caps around 7-12 GB/s however the queues are arranged.
+Work runs on a fixed pool, sized by `NIXL_DAOS_THREADS` (default 64).
 
 64 is where the ladder flattens: unfolded, the backend reaches 8.3 GB/s at 16
 threads, 11.3 at 32, 14.4 at 64 and 14.3 at 128. Effective concurrency is
 `min(threads, requests in flight)`, so a caller that keeps fewer requests
 outstanding is capped by its own depth, not by this setting.
+
+## Bounding a dead engine (`NIXL_DAOS_EQ_TIMEOUT`)
+
+Set it to a number of seconds and the backend submits to a DAOS event queue and
+polls with that deadline instead of making a blocking call. Unset or `0`, the
+default, keeps the blocking call.
+
+It exists because a blocking DAOS call whose engine has died **does not return**
+(`doc/FAILURE-MODES.md`). Through this plugin, with `daos_server` killed
+mid-read:
+
+| | outcome |
+|---|---|
+| blocking | still running at **120 s**, 65 threads stuck |
+| `NIXL_DAOS_EQ_TIMEOUT=8` | exited in **8 s**, every thread reclaimed |
+
+The queues are borrowed per request rather than held per thread, which is what
+makes this free. Measured on cxl2 at 120 objects x 40 layers, fold=1:
+
+| | 64 threads | 16 threads |
+|---|---|---|
+| blocking | 3.16 GB/s | 3.12 GB/s |
+| event queue, one per thread | 2.08 | 3.24 |
+| event queue, borrowed | **3.24** | **3.26** |
+
+One EQ per thread is a trap: the thread pool is deliberately oversized, idle
+threads are free but idle event queues hold a network context, so 64 threads
+paid for 64 contexts to run 16 concurrent requests. Borrowing grows the set to
+the actual concurrency and no further.
+
+This also corrects what this file used to say -- that an event queue "caps
+around 7-12 GB/s however the queues are arranged". That came from a sweep over
+the DFS async path through Python with 28 MiB reads; it does not reproduce for
+folded object-API requests.
+
+**Still off by default.** cxl2 is single-node TCP and tops out near 3 GB/s,
+where the fabric is the bottleneck and both paths look alike. The regime the
+original rejection came from -- 400G verbs at 34 GB/s, where per-EQ network
+contexts could plausibly dominate -- has not been re-measured. Flipping the
+default needs that host.
 
 ## Building
 
