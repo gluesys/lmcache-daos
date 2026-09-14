@@ -423,24 +423,25 @@ nixlDaosEngine::prepXfer(const nixl_xfer_op_t &operation,
  * queue and polled with a timeout released every thread at 5.01 s, and the
  * daos_event_abort()/daos_event_fini() that tidies up cost 0.00 s each.
  *
- * It is off by default because the throughput question is NOT settled. The
- * original rejection (doc/DESIGN-AND-VALIDATION.md) measured 1 EQ capping at
- * ~12.5 GB/s and 16 EQs collapsing to 2.74, against 34-35 GB/s blocking -- but
- * on the DFS async path through Python with 28 MiB reads, which is not this.
- * Re-measured in this shape (tests/obj_latency.c -m eq) on cxl2:
+ * The original rejection (doc/DESIGN-AND-VALIDATION.md) measured 1 EQ capping
+ * at ~12.5 GB/s and 16 EQs collapsing to 2.74, against 34-35 GB/s blocking --
+ * but on the DFS async path through Python with 28 MiB reads, which is not
+ * this. It does not transfer. Measured on client-5 against cell1/cell2, 400G
+ * verbs, the regime that rejection came from, four runs each:
  *
- *   blocking, 16 threads            2.99 GB/s
- *   16 EQs x depth 1                3.19 GB/s   <- this topology
- *   16 EQs x depth 4                3.04
- *   16 EQs x depth 16               1.67        <- eqx_lock, as advertised
- *   1 EQ x depth 32                 2.34
+ *   blocking   31.29  31.00  30.70  31.15    mean 31.04 GB/s
+ *   event queue 30.44  31.27  30.23  30.61   mean 30.64 GB/s
  *
- * So the collapse does not reproduce and one EQ per thread at depth 1 is the
- * best point. That is NOT a clearance: cxl2 is single-node TCP and tops out at
- * ~3 GB/s, where the fabric is the bottleneck and both paths look alike. The
- * regime the original rejection came from -- 400G verbs at 34 GB/s, where a
- * per-EQ network context could plausibly dominate -- is not reachable here.
- * Flipping the default needs that host.
+ * The ranges overlap -- the event queue beat blocking on one run -- so the cost
+ * is not measurable here, let alone the 3-12x the old sweep implied. Unfolded
+ * (4800 requests instead of 120) it is the same story: 7.55 against 7.50.
+ *
+ * That is why this is now ON by default. A deadline that costs nothing and
+ * turns 16 permanently lost threads into a bounded error is not a trade.
+ *
+ * The default is 60 s rather than something tight: a request measured 1.34 ms
+ * here, so 60 s is four orders of magnitude of headroom and still bounds the
+ * wedge. It is a backstop for an engine that has died, not a latency target.
  *
  * Depth 1 per thread is deliberate, and it is why this is a small change: the
  * thread pool, the concurrency and the RPC shape are all unchanged. The only
@@ -452,7 +453,7 @@ double
 nixlDaosEqTimeout() {
     static const double t = [] {
         const char *e = std::getenv("NIXL_DAOS_EQ_TIMEOUT");
-        return e ? std::atof(e) : 0.0;
+        return e ? std::atof(e) : 60.0;   /* 0 in the environment disables it */
     }();
     return t;
 }
