@@ -18,6 +18,28 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Added
+
+- Two diagnostics behind environment flags, both off by default:
+  `DAOS_DEBUG_OBJ` logs the reference count either side of `_drop_put_ref`, and
+  `DAOS_SKIP_PUT_REF_DROP` skips the drop (which leaks, deliberately).
+
+  Together they close the question the correctness gate was blocked on. Our
+  drop is the one that frees the object: `1 -> 0 (pin=0 valid=False)`, after
+  which `.tensor` returns None and the assertion fires. Skipping it makes the
+  crash disappear entirely -- pass B goes 500 to 200, invalidations 1 to 0.
+
+  It is not obviously our bug. LMCache's own connectors are split on whether
+  they release that reference (bigtable, hf3fs, azure, hfbucket, sagemaker and
+  instrumented do; redis and fs do not), and `cache_engine.py:562` says so
+  itself: "TODO: we implicitly rely on batched_put to call ref_count_down /
+  this management should be done in a cleaner way". Ours matches the majority,
+  and here the majority behaviour frees an object LMCache still reads.
+
+  Every option costs something -- drop and crash, skip and leak a reference per
+  stored chunk, or fix it upstream -- so the next move is to strengthen LMCache
+  issue #5090 with this minimal reproduction and that TODO.
+
 ### Fixed
 
 - A docstring in `connector.py` quoted `NaiveSerializer.serialize` as ending in
