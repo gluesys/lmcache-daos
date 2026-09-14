@@ -13,6 +13,16 @@ is doing real work.
 
 ### Added
 
+- Resolved from the above: the GPU entry points take an event after all. The
+  plugin comment claiming "synchronous only -- no event queue", and using that
+  to justify the thread pool, was wrong. In `theodore/b_cufile`,
+  `src/client/api/object.c:213` differs from `:197` only by the GPU_DIRECT flag
+  and `args->mem_attrs`; `ev` is passed to the same task machinery. So the
+  `nullptr` in the plugin is a choice, and the VRAM_SEG path can have the same
+  bounded escape. Verified against the draft branch's source, not against the
+  binary on the GPU host, and the GPU path's failure behaviour is still
+  unmeasured.
+
 - `tests/obj_failure.c` measures the low-level object API under the same fault,
   because switching to dkey/akey for its 46x lower per-object cost should not be
   decided without knowing what it does when the engine dies.

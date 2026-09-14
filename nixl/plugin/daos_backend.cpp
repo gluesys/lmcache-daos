@@ -448,16 +448,21 @@ nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
             int rc;
 #ifdef NIXL_DAOS_HAVE_GPU
             if (!gp->memAttrs.empty()) {
-                /* This said "synchronous only -- no event queue", and that
-                 * claim does not survive counting the arguments: the GPU form
-                 * is the plain form plus mem_attrs, and the trailing nullptr
-                 * still looks like the daos_event_t slot. Either the comment
-                 * was wrong or the draft implementation ignores ev. Unresolved
-                 * -- cxl2 runs stock DAOS and has no such symbol to check
-                 * against. It matters because doc/FAILURE-MODES.md measured the
-                 * event queue as the ONLY bounded way out of a dead engine
-                 * (16/16 threads lost blocking, 0/16 with a poll timeout), so
-                 * whether VRAM_SEG can have that escape is still open. */
+                /* This once said "synchronous only -- no event queue", and
+                 * used that to justify putting the work on a thread. It was
+                 * wrong. In theodore/b_cufile the GPU entry points take an
+                 * event and hand it to the same task machinery as the host
+                 * ones -- src/client/api/object.c:213 differs from :197 only
+                 * by the GPU_DIRECT flag and args->mem_attrs:
+                 *
+                 *   update      dc_obj_update_task_create(oh, th, flags, ..., ev, ...)
+                 *   update_gpu  dc_obj_update_task_create(oh, th, flags|GPU_DIRECT, ..., ev, ...)
+                 *
+                 * So the nullptr below is a choice, not a constraint, and it
+                 * is currently the wrong one: doc/FAILURE-MODES.md measured the
+                 * event queue as the only bounded way out of a dead engine
+                 * (16/16 threads lost blocking, 0/16 with a poll timeout). The
+                 * VRAM_SEG path can have that escape; it just does not yet. */
                 rc = req->op == NIXL_READ
                          ? daos_obj_fetch_gpu(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
                                               gp->iods.data(), gp->sgls.data(),
