@@ -20,6 +20,23 @@ is doing real work.
 
 ### Added
 
+- Phase 1 step 3 of [doc/RAW-API-PLAN.md]: `tests/test_torn_object_raw.py` holds
+  the torn-object gate for the dkey/akey layout. Nine damage shapes, all reading
+  back as a miss, with the staging buffer handed back every time.
+
+  The shapes are different even though the policy is not. In a file, torn means
+  short; under dkey/akey it means an absent akey, which DAOS reports with rc 0
+  and an untouched `iov_len` -- so "absent" and "a full buffer of uninitialised
+  memory" arrive looking the same unless the code reads `sg_nr_out`. The case
+  the write order exists for is covered directly: payload written, metadata not.
+
+  It drives the real connector instead of a copy of its read path. The DFS
+  version re-implements `_get_sync` because importing the connector needs
+  LMCache, and that duplicate has to be kept in lockstep by hand; a read path
+  that has drifted from the one in production proves nothing. Damage is injected
+  at the storage layer -- punch and overwrite akeys under a real object -- rather
+  than by building headers, because that is what a crashed writer leaves.
+
 - Phase 1 step 2 of [doc/RAW-API-PLAN.md]: the connector picks its backend from
   the container. `ObjSys` does the dkey/akey I/O, `container_layout()` reads
   DAOS_PROP_CO_LAYOUT_TYPE, and a POSIX container still gets the DFS path
