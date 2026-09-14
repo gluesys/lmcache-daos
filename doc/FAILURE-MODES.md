@@ -214,17 +214,32 @@ DFS 를 dkey/akey 로 바꾸자는 이유는 성능이다. 객체당 고정비�
 `async-abort` arm 을 따로 만들었다. 결과는 **abort 도 fini 도 0.00 초**라 정리
 비용은 없다. 탈출구가 막힘을 다른 데로 옮기지 않는다.
 
-### 확인 못 한 것: GPU 진입점
+### GPU 진입점도 이벤트를 받는다 (주석이 틀렸다)
 
-`daos_obj_fetch_gpu` / `daos_obj_update_gpu` 가 이벤트를 받는지는 **여기서 재지
-못했다.** cxl2 는 stock DAOS 2.8.0 이라 그 진입점이 없다.
+플러그인 안에 "GPU 진입점은 동기 전용 — 이벤트 큐 없음"이라는 주석이 있었고, 그걸
+근거로 "그래서 스레드에 올린다"고 적혀 있었다. **틀렸다.**
 
-플러그인 안에는 "GPU 진입점은 동기 전용 — 이벤트 큐 없음"이라는 주석이 있는데,
-**호출부의 인자 개수를 세어 보면 그 주석과 맞지 않는다.** GPU 형태는 비-GPU 형태에
-`mem_attrs` 하나가 더 붙은 모양이고 마지막 인자는 여전히 `ev` 자리로 보인다.
-주석이 틀렸거나, 초안 구현이 `ev` 를 무시한다는 뜻일 수 있다. 둘 중 무엇인지는
-GPU 호스트에서 헤더를 봐야 정해진다. 그때까지 `VRAM_SEG` 경로에 이 탈출구가
-있다고 가정하면 안 된다.
+`theodore/b_cufile` 의 `src/client/api/object.c` 에서 두 함수는 `ev` 를 **똑같이**
+다룬다. 차이는 GPU_DIRECT 플래그와 `mem_attrs` 뿐이다.
+
+```c
+:197 daos_obj_update     → dc_obj_update_task_create(oh, th, flags,              ..., ev, NULL, &task)
+:213 daos_obj_update_gpu → dc_obj_update_task_create(oh, th, flags|GPU_DIRECT,   ..., ev, NULL, &task)
+                           args->mem_attrs = mem_attrs
+```
+
+선언도 마찬가지다 — `daos_obj_update_gpu(..., daos_mem_attr_t *mem_attrs,
+daos_event_t *ev)`, `daos_obj_fetch_gpu(..., daos_mem_attr_t *mem_attrs,
+daos_iom_t *ioms, daos_event_t *ev)`. 헤더 주석도 비-GPU 판을 그대로 가리키며
+`ev` 가 NULL 이면 블로킹이라고 적어 뒀다.
+
+따라서 플러그인의 `nullptr` 은 **제약이 아니라 선택**이고, 지금은 틀린 선택이다.
+`VRAM_SEG` 경로도 위 `async` arm 의 5초 탈출구를 가질 수 있다.
+
+**확인 범위**: 초안 브랜치의 **소스**를 봤다. GPU 호스트에 설치된 바이너리가 이
+브랜치에서 빌드된 것이라면 같지만, 그건 확인하지 않았다. GPU 경로의 장애 거동을
+실제로 **측정한 것도 아니다** — API 가 이벤트를 받는다는 사실만 확정했다. 측정은
+GPU 호스트가 있어야 한다.
 
 ## 답하지 못한 것
 
@@ -234,7 +249,7 @@ GPU 호스트에서 헤더를 봐야 정해진다. 그때까지 `VRAM_SEG` 경�
 |---|---|---|
 | 크래시 때 날아가던 객체가 디스크에 **절단**(→ miss, 정답)으로 남나, **완전한데 틀리게** 남나 | SCM 이 램디스크라 복구 = 재포맷. 증거가 같이 사라진다 | MD-on-SSD |
 | 무한 재시도가 **단일 랭크 특성**인가 | 랭크가 하나뿐이라 SWIM 이 죽은 랭크를 축출할 정족수가 없다. 다중 랭크 클러스터라면 축출 후 오류가 떴을 수 있다 (단 위 `async` 결과는 이 질문과 무관하다) | cell1/cell2 |
-| GPU 진입점이 이벤트를 받나 | cxl2 는 stock DAOS 라 그 심볼이 없다 | GPU 호스트 |
+| GPU 경로의 **실측** 장애 거동 | 소스상 이벤트를 받는 건 확정. 실제로 5초에 빠져나오는지는 안 재봤다 | GPU 호스트 |
 | 랭크 손실 · 네트워크 분단 | 노드가 하나다 | cell1/cell2 |
 
 
