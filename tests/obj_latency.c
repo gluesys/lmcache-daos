@@ -56,6 +56,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -75,6 +76,7 @@ static daos_handle_t g_pcoh;
 static char *g_buf[256];
 static char  *g_mode = "all";
 static int    g_threads = 16, g_layers = 40, g_chunks = 120, g_rounds = 3;
+static int    g_depth   = 1;   /* eq arm: requests in flight per EQ */
 static size_t g_lsize = 1ul << 20;
 
 static daos_handle_t g_poh, g_coh, g_oh;
@@ -209,6 +211,128 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* ------------------------------------------------------------------ eq arm
+ *
+ * Why this exists: doc/DESIGN-AND-VALIDATION.md rejected the event queue on a
+ * sweep that measured 1 EQ capping at ~12.5 GB/s and 16 EQs collapsing to
+ * 2.74, against 34-35 GB/s for blocking threads. That sweep ran on the DFS
+ * async path through the Python ctypes binding with 28 MiB reads -- a
+ * different API, a different language and a different request shape from what
+ * the NIXL plugin does. The mechanism it blamed (eq_progress_cb serialising
+ * submit and completion under eqx_lock) lives in libdaos and does not care
+ * about any of that, so the rejection is plausible here but not established.
+ *
+ * doc/FAILURE-MODES.md is why it matters: blocking loses 16/16 threads to a
+ * dead engine and the event queue loses none. If the throughput gap does not
+ * reproduce in this shape, that trade disappears.
+ *
+ * The variable is NOT thread count. It is EQ count x in-flight depth: one
+ * thread per EQ, each keeping `depth` requests outstanding. K=16,D=1 is the
+ * old sweep's worst point and K=1,D=16 its best, in the same harness as the
+ * blocking arm for once.
+ */
+struct eqslot {
+	daos_event_t ev;
+	daos_iod_t   iods[64];
+	daos_recx_t  recxs[64];
+	d_sg_list_t  sgls[64];
+	d_iov_t      iovs[64];
+	char         names[64][AKEY_LEN];
+	uint64_t     dk;
+	daos_key_t   dkey;
+	char        *buf;
+	bool         busy;
+};
+
+/* Build and launch one chunk into a slot. The slot owns every structure DAOS
+ * will read asynchronously -- building them on the stack the way io_chunk()
+ * does would hand libdaos pointers into a frame that returns immediately. */
+static int eq_submit(struct eqslot *sl, daos_handle_t eq, int chunk, bool write)
+{
+	int n = g_layers, rc;
+
+	sl->dk = chunk;
+	d_iov_set(&sl->dkey, &sl->dk, sizeof(sl->dk));
+	for (int i = 0; i < n; i++) {
+		akey_name(sl->names[i], i);
+		memset(&sl->iods[i], 0, sizeof(sl->iods[i]));
+		d_iov_set(&sl->iods[i].iod_name, sl->names[i], strlen(sl->names[i]));
+		sl->iods[i].iod_type  = DAOS_IOD_ARRAY;
+		sl->iods[i].iod_size  = 1;
+		sl->iods[i].iod_nr    = 1;
+		sl->recxs[i].rx_idx   = 0;
+		sl->recxs[i].rx_nr    = g_lsize;
+		sl->iods[i].iod_recxs = &sl->recxs[i];
+
+		d_iov_set(&sl->iovs[i], sl->buf + (size_t)i * g_lsize, g_lsize);
+		sl->sgls[i].sg_nr     = 1;
+		sl->sgls[i].sg_nr_out = 0;
+		sl->sgls[i].sg_iovs   = &sl->iovs[i];
+	}
+	rc = daos_event_init(&sl->ev, eq, NULL);
+	if (rc)
+		return rc;
+	rc = write ? daos_obj_update(g_oh, DAOS_TX_NONE, 0, &sl->dkey, n,
+				     sl->iods, sl->sgls, &sl->ev)
+		   : daos_obj_fetch(g_oh, DAOS_TX_NONE, 0, &sl->dkey, n,
+				    sl->iods, sl->sgls, NULL, &sl->ev);
+	if (rc) {
+		daos_event_fini(&sl->ev);
+		return rc;
+	}
+	sl->busy = true;
+	return 0;
+}
+
+static void *eq_worker(void *arg)
+{
+	struct job    *j = arg;
+	daos_handle_t  eq;
+	struct eqslot *slots;
+	int            depth = g_depth, next = j->lo, outstanding = 0, rc;
+
+	rc = daos_eq_create(&eq);
+	CHK(rc, "daos_eq_create");
+	slots = calloc(depth, sizeof(*slots));
+	if (!slots)
+		exit(1);
+	for (int i = 0; i < depth; i++) {
+		slots[i].buf = malloc(g_lsize * g_layers);
+		if (!slots[i].buf)
+			exit(1);
+		memset(slots[i].buf, 0x5a, g_lsize * g_layers);
+	}
+
+	while (next < j->hi || outstanding) {
+		while (next < j->hi && outstanding < depth) {
+			int i = 0;
+			while (i < depth && slots[i].busy) i++;
+			rc = eq_submit(&slots[i], eq, next++, j->write);
+			CHK(rc, "eq submit");
+			outstanding++;
+		}
+		daos_event_t *evp = NULL;
+		int n = daos_eq_poll(eq, 1, DAOS_EQ_WAIT, 1, &evp);
+		if (n < 0)
+			CHK(n, "daos_eq_poll");
+		if (n == 0)
+			continue;
+		CHK(evp->ev_error, "eq completion");
+		/* evp points at the slot's embedded event, so the slot is
+		 * recovered by offset rather than by searching. */
+		struct eqslot *sl = (struct eqslot *)((char *)evp - offsetof(struct eqslot, ev));
+		daos_event_fini(&sl->ev);
+		sl->busy = false;
+		outstanding--;
+	}
+
+	for (int i = 0; i < depth; i++)
+		free(slots[i].buf);
+	free(slots);
+	daos_eq_destroy(eq, 0);
+	return NULL;
+}
+
 static double run(int mode, bool write)
 {
 	pthread_t   th[256];
@@ -226,7 +350,7 @@ static double run(int mode, bool write)
 	}
 	t0 = now();
 	for (int i = 0; i < g_threads; i++)
-		pthread_create(&th[i], NULL, worker, &jobs[i]);
+		pthread_create(&th[i], NULL, mode == 4 ? eq_worker : worker, &jobs[i]);
 	for (int i = 0; i < g_threads; i++)
 		pthread_join(th[i], NULL);
 	return now() - t0;
@@ -247,12 +371,13 @@ int main(int argc, char **argv)
 {
 	int rc, opt;
 
-	while ((opt = getopt(argc, argv, "p:c:o:m:t:L:C:s:r:P:")) != -1) {
+	while ((opt = getopt(argc, argv, "p:c:o:m:t:L:C:s:r:P:d:")) != -1) {
 		switch (opt) {
 		case 'p': g_pool = optarg; break;
 		case 'c': g_cont = optarg; break;
 		case 'o': g_oc = optarg; break;
 		case 'm': g_mode = optarg; break;
+		case 'd': g_depth = atoi(optarg); break;
 		case 't': g_threads = atoi(optarg); break;
 		case 'L': g_layers = atoi(optarg); break;
 		case 'C': g_chunks = atoi(optarg); break;
@@ -300,11 +425,20 @@ int main(int argc, char **argv)
 	       g_pool, g_cont, g_oc, g_threads, g_layers, g_chunks, g_lsize,
 	       (double)g_chunks * g_layers * g_lsize / (1024.0 * 1024 * 1024));
 
+
 	/* Populate only the layouts this run will read. Doing all of them in one
 	 * process is what first exposed the registration failure below, and it
 	 * also makes each arm pay for the others' warm-up. */
 	bool all = strcmp(g_mode, "all") == 0;
-	bool need_ak  = all || !strcmp(g_mode, "sep") || !strcmp(g_mode, "batch");
+	if (!strcmp(g_mode, "eq") || all)
+		printf("eq arm: %d EQs (one per thread) x depth %d = %d in flight\n",
+		       g_threads, g_depth, g_threads * g_depth);
+	/* The eq arm reads the same per-akey layout the batch arm does, so it
+	 * needs the same populate pass -- otherwise it measures fetches of
+	 * records that were never written and reports a throughput that is
+	 * really the cost of returning nothing. */
+	bool need_ak  = all || !strcmp(g_mode, "sep") || !strcmp(g_mode, "batch")
+			|| !strcmp(g_mode, "eq");
 	bool need_one = all || !strcmp(g_mode, "one");
 	bool need_dfs = g_pcont && (all || !strcmp(g_mode, "dfs"));
 	double w1 = need_ak  ? run(1, true) : 0;
@@ -318,6 +452,7 @@ int main(int argc, char **argv)
 		{ "batch", 1, (long)g_chunks },
 		{ "one",   2, (long)g_chunks },
 		{ "dfs",   3, (long)g_chunks * g_layers },
+		{ "eq",    4, (long)g_chunks },
 	};
 	for (unsigned a = 0; a < sizeof(arms) / sizeof(arms[0]); a++) {
 		if (strcmp(g_mode, "all") != 0 && strcmp(g_mode, arms[a].name) != 0)

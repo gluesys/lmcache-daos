@@ -5,6 +5,8 @@
 #include "daos_backend.h"
 
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -110,6 +112,7 @@ nixlDaosEngine::getPluginParams() {
 
 nixlDaosEngine::nixlDaosEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params) {
+    eqPool_ = std::make_unique<nixlDaosEqPool>();
     const int rc = daos_init();
 
     /* -DER_ALREADY: another component in this process already called it. That
@@ -412,16 +415,120 @@ nixlDaosEngine::prepXfer(const nixl_xfer_op_t &operation,
 }
 
 /*
+ * Optional event-queue path, off by default.
+ *
+ * doc/FAILURE-MODES.md measured why it is wanted: when the engine is killed
+ * mid-write, a blocking daos_obj_update() never returns -- 16 of 16 threads
+ * still inside the call at 150 s -- while the same work submitted to an event
+ * queue and polled with a timeout released every thread at 5.01 s, and the
+ * daos_event_abort()/daos_event_fini() that tidies up cost 0.00 s each.
+ *
+ * It is off by default because the throughput question is NOT settled. The
+ * original rejection (doc/DESIGN-AND-VALIDATION.md) measured 1 EQ capping at
+ * ~12.5 GB/s and 16 EQs collapsing to 2.74, against 34-35 GB/s blocking -- but
+ * on the DFS async path through Python with 28 MiB reads, which is not this.
+ * Re-measured in this shape (tests/obj_latency.c -m eq) on cxl2:
+ *
+ *   blocking, 16 threads            2.99 GB/s
+ *   16 EQs x depth 1                3.19 GB/s   <- this topology
+ *   16 EQs x depth 4                3.04
+ *   16 EQs x depth 16               1.67        <- eqx_lock, as advertised
+ *   1 EQ x depth 32                 2.34
+ *
+ * So the collapse does not reproduce and one EQ per thread at depth 1 is the
+ * best point. That is NOT a clearance: cxl2 is single-node TCP and tops out at
+ * ~3 GB/s, where the fabric is the bottleneck and both paths look alike. The
+ * regime the original rejection came from -- 400G verbs at 34 GB/s, where a
+ * per-EQ network context could plausibly dominate -- is not reachable here.
+ * Flipping the default needs that host.
+ *
+ * Depth 1 per thread is deliberate, and it is why this is a small change: the
+ * thread pool, the concurrency and the RPC shape are all unchanged. The only
+ * difference is that the call now has a deadline the caller owns.
+ */
+namespace {
+
+double
+nixlDaosEqTimeout() {
+    static const double t = [] {
+        const char *e = std::getenv("NIXL_DAOS_EQ_TIMEOUT");
+        return e ? std::atof(e) : 0.0;
+    }();
+    return t;
+}
+
+} // namespace
+
+/*
+ * A borrow-and-return pool of event queues.
+ *
+ * The obvious implementation -- one EQ per worker thread, thread_local -- was
+ * written first and measured 35% SLOWER than blocking (2.08 vs 3.12 GB/s).
+ * The reason is that the thread pool is deliberately oversized: 64 threads
+ * serving at most `inflight` concurrent requests. Idle threads cost nothing,
+ * but an idle EQ holds a network context, so that arrangement paid for 64
+ * contexts to run 16 requests. Sizing the pool to the concurrency instead:
+ *
+ *   blocking, 64 threads    3.12 GB/s      eq, 64 EQs    2.08 GB/s
+ *   blocking, 16 threads    3.12           eq, 16 EQs    3.24
+ *                                          eq,  8 EQs    3.27
+ *
+ * Blocking is flat because unused threads are free; the event path is not,
+ * which is most of what the original "EQs are expensive" finding was about.
+ *
+ * Borrowing fixes it without a tuning knob. An EQ is held only for the
+ * duration of one request, so the pool grows to the actual high-water
+ * concurrency and no further -- 16 here, whatever the thread count. It also
+ * keeps the property the per-thread version had for free: no two threads ever
+ * hold the same EQ, so a poll cannot harvest another thread's completion.
+ */
+class nixlDaosEqPool {
+public:
+    ~nixlDaosEqPool() {
+        for (auto h : all_) daos_eq_destroy(h, 0);
+    }
+
+    bool borrow(daos_handle_t &out) {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            if (!free_.empty()) {
+                out = free_.back();
+                free_.pop_back();
+                return true;
+            }
+        }
+        /* Created outside the lock: daos_eq_create() talks to the client
+         * library and is far too slow to hold a mutex across. */
+        daos_handle_t h{};
+        if (daos_eq_create(&h) != 0) return false;
+        {
+            std::lock_guard<std::mutex> g(m_);
+            all_.push_back(h);
+        }
+        out = h;
+        return true;
+    }
+
+    void giveBack(daos_handle_t h) {
+        std::lock_guard<std::mutex> g(m_);
+        free_.push_back(h);
+    }
+
+private:
+    std::mutex m_;
+    std::vector<daos_handle_t> free_;  /* available now */
+    std::vector<daos_handle_t> all_;   /* every EQ ever made, for teardown */
+};
+
+/*
  * Submit. Each group is one daos_obj_fetch()/daos_obj_update().
  *
- * The work runs on a thread rather than a DAOS event queue. That is a
- * deliberate first cut: the event path serialises on the per-EQ eqx_lock and
- * has been measured to cap around 7-12 GB/s however the queues are arranged,
- * whereas blocking calls on a pool of threads reach the full 26 GB/s. One
- * thread per request is still coarse -- a pool belongs here once there is a
- * throughput test to size it against -- but prepXfer() has already folded the
- * descriptor list down to a handful of RPCs, so the thread count tracks
- * requests rather than descriptors.
+ * The work runs on a pool thread. Whether that thread then BLOCKS inside DAOS
+ * or waits on an event queue with a deadline is decided by
+ * NIXL_DAOS_EQ_TIMEOUT -- see the block above for what each costs and what is
+ * still unmeasured. Either way prepXfer() has already folded the descriptor
+ * list down to a handful of RPCs, so the thread count tracks requests rather
+ * than descriptors.
  */
 nixl_status_t
 nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
@@ -440,12 +547,32 @@ nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
 
     for (auto &g : req->groups) {
         nixlDaosIoGroup *gp = &g;
-        pool_->submit([req, gp]() {
+        pool_->submit([this, req, gp]() {
             daos_key_t dkey;
             d_iov_set(&dkey, &gp->dkeyVal, sizeof(uint64_t));
 
             const unsigned nr = static_cast<unsigned>(gp->iods.size());
+            const double eqTimeout = nixlDaosEqTimeout();
+            daos_handle_t eq{};
+            daos_event_t ev;
+            daos_event_t *evp = nullptr;
+            bool useEq = false;
             int rc;
+
+            if (eqTimeout > 0.0) {
+                /* A queue we could not get is a reason to fall back to the
+                 * blocking call, not to fail the transfer: the deadline is an
+                 * improvement on the failure path, never a prerequisite for
+                 * doing the I/O. */
+                if (eqPool_->borrow(eq)) {
+                    if (daos_event_init(&ev, eq, nullptr) == 0) useEq = true;
+                    else eqPool_->giveBack(eq);
+                }
+                if (!useEq)
+                    NIXL_ERROR << "DAOS: no event queue available, "
+                                  "falling back to a blocking call";
+            }
+            daos_event_t *evArg = useEq ? &ev : nullptr;
 #ifdef NIXL_DAOS_HAVE_GPU
             if (!gp->memAttrs.empty()) {
                 /* This once said "synchronous only -- no event queue", and
@@ -466,19 +593,43 @@ nixlDaosEngine::postXfer(const nixl_xfer_op_t &operation,
                 rc = req->op == NIXL_READ
                          ? daos_obj_fetch_gpu(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
                                               gp->iods.data(), gp->sgls.data(),
-                                              gp->memAttrs.data(), nullptr, nullptr)
+                                              gp->memAttrs.data(), nullptr, evArg)
                          : daos_obj_update_gpu(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
                                                gp->iods.data(), gp->sgls.data(),
-                                               gp->memAttrs.data(), nullptr);
+                                               gp->memAttrs.data(), evArg);
             } else
 #endif
             {
                 rc = req->op == NIXL_READ
                          ? daos_obj_fetch(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
                                           gp->iods.data(), gp->sgls.data(), nullptr,
-                                          nullptr)
+                                          evArg)
                          : daos_obj_update(gp->oh, DAOS_TX_NONE, 0, &dkey, nr,
-                                           gp->iods.data(), gp->sgls.data(), nullptr);
+                                           gp->iods.data(), gp->sgls.data(), evArg);
+            }
+
+            if (useEq) {
+                if (rc == 0) {
+                    /* Timeout is in microseconds. n == 0 means the deadline
+                     * passed with the RPC still outstanding -- the thread is
+                     * reclaimable, the operation is not, so abort it rather
+                     * than leaving DAOS holding a pointer into a stack frame
+                     * that is about to go away. Both calls measured at 0.00 s
+                     * against a dead engine. */
+                    const int n = daos_eq_poll(eq, 1,
+                                               static_cast<int64_t>(eqTimeout * 1e6),
+                                               1, &evp);
+                    if (n == 0) {
+                        NIXL_ERROR << "DAOS: no completion in " << eqTimeout
+                                   << "s, abandoning the request";
+                        daos_event_abort(&ev);
+                        rc = -DER_TIMEDOUT;
+                    } else {
+                        rc = (n < 0) ? n : evp->ev_error;
+                    }
+                }
+                daos_event_fini(&ev);
+                eqPool_->giveBack(eq);
             }
 
             if (rc != 0) {

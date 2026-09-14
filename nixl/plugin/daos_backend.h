@@ -136,6 +136,8 @@ private:
     bool stop_ = false;
 };
 
+class nixlDaosEqPool;
+
 class nixlDaosBackendReqH : public nixlBackendReqH {
 public:
     nixlDaosBackendReqH() = default;
@@ -314,6 +316,14 @@ private:
      * is where throughput stops improving on the testbed -- see
      * doc/NIXL-DAOS-MEASUREMENT.md. */
     mutable std::unique_ptr<nixlDaosThreadPool> pool_;
+
+    /* Event queues, borrowed per request. Only used when NIXL_DAOS_EQ_TIMEOUT
+     * is set; see daos_backend.cpp for why it is a borrow pool and not one
+     * queue per thread. */
+    /* unique_ptr so the class itself can stay in the .cpp with the
+     * measurements that explain it; the destructor is defined there, which is
+     * where the complete type is needed. */
+    mutable std::unique_ptr<nixlDaosEqPool> eqPool_;
 
     /* Offset span that maps to one dkey. 64 MiB by default: large enough that a
      * request's descriptors usually share a dkey and fold into one RPC, small

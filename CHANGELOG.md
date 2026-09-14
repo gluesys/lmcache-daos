@@ -20,6 +20,28 @@ is doing real work.
 
 ### Added
 
+- `NIXL_DAOS_EQ_TIMEOUT` gives the NIXL backend a deadline it owns. Set to a
+  number of seconds, the backend submits to a DAOS event queue and polls with
+  that timeout instead of making a blocking call. Killing `daos_server`
+  mid-read, through the plugin: blocking was still running at 120 s with 65
+  threads stuck; with the timeout at 8 s the process exited in 8 s and every
+  thread came back.
+
+  Off by default, and the reason is worth keeping. The old rejection of the
+  event queue ("caps at 7-12 GB/s however the queues are arranged") came from a
+  sweep over the DFS async path through Python with 28 MiB reads, and it does
+  not reproduce for folded object-API requests. But it is not refuted either:
+  cxl2 is single-node TCP and tops out near 3 GB/s, where the fabric is the
+  bottleneck and both paths look alike. The 400G verbs regime the rejection
+  came from has not been re-measured.
+
+  The first implementation held one queue per worker thread and was 35% SLOWER
+  than blocking (2.08 vs 3.12 GB/s): the pool is deliberately oversized, and
+  while an idle thread is free, an idle event queue holds a network context --
+  64 contexts to run 16 concurrent requests. Borrowing a queue per request
+  instead grows the set to the actual concurrency and no further, and lands at
+  3.24 GB/s independent of thread count.
+
 - Resolved from the above: the GPU entry points take an event after all. The
   plugin comment claiming "synchronous only -- no event queue", and using that
   to justify the thread pool, was wrong. In `theodore/b_cufile`,
