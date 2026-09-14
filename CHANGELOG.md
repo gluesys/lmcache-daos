@@ -18,6 +18,13 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Fixed
+
+- A docstring in `connector.py` quoted `NaiveSerializer.serialize` as ending in
+  `return self._dbg(memory_obj, "read")`. It does not; the previous commit's
+  blind replacement of `return memory_obj` reached into quoted upstream source.
+  Restored, and checked against the real file.
+
 ### Added
 
 - `tests/raw_gate_ab.sh` runs the correctness gate against both layouts, control

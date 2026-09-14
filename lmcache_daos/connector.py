@@ -620,7 +620,7 @@ class DaosConnector(RemoteConnector):
 
             def serialize(self, memory_obj):
                 memory_obj.ref_count_up()
-                return self._dbg(memory_obj, "read")
+                return memory_obj
 
         -- the same object, with one reference added FOR THE CONSUMER. And
         remote_backend.batched_submit_put_task() drops only its own::

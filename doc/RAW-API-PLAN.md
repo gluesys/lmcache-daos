@@ -217,10 +217,34 @@ MemoryObj 를 별칭으로 잡고 `_drop_put_ref` 가 참조를 하나 내려놓
 계열**이다. 다만 동일하다고 단정하지 않는다 — #5090 은 DAOS 없이 재현됐고 이쪽은
 원격 백엔드가 있어야 난다.
 
-### 남은 것
+### 저장 경로의 참조 회계는 맞다 (가설 철회)
 
-`_drop_put_ref` 가 LMCache 가 아직 소유한 참조를 내려놓는지 확인해야 한다. 그게
-맞다면 4번과 5번은 그 수정 뒤에야 의미가 있다.
+`_drop_put_ref` 가 LMCache 가 아직 소유한 참조를 내려놓는 것 아니냐고 의심했다.
+cxl2 의 실제 LMCache 소스와 대조한 결과 **그렇지 않다.**
+
+`remote_backend.batched_submit_put_task` 는 이렇게 한다.
+
+```
+for mo in memory_objs: mo.ref_count_up()          # +1  자기 것
+try:    compressed = [serialize(mo) ...]          # +1  소비자 몫 (Naive 는 항등)
+finally: for mo in memory_objs: mo.ref_count_down()  # -1  자기 것
+        connection.batched_put(keys, compressed)
+```
+
+넘어오는 것은 **객체당 +1** 이고, `_drop_put_ref` 는 정확히 하나를 내린다.
+`batched_put_callback` 은 키 집합만 손대고 참조를 건드리지 않는다. 커넥터 쪽
+docstring 이 인용한 계약도 실제 코드와 문자 그대로 일치했다.
+
+따라서 무효화의 출처는 저장 경로의 참조 수가 아니다. 남은 후보는 셋이다.
+
+| | |
+|---|---|
+| `_prep_write` 의 별칭 | MemoryObj 버퍼를 별칭으로 잡는다. 반납 뒤 재활용된 버퍼를 누가 읽는지 |
+| LMCache 의 계층 간 경쟁 | 원격 백엔드가 있을 때만 객체가 두 계층에 동시에 걸린다 |
+| 실패 경로의 이중 정리 | `gather` 가 예외를 내면 우리 `finally` 와 LMCache 정리가 겹칠 수 있다 |
+
+다음 측정은 `_drop_put_ref` 직전·직후의 실제 참조 수를 찍는 것이다. 0 으로 내려간
+뒤에도 LMCache 가 그 객체를 쓴다면 소유권 경계가 어디서 어긋나는지가 확정된다.
 
 ### 그래도 확인된 것
 
