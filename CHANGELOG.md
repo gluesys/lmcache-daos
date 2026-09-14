@@ -18,6 +18,20 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Changed
+
+- `NIXL_DAOS_EQ_TIMEOUT` is now **on by default at 60 s**. The measurement it
+  was waiting for exists: on client-5 against cell1/cell2 over 400G verbs --
+  the regime the event queue was originally rejected in -- four runs each gave
+  31.04 GB/s blocking against 30.64 event queue, with overlapping ranges and
+  one run where the event queue was faster. Unfolded, 7.55 against 7.50. The
+  old "caps around 7-12 GB/s" does not transfer to folded object-API requests.
+
+  A deadline that costs nothing and turns 16 permanently lost threads into a
+  bounded error is not a trade. 60 s is a backstop rather than a latency
+  target: a request measured 1.34 ms there. `NIXL_DAOS_EQ_TIMEOUT=0` restores
+  the blocking call.
+
 ### Added
 
 - `NIXL_DAOS_EQ_TIMEOUT` gives the NIXL backend a deadline it owns. Set to a
