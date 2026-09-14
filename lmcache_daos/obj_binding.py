@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import os
 from typing import List, Optional, Sequence, Tuple
 
@@ -63,6 +64,34 @@ DAOS_COO_RW = 1 << 1
 # Not hard-coding S16 on purpose: on a single-rank pool it is rejected outright
 # (daos_obj_generate_oid -> DER_INVAL), which cost real time to work out.
 OC_UNKNOWN = 0
+
+# daos_prop.h -- DAOS_PROP_CO_MIN is 0x1000, LABEL 0x1001, LAYOUT_TYPE 0x1002.
+# Confirmed against the compiler rather than counted by hand, along with the
+# two layout values; see tests/test_obj_binding.py.
+DAOS_PROP_CO_LAYOUT_TYPE = 0x1002
+DAOS_PROP_CO_LAYOUT_UNKNOWN = 0
+DAOS_PROP_CO_LAYOUT_POSIX = 1
+
+
+class DaosPropEntry(ctypes.Structure):
+    """``struct daos_prop_entry`` -- 16 B, value is a union we only read as u64."""
+
+    _fields_ = [
+        ("dpe_type", ctypes.c_uint32),
+        ("dpe_flags", ctypes.c_uint16),
+        ("dpe_reserv", ctypes.c_uint16),
+        ("dpe_val", ctypes.c_uint64),
+    ]
+
+
+class DaosProp(ctypes.Structure):
+    """``daos_prop_t`` -- {uint32 dpp_nr; uint32 dpp_reserv; entry *dpp_entries}"""
+
+    _fields_ = [
+        ("dpp_nr", ctypes.c_uint32),
+        ("dpp_reserv", ctypes.c_uint32),
+        ("dpp_entries", ctypes.POINTER(DaosPropEntry)),
+    ]
 
 
 class DaosHandle(ctypes.Structure):
@@ -262,7 +291,181 @@ def _load() -> None:
         ctypes.POINTER(DIov), ctypes.c_void_p,
     ]
 
+    _daos.daos_cont_query.restype = ctypes.c_int
+    _daos.daos_cont_query.argtypes = [
+        DaosHandle, ctypes.c_void_p, ctypes.POINTER(DaosProp), ctypes.c_void_p,
+    ]
+    _daos.daos_prop_alloc.restype = ctypes.POINTER(DaosProp)
+    _daos.daos_prop_alloc.argtypes = [ctypes.c_uint]
+    _daos.daos_prop_free.restype = None
+    _daos.daos_prop_free.argtypes = [ctypes.POINTER(DaosProp)]
+
 
 def loaded() -> bool:
     """True once libdaos is open. Lets a test skip I/O without importing it."""
     return _daos is not None
+
+
+def _chk(rc: int, what: str) -> None:
+    if rc != 0:
+        raise DaosError(what, rc)
+
+
+class ObjSys:
+    """A pool + container + one object, addressed by dkey/akey.
+
+    One DAOS object for the whole container rather than one per key. An object
+    id is 128 bits of address space and a dkey is a full hash, so there is
+    nothing to gain from spreading keys over many objects, and one object means
+    one open and one close instead of a lifecycle to manage per key.
+
+    Deliberately NOT shaped like DfsSys. DfsSys is file-oriented -- open a
+    handle, write at an offset, close -- and pretending dkey/akey has handles
+    would invent a lifecycle that does not exist. The connector dispatches on
+    which backend it holds instead; that is two branches, against a fake handle
+    API touching every call site.
+    """
+
+    def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
+                 oid_lo: int = 1, oid_hi: int = 0):
+        _load()
+        _chk(_daos.daos_init(), "daos_init")
+        self._poh = DaosHandle()
+        self._coh = DaosHandle()
+        self._oh = DaosHandle()
+        self._open = False
+        try:
+            _chk(_daos.daos_pool_connect(
+                pool.encode(), sys.encode() if sys else None, DAOS_PC_RW,
+                ctypes.byref(self._poh), None, None), "daos_pool_connect")
+            _chk(_daos.daos_cont_open(
+                self._poh, cont.encode(), DAOS_COO_RW,
+                ctypes.byref(self._coh), None, None), "daos_cont_open")
+            # A fixed oid rather than a generated one: the same container must
+            # produce the same object in a later process, and
+            # daos_obj_generate_oid() is a placement helper, not a lookup. The
+            # low bits are ours; generate_oid stamps class and feature bits into
+            # the high word, so it is still called -- with our lo preserved.
+            oid = DaosObjId(oid_lo, oid_hi)
+            _chk(_daos.daos_obj_generate_oid(
+                self._coh, ctypes.byref(oid), 0, OC_UNKNOWN, 0, 0),
+                "daos_obj_generate_oid")
+            self.oid = oid
+            _chk(_daos.daos_obj_open(self._coh, oid, DAOS_OO_RW,
+                                     ctypes.byref(self._oh), None),
+                 "daos_obj_open")
+            self._open = True
+        except Exception:
+            self.close()
+            raise
+
+    # -- I/O ---------------------------------------------------------------
+    def update(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
+               single: bool = False) -> None:
+        """Write several akeys under one dkey in one RPC.
+
+        This is the folding call: 40 layers go in one round trip instead of 40.
+        """
+        dk_iov, dk_buf = build_key(dkey)
+        iods, sgls, n, keep = build_vectors(items, single=single)
+        _chk(_daos.daos_obj_update(self._oh, DaosHandle(0), 0,
+                                   ctypes.byref(dk_iov), n, iods, sgls, None),
+             "daos_obj_update")
+        del keep, dk_buf
+
+    def fetch(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
+              single: bool = False) -> List[int]:
+        """Read several akeys under one dkey in one RPC.
+
+        Returns the bytes DAOS actually produced per akey, 0 meaning the akey
+        is not there.
+
+        Getting this right needs care, because the obvious field lies. Measured
+        against DAOS 2.8, fetching with a buffer larger than the value::
+
+            case                rc   iod_size  sg_nr_out  iov_len
+            SINGLE, present      0     64          1         64
+            SINGLE, absent       0      0          0       4096   <- untouched
+            ARRAY,  present      0      1          1       4096
+            ARRAY,  absent       0      0          0       8192   <- untouched
+            ARRAY,  over-asked   0      1          1       4096   <- real length
+
+        A missing akey is not an error: rc is 0. And ``iov_len`` is *not*
+        cleared -- it keeps whatever the caller put there, which is the request
+        size. So a reader that trusts iov_len sees a full-length buffer of
+        uninitialised memory and serves it as a hit. That is the exact shape of
+        silent corruption this project has already paid for once, and the first
+        version of this method had it.
+
+        ``sg_nr_out`` is the gate: zero segments produced means nothing was
+        there. Past that gate ``iov_len`` is trustworthy, including for a short
+        value, which is what makes a truncated payload detectable.
+        """
+        dk_iov, dk_buf = build_key(dkey)
+        iods, sgls, n, keep = build_vectors(items, single=single)
+        _chk(_daos.daos_obj_fetch(self._oh, DaosHandle(0), 0,
+                                  ctypes.byref(dk_iov), n, iods, sgls, None, None),
+             "daos_obj_fetch")
+        got = [int(sgls[i].sg_iovs[0].iov_len) if sgls[i].sg_nr_out else 0
+               for i in range(n)]
+        del keep, dk_buf
+        return got
+
+    def punch(self, dkey: bytes) -> None:
+        """Remove every akey under a dkey."""
+        dk_iov, dk_buf = build_key(dkey)
+        _chk(_daos.daos_obj_punch_dkeys(self._oh, DaosHandle(0), 0, 1,
+                                        ctypes.byref(dk_iov), None),
+             "daos_obj_punch_dkeys")
+        del dk_buf
+
+    def close(self) -> None:
+        if self._open:
+            _daos.daos_obj_close(self._oh, None)
+            self._open = False
+        if self._coh.valid:
+            _daos.daos_cont_close(self._coh, None)
+            self._coh = DaosHandle()
+        if self._poh.valid:
+            _daos.daos_pool_disconnect(self._poh, None)
+            self._poh = DaosHandle()
+
+
+def container_layout(pool: str, cont: str, sys: Optional[str] = None) -> int:
+    """DAOS_PROP_CO_LAYOUT_* for a container.
+
+    Which backend can be used is decided here, and it is decided by the
+    container rather than by configuration because the container decided it
+    first: layout is fixed at creation, and each API rejects the other's
+    container outright (dfs_sys_connect returns EINVAL on a non-POSIX
+    container; a POSIX container is not ours to write dkeys into).
+
+    Worth the extra connect at startup. A backend pointed at the wrong
+    container does not fail cleanly -- it repeats DER_HG every 15 s at ~100%
+    CPU, which took an hour to recognise during the 400G measurement
+    (doc/FAILURE-MODES.md).
+    """
+    _load()
+    _chk(_daos.daos_init(), "daos_init")
+    poh, coh = DaosHandle(), DaosHandle()
+    prop = None
+    try:
+        _chk(_daos.daos_pool_connect(
+            pool.encode(), sys.encode() if sys else None, DAOS_PC_RO,
+            ctypes.byref(poh), None, None), "daos_pool_connect")
+        _chk(_daos.daos_cont_open(poh, cont.encode(), DAOS_COO_RO,
+                                  ctypes.byref(coh), None, None),
+             "daos_cont_open")
+        prop = _daos.daos_prop_alloc(1)
+        if not prop:
+            raise DaosError("daos_prop_alloc", errno.ENOMEM)
+        prop.contents.dpp_entries[0].dpe_type = DAOS_PROP_CO_LAYOUT_TYPE
+        _chk(_daos.daos_cont_query(coh, None, prop, None), "daos_cont_query")
+        return int(prop.contents.dpp_entries[0].dpe_val)
+    finally:
+        if prop:
+            _daos.daos_prop_free(prop)
+        if coh.valid:
+            _daos.daos_cont_close(coh, None)
+        if poh.valid:
+            _daos.daos_pool_disconnect(poh, None)

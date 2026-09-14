@@ -42,7 +42,9 @@ from typing import List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import serde
+from . import serde_v3
 from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
+from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -113,6 +115,34 @@ def _parse_daos_url(url: str):
     return pool, cont, parse_qs(parsed.query).get("sys", [None])[0]
 
 
+def _choose_backend(pool: str, cont: str, sysname) -> bool:
+    """True for the object API, False for DFS.
+
+    The container decides. DAOS_FORCE_LAYOUT exists for a host where the probe
+    cannot run, and is still checked against the container when the probe does
+    work -- an override that silently disagrees with the storage is the failure
+    this whole mechanism exists to prevent.
+    """
+    forced = os.environ.get("DAOS_FORCE_LAYOUT", "").strip().lower()
+    if forced and forced not in ("posix", "raw"):
+        raise ValueError("DAOS_FORCE_LAYOUT must be 'posix' or 'raw', "
+                         f"not {forced!r}")
+    try:
+        raw = container_layout(pool, cont, sysname) != DAOS_PROP_CO_LAYOUT_POSIX
+    except Exception as e:  # noqa: BLE001 - the probe is best effort
+        if not forced:
+            raise
+        logger.warning("DAOS: layout probe failed (%s); using DAOS_FORCE_LAYOUT=%s",
+                       e, forced)
+        return forced == "raw"
+    if forced and (forced == "raw") != raw:
+        raise ValueError(
+            f"DAOS_FORCE_LAYOUT={forced} disagrees with {pool}/{cont}, which is "
+            f"{'non-POSIX' if raw else 'POSIX'}. Pointing a backend at the wrong "
+            "container does not fail cleanly; it repeats DER_HG forever.")
+    return raw
+
+
 def _key_to_path(key) -> str:
     """Map a CacheEngineKey to a flat DFS path.
 
@@ -173,6 +203,20 @@ PING_TIMEOUT_SECS = float(os.environ.get("DAOS_PING_TIMEOUT", "3.0"))
 STALL_SECS = float(os.environ.get("DAOS_STALL_SECS", "60"))
 
 
+# How large a buffer every read of the metadata akey offers.
+#
+# A DAOS_IOD_SINGLE value is fetched whole or not at all: ask with a buffer
+# smaller than the stored value and DAOS returns DER_REC2BIG(-2013) rather than
+# a short read. Arrays do not behave this way -- an extent shorter than asked
+# comes back short and succeeds -- so the difference is easy to trip over, and
+# it did: exists() probed with just the fixed part and every call failed.
+#
+# So the size must be an upper bound on fixed + metadata, not a guess at the
+# typical case. KV RemoteMetadata is ~28 bytes; _HDR_CAP is the same headroom
+# the DFS path already allows for it.
+_META_CAP = serde_v3.FIXED_SIZE + _HDR_CAP
+
+
 class DaosPoolWedged(DaosError):
     """Every IO worker is inside a DAOS call that is not going to return.
 
@@ -210,7 +254,28 @@ class DaosConnector(RemoteConnector):
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
-        self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
+
+        # Which layout this container holds is not ours to choose: it was fixed
+        # when the container was created, and each API refuses the other's
+        # container. Asking costs one extra connect at startup and removes a
+        # failure that is very hard to read -- a backend pointed at the wrong
+        # container repeats DER_HG every 15 s at ~100% CPU rather than erroring
+        # (doc/FAILURE-MODES.md).
+        #
+        # DAOS_FORCE_LAYOUT=posix|raw overrides the probe, for a host where the
+        # probe itself cannot run. It is checked against the container anyway,
+        # because a silent disagreement is the thing being avoided.
+        self._raw = _choose_backend(pool, cont, sysname)
+        if self._raw:
+            self._obj = ObjSys(pool=pool, cont=cont, sys=sysname)
+            self._dfs = None
+            self._addr = serde_v3.dkey_for
+            logger.info("DAOS: %s/%s is a non-POSIX container, using the "
+                        "object API (dkey/akey)", pool, cont)
+        else:
+            self._obj = None
+            self._dfs = DfsSys(pool=pool, cont=cont, sys=sysname)
+            self._addr = _key_to_path
         # 16 was measured as the sweet spot for the 40 MiB objects this
         # connector normally sees. It is a knob because layerwise mode
         # (use_layerwise) shrinks objects by the layer count, which changes
@@ -257,6 +322,12 @@ class DaosConnector(RemoteConnector):
             return
         t0 = _t.monotonic()
         try:
+            if self._raw:
+                # warm_up_all_targets writes DFS files. The object path needs an
+                # equivalent before it meets a lossy verbs fabric; until then
+                # say so rather than appear to have warmed up.
+                logger.info("DAOS: object-API backend, SX warm-up skipped")
+                return
             r = warm_up_all_targets(self._dfs, f"/.daos-probe.{os.getpid()}",
                                     nchunks, self._pool)
             _s.stderr.write(f"[DaosConnector] warm-up: SX probe, {r['n']} targets contacted "
@@ -300,16 +371,23 @@ class DaosConnector(RemoteConnector):
 
     # -- RemoteConnector interface -----------------------------------------
     async def exists(self, key) -> bool:
-        return await self._run(self._exists_sync, _key_to_path(key))
+        return await self._run(self._exists_sync, self._addr(key))
 
-    def _exists_sync(self, path) -> bool:
-        return self._dfs.exists(path)
+    def _exists_sync(self, addr) -> bool:
+        if self._raw:
+            # Presence of the metadata akey, not of the payload: metadata is
+            # written last, so it is the commit record (serde_v3).
+            probe = ctypes.create_string_buffer(_META_CAP)
+            (got,) = self._obj.fetch(addr, [(serde_v3.AKEY_META, probe, _META_CAP)],
+                                     single=True)
+            return got > 0
+        return self._dfs.exists(addr)
 
     def exists_sync(self, key) -> bool:
-        return self._dfs.exists(_key_to_path(key))
+        return self._exists_sync(self._addr(key))
 
     async def get(self, key) -> Optional["MemoryObj"]:
-        return await self._run(self._get_sync, _key_to_path(key))
+        return await self._run(self._get_sync, self._addr(key))
 
     # LMCache dispatches per-chunk get() concurrently, but also probes for a
     # batched hook. Advertising it lets us gather every chunk of a request onto
@@ -324,7 +402,7 @@ class DaosConnector(RemoteConnector):
         semantics -- the result is positional, with None for a miss."""
         import time as _t
         t0 = _t.perf_counter()
-        paths = [_key_to_path(k) for k in keys]
+        paths = [self._addr(k) for k in keys]
         # return_exceptions: one unreadable object must not fail the whole
         # batch. A cache reports a miss and lets the engine recompute that
         # range. (Adopted from the main branch's batched_get.)
@@ -435,7 +513,15 @@ class DaosConnector(RemoteConnector):
         # exists() returning False is success. Any DaosError other than ENOENT
         # propagates, because exists() only swallows that one.
         try:
-            self._dfs.exists(_PING_PATH)
+            if self._raw:
+                # Same probe shape as the DFS path: a read that must not raise.
+                # A dkey no key can produce -- dkeys are sha256 digests, and
+                # this one is short.
+                self._obj.fetch(b"ping", [(serde_v3.AKEY_META,
+                                           ctypes.create_string_buffer(8), 8)],
+                                single=True)
+            else:
+                self._dfs.exists(_PING_PATH)
         finally:
             # Runs on the ping thread, so it clears the flag whenever the call
             # actually came back -- including long after wait_for() gave up.
@@ -453,7 +539,7 @@ class DaosConnector(RemoteConnector):
         return False
 
     async def batched_get_non_blocking(self, lookup_id, keys):
-        paths = [_key_to_path(k) for k in keys]
+        paths = [self._addr(k) for k in keys]
         res = await asyncio.gather(
             *(self._run(self._get_sync, p) for p in paths))
         prefix = []
@@ -498,7 +584,7 @@ class DaosConnector(RemoteConnector):
         batch. ``None`` means miss-or-error for that chunk; the stream continues
         (per-chunk error semantics, as the RFC proposes).
         """
-        paths = [_key_to_path(k) for k in keys]
+        paths = [self._addr(k) for k in keys]
         async for idx, res in stream_completions(
                 self.loop, self._pool, self._get_sync, paths, max_inflight):
             if isinstance(res, BaseException):
@@ -556,7 +642,7 @@ class DaosConnector(RemoteConnector):
     async def put(self, key, memory_obj: "MemoryObj"):
         header, src, n = self._prep_write(memory_obj)
         try:
-            await self._run(self._put_sync, _key_to_path(key), header, src, n)
+            await self._run(self._put_sync, self._addr(key), header, src, n)
         finally:
             self._drop_put_ref(memory_obj)
 
@@ -654,8 +740,10 @@ class DaosConnector(RemoteConnector):
             return header, buf.from_buffer(view), n
         return header, buf.from_buffer_copy(view), n
 
-    def _put_sync(self, path, header, src, n):
-        obj = self._dfs.open_rdwr_create(path)
+    def _put_sync(self, addr, header, src, n):
+        if self._raw:
+            return self._put_raw(addr, header, src, n)
+        obj = self._dfs.open_rdwr_create(addr)
         try:
             hdr = (ctypes.c_char * len(header)).from_buffer_copy(header)
             self._dfs.write_obj_from(obj, 0, len(header), hdr)   # tiny (~36 B)
@@ -707,7 +795,7 @@ class DaosConnector(RemoteConnector):
         prepped = [self._prep_write(mo) for mo in memory_objs]
         try:
             await asyncio.gather(*(
-                self._run(self._put_sync, _key_to_path(k), h, s, n)
+                self._run(self._put_sync, self._addr(k), h, s, n)
                 for k, (h, s, n) in zip(keys, prepped)
             ))
         finally:
@@ -733,13 +821,19 @@ class DaosConnector(RemoteConnector):
         object and interacts with the directory-fanout design -- so it is left
         as an explicit decision rather than a silent change.
         """
+        if self._raw:
+            # daos_obj_list_dkey is not bound yet; list() is a capacity tool,
+            # not a serving path, and claiming an empty container would be
+            # worse than saying so.
+            raise NotImplementedError(
+                "list() is not implemented for the object-API backend")
         return await self._run(self._dfs.listdir, "/")
 
     def remove_sync(self, key) -> bool:
         """Delete one object. ``RemoteBackend.remove()`` calls this, so this is
         what makes remote eviction work at all -- without it the container grows
         without bound."""
-        return self._dfs.remove(_key_to_path(key))
+        return self._remove_one(self._addr(key))
 
     async def close(self):
         # wait=False on BOTH pools, for one reason: a DAOS call whose engine
@@ -767,7 +861,7 @@ class DaosConnector(RemoteConnector):
             self._pool.shutdown(wait=False)
         self._ping_pool.shutdown(wait=False)
         try:
-            self._dfs.close()
+            (self._obj or self._dfs).close()
         except Exception:
             pass
 
@@ -788,6 +882,89 @@ class DaosConnector(RemoteConnector):
                 except Exception:
                     pass
                 return
+
+    def _put_raw(self, dkey, header, src, n) -> None:
+        """Payload akey first, metadata akey last.
+
+        The order is the commit protocol, not an optimisation: the metadata
+        akey is what a reader looks for, so a crash between the two calls
+        leaves a dkey that reads as a miss. Doing both in one update would save
+        a round trip and would not be a single commit point -- a dkey's akeys
+        can land on different shards under replication or EC. See serde_v3.
+        """
+        # _prep_write builds a v1 header (8-byte prefix + metadata) because that
+        # is what the DFS path writes, and it is left alone so the DFS path stays
+        # byte-identical. Repack it here rather than teach _prep_write about two
+        # formats: the metadata is ~28 bytes, so the cost is a slice.
+        ps = serde.prefix_size()
+        meta_len, payload_len = serde.parse_prefix(bytes(header[:ps]))
+        meta_bytes = bytes(header[ps:ps + meta_len])
+        hdr = serde_v3.pack_meta(meta_bytes, payload_len)
+
+        self._obj.update(dkey, [(serde_v3.AKEY_PAYLOAD, src, n)])
+        meta = (ctypes.c_char * len(hdr)).from_buffer_copy(hdr)
+        self._obj.update(dkey, [(serde_v3.AKEY_META, meta, len(hdr))],
+                         single=True)
+
+    def _get_raw(self, dkey) -> Optional["MemoryObj"]:
+        """The object-API read. Same contract as _get_sync: absent or
+        incomplete is None, never a raise and never a partial object.
+
+        Two round trips, metadata then payload, because the payload's size is
+        not known until the metadata is read and over-asking would mean sizing
+        every fetch to the largest object this container might hold.
+
+        The absence test is ``got == 0`` from ObjSys.fetch, which gates on
+        ``sg_nr_out``. Trusting the iov length instead would report a full
+        buffer of uninitialised memory as a hit -- DAOS leaves that field
+        untouched for an akey that is not there. See ObjSys.fetch.
+        """
+        hdr_buf = ctypes.create_string_buffer(_META_CAP)
+        (got,) = self._obj.fetch(dkey, [(serde_v3.AKEY_META, hdr_buf, _META_CAP)],
+                                 single=True)
+        if got == 0:
+            return None                          # no metadata akey => miss
+        try:
+            hdr = serde_v3.parse_meta(bytes(hdr_buf[:got]))
+        except serde_v3.BadHeader:
+            return None                          # torn or uncommitted => miss
+        try:
+            metadata = RemoteMetadata.deserialize(hdr.meta)
+        except Exception:
+            return None
+        if hdr.payload_len < metadata.length:
+            return None                          # header disagrees with itself
+
+        memory_obj = self.local_cpu_backend.allocate(
+            metadata.shapes, metadata.dtypes, metadata.fmt)
+        if memory_obj is None:
+            return None
+
+        view = memory_obj.byte_array
+        if not isinstance(view, memoryview):
+            view = memoryview(view)
+        view = view.cast("B")
+        n = metadata.length
+        dst = (ctypes.c_char * n).from_buffer(view)
+        try:
+            (readn,) = self._obj.fetch(dkey, [(serde_v3.AKEY_PAYLOAD, dst, n)])
+        except Exception:
+            self._release(memory_obj)
+            raise
+        if readn != n:
+            # Short payload: the writer died between the payload and metadata
+            # akeys, or the value really is shorter than the header promised.
+            # Either way a miss, and the staging buffer goes back -- a leak here
+            # would be one buffer per torn key.
+            self._release(memory_obj)
+            return None
+        return memory_obj
+
+    def _remove_one(self, addr) -> bool:
+        if self._raw:
+            self._obj.punch(addr)
+            return True
+        return self._dfs.remove(addr)
 
     def _get_sync(self, path) -> Optional["MemoryObj"]:
         """Load one object, or return None if it is absent OR incomplete.
@@ -812,6 +989,8 @@ class DaosConnector(RemoteConnector):
         main's path does not scale at all -- the two full Python-level copies
         hold the GIL, so 16 threads serialise. Keeping its safety costs 2%.
         """
+        if self._raw:
+            return self._get_raw(path)
         dfs = self._dfs
         # One open for prefix + metadata + payload (was 3 opens: exists + meta +
         # payload). Missing key => open raises ENOENT, which we map to None.
