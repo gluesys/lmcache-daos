@@ -32,8 +32,8 @@ So:
 
 ## Before you send it
 
-The CI (`.gitlab-ci.yml`, mirrored as `.github/workflows/ci.yml`) runs three
-things, and all of them run on a laptop with nothing but a Python interpreter:
+The CI (`.gitlab-ci.yml`; there is no GitHub Actions copy, see `.github/README.md`)
+runs three things, and all of them run on a laptop with nothing but a Python interpreter:
 
 ```bash
 python3 tests/test_serde.py

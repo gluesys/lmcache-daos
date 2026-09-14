@@ -11,6 +11,13 @@ is doing real work.
 
 ## [Unreleased]
 
+### Removed
+
+- `.github/workflows/ci.yml`. The GitHub repository is a push mirror whose token
+  lacks the `workflow` scope, so GitHub rejected every push touching that file
+  and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
+  `.gitlab-ci.yml`; `.github/README.md` records the reason.
+
 ### Added
 
 - Resolved from the above: the GPU entry points take an event after all. The
