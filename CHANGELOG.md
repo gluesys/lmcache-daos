@@ -20,6 +20,27 @@ is doing real work.
 
 ### Added
 
+- Phase 1 step 2 of [doc/RAW-API-PLAN.md]: the connector picks its backend from
+  the container. `ObjSys` does the dkey/akey I/O, `container_layout()` reads
+  DAOS_PROP_CO_LAYOUT_TYPE, and a POSIX container still gets the DFS path
+  byte-for-byte. Verified both ways on one connector against one pool.
+  `DAOS_FORCE_LAYOUT` overrides the probe and is rejected when it disagrees
+  with the container, because a silent disagreement is the failure this exists
+  to prevent.
+
+  Two DAOS behaviours were measured rather than assumed, and both would have
+  shipped as silent bugs:
+
+  A fetch of an akey that is not there returns **rc 0** and does **not** clear
+  `iov_len` -- it keeps whatever the caller put in, i.e. the request size. A
+  reader trusting it serves a full buffer of uninitialised memory as a hit.
+  `sg_nr_out` is the real gate; the table is in `ObjSys.fetch`.
+
+  A `DAOS_IOD_SINGLE` value is fetched whole or not at all: a buffer smaller
+  than the stored value returns `DER_REC2BIG(-2013)` rather than a short read.
+  Arrays do not behave this way. `exists()` probed with only the fixed header
+  size and every call failed.
+
 - Phase 1 step 1 of [doc/RAW-API-PLAN.md]: `lmcache_daos/obj_binding.py` and
   `lmcache_daos/serde_v3.py`, with tests that need no DAOS. Nothing is wired
   into the connector yet and no default moves.

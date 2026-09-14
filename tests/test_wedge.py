@@ -65,6 +65,11 @@ def bare(workers=2):
     c._pool = concurrent.futures.ThreadPoolExecutor(workers, thread_name_prefix="daos-io")
     c._ping_pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="daos-ping")
     c._ping_inflight = False
+    # Backend selection fields: the DFS branch, with no backend attached. The
+    # wedge detector runs before either is touched, which is the point.
+    c._raw = False
+    c._obj = None
+    c._dfs = None
     c.loop = asyncio.new_event_loop()
     return c
 

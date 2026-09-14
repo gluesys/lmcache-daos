@@ -63,9 +63,13 @@ def main():
     try:
         # Make the test idempotent: a previous run leaves the key behind, and
         # the container is shared, so start from a known-clean state.
-        from lmcache_daos.connector import _key_to_path
-
-        conn._dfs.remove(_key_to_path(key))
+        # Through the connector, not through its backend: _dfs is None when the
+        # container is non-POSIX, and reaching past remove_sync() would make
+        # this test exercise only one of the two layouts.
+        try:
+            conn.remove_sync(key)
+        except Exception:
+            pass
         assert not loop.run_until_complete(conn.exists(key)), "key should not exist yet"
         loop.run_until_complete(conn.put(key, mo))
         print("put OK")
