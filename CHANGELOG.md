@@ -20,6 +20,29 @@ is doing real work.
 
 ### Added
 
+- Phase 1 step 1 of [doc/RAW-API-PLAN.md]: `lmcache_daos/obj_binding.py` and
+  `lmcache_daos/serde_v3.py`, with tests that need no DAOS. Nothing is wired
+  into the connector yet and no default moves.
+
+  `serde_v3` is a placement, not a new header format. The metadata akey holds a
+  v2 header with the page padding removed, and `parse_meta` delegates to
+  `serde_v2.parse_header` unchanged, so the torn-object policy transfers
+  instead of being re-proved. Two things fall out of the placement: no padding
+  (nothing follows the header to align) and no rename (the metadata akey is the
+  commit record -- payload akeys first, metadata last, and a crash between
+  leaves a dkey a reader reports as a miss).
+
+  Writing both in one `daos_obj_update` is tempting and deliberately not done:
+  a dkey's akeys can land on different shards under replication or EC, so one
+  call is not one commit point. The extra RPC is against a few dozen bytes.
+
+  `obj_binding` pins the ABI. `daos_iod_t` carries `iod_flags` between
+  `iod_size` and `iod_nr`; omitting it yields a binding that compiles, links
+  and corrupts, so the test asserts size 64 and every offset as literals
+  cross-checked against the C compiler on a host with the headers. The builders
+  return everything that must outlive a transfer, because ctypes frees an
+  unreferenced temporary immediately and DAOS would read the dangling pointer.
+
 - [doc/RAW-API-PLAN.md] scopes phase 1 of the move to dkey/akey: the in-process
   connector only, behind container-type detection, changing no default and no
   existing data.

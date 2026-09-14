@@ -50,6 +50,11 @@ unit:
     # by an Event. Worth guarding here precisely because the real version of
     # that fault can only be reproduced by destroying a cluster.
     - python3 tests/test_wedge.py
+    # Neither needs DAOS. The ABI test is the one that earns its place here:
+    # a wrong daos_iod_t offset produces a binding that compiles, links and
+    # corrupts, and the runner has no libdaos to catch it any other way.
+    - python3 tests/test_serde_v3.py
+    - python3 tests/test_obj_binding.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
