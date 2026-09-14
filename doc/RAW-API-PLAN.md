@@ -185,8 +185,42 @@ retrieve 중 LMCache 의 GPU 커넥터가 원격 백엔드에서 받은 MemoryOb
 가 없다며 단언에 걸리고, vLLM 엔진이 통째로 죽는다(`EngineDeadError`). DFS
 컨테이너와 dkey/akey 컨테이너에서 **동일하게** 발생한다.
 
-cxl2 의 LMCache 가 이 게이트가 검증됐던 배포본과 다른 것으로 보이나, 확인하지
-않았다. 확인 전까지 4번은 **미완**이다.
+### 원인 — 무효화된 MemoryObj 를 되읽는다
+
+로그 순서가 답이다.
+
+```
+00:22:52.678  WARNING  Trying to access an invalidated MemoryObj
+00:22:52      ERROR    assert memory_obj.tensor is not None
+```
+
+`tensor` 가 `None` 인 이유는 **그 객체가 이미 무효화됐기 때문**이다. 버퍼가 반납된
+뒤에 retrieve 가 같은 객체를 다시 만졌다. 사용 후 해제다.
+
+세 가지 대조로 좁혔다.
+
+| 구성 | invalidated | assert | 결과 |
+|---|---|---|---|
+| DAOS 없음 (local_cpu 만) | **0** | **0** | pass A·B 둘 다 200 |
+| DAOS DFS 컨테이너 | 1 | 1 | pass B 500 |
+| DAOS 저수준 컨테이너 | 1 | 1 | pass B 500 |
+
+**원격 백엔드가 붙을 때만 난다.** 그리고 DFS 와 저수준을 가르지 않는다.
+
+한 가지 더, 이게 우리 읽기 경로가 아니라는 증거가 있다. `_get_sync`/`_get_raw` 의
+모든 성공 반환에 로그를 걸었는데(`DAOS_DEBUG_OBJ=1`) **실패한 실행에서 한 줄도
+찍히지 않았다.** 즉 문제의 객체는 우리가 돌려준 것이 아니다. 남는 것은 **저장
+경로**다 — 원격 백엔드가 있을 때만 `batched_put` 이 돌고, `_prep_write` 가
+MemoryObj 를 별칭으로 잡고 `_drop_put_ref` 가 참조를 하나 내려놓는다.
+
+이것은 이 프로젝트가 이미 상류에 올린 **LMCache 이슈 #5090(double unpin)과 같은
+계열**이다. 다만 동일하다고 단정하지 않는다 — #5090 은 DAOS 없이 재현됐고 이쪽은
+원격 백엔드가 있어야 난다.
+
+### 남은 것
+
+`_drop_put_ref` 가 LMCache 가 아직 소유한 참조를 내려놓는지 확인해야 한다. 그게
+맞다면 4번과 5번은 그 수정 뒤에야 의미가 있다.
 
 ### 그래도 확인된 것
 
