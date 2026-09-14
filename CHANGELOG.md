@@ -20,6 +20,24 @@ is doing real work.
 
 ### Added
 
+- `tests/raw_gate_ab.sh` runs the correctness gate against both layouts, control
+  first, and `tests/kv_correctness_gate.sh` gains `LOG_CMD`, `GATE_MODEL` and
+  `PARA_REPEAT` -- it was fixed to one podman deployment, one model name and one
+  prompt length, and each mismatch arrives looking like a backend failure.
+
+  Phase 1 step 4 is NOT passed. The gate dies at
+  `gpu_connectors.py:285 assert memory_obj.tensor is not None` during retrieve,
+  taking the vLLM engine with it -- **on the DFS control as well as on the
+  object API**, identically. Nothing about the raw path can be claimed from a
+  run whose known-good arm fails the same way. Recorded in
+  [doc/RAW-API-PLAN.md].
+
+  What the attempt did establish: backend selection works under real vLLM, with
+  each arm logging which one it chose; a non-POSIX container serves a vLLM
+  startup and LMCache init without complaint; and the gate reported
+  INCONCLUSIVE rather than a false pass when vLLM's own prefix cache answered
+  pass B and LMCache was never consulted.
+
 - Phase 1 step 3 of [doc/RAW-API-PLAN.md]: `tests/test_torn_object_raw.py` holds
   the torn-object gate for the dkey/akey layout. Nine damage shapes, all reading
   back as a miss, with the staging buffer handed back every time.

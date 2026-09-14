@@ -35,6 +35,11 @@ URL=${1:-http://127.0.0.1:8001/v1/completions}
 N=${2:-6}
 MAXTOK=${3:-24}
 CONT=${CONT:-vllm-daos}
+# How to read the serving process's log. The default assumes the podman
+# deployment this was written against; a bare venv run needs
+#   LOG_CMD="cat /path/to/vllm.log"
+# Kept as a command rather than a path so both shapes work with one variable.
+LOG_CMD=${LOG_CMD:-podman logs $CONT}
 # Log line that proves pass B was served from cache. In-process mode logs
 # "Retrieved N out of M"; MP mode's server logs "Retrieved N tokens in T seconds"
 # (prefixed by the launcher). Override with HIT_PATTERN for other setups.
@@ -42,9 +47,16 @@ HIT_PATTERN=${HIT_PATTERN:-'Retrieved [0-9]+ (out of|tokens in)'}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-python3 - "$N" "$MAXTOK" "$TMP" <<'PY'
+# The served model name and the prompt length were fixed for one deployment.
+# They have to move together with the model: a name vLLM does not serve gets a
+# 404 with no "choices", and a prompt past the context window gets a 400, and
+# both arrive looking like the backend failed.
+GATE_MODEL=${GATE_MODEL:-qwen3}
+PARA_REPEAT=${PARA_REPEAT:-90}     # ~6000 tokens; ~65 tokens per repeat
+python3 - "$N" "$MAXTOK" "$TMP" "$GATE_MODEL" "$PARA_REPEAT" <<'PY'
 import json, sys
 n, maxtok, tmp = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+model, repeat = sys.argv[4], int(sys.argv[5])
 
 # Coherent prose, NOT a repeated word list. The first version of this gate used
 # " ".join of a cycling 8-word vocabulary, and that is the worst possible prompt
@@ -62,8 +74,8 @@ para = ("Distributed object storage separates metadata from bulk data so that "
 for k in range(n):
     # ~6000 tokens so the prompt spans many chunks; unique prefix per k so
     # pass A is always a genuine miss.
-    txt = f"gate{k} " + (para * 90)
-    json.dump({"model": "qwen3", "prompt": txt, "max_tokens": maxtok,
+    txt = f"gate{k} " + (para * repeat)
+    json.dump({"model": model, "prompt": txt, "max_tokens": maxtok,
                "temperature": 0, "seed": 1234},
               open(f"{tmp}/g{k}.json", "w"))
 PY
@@ -80,7 +92,7 @@ pass=0
 fail=0
 nocache=0
 for k in $(seq 0 $((N - 1))); do
-	mark_before=$(podman logs "$CONT" 2>&1 | grep -Ec "$HIT_PATTERN" || true)
+	mark_before=$($LOG_CMD 2>&1 | grep -Ec "$HIT_PATTERN" || true)
 
 	curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
 		-d @"$TMP/g$k.json" -o "$TMP/a$k.json"
@@ -91,7 +103,7 @@ for k in $(seq 0 $((N - 1))); do
 
 	a=$(get_text "$TMP/a$k.json")
 	b=$(get_text "$TMP/b$k.json")
-	mark_after=$(podman logs "$CONT" 2>&1 | grep -Ec "$HIT_PATTERN" || true)
+	mark_after=$($LOG_CMD 2>&1 | grep -Ec "$HIT_PATTERN" || true)
 
 	if [ "$mark_after" -le "$mark_before" ]; then
 		# Pass B never hit the cache, so this iteration proves nothing.
