@@ -170,6 +170,53 @@ daos cont query → layout_type
 를 쥐어 느려진다 — cxl2 에서 블로킹보다 35 % 느렸다. `nixl/plugin/daos_backend.cpp`
 의 `nixlDaosEqPool` 이 같은 문제의 해법이고, 파이썬 쪽도 같은 형태여야 한다.
 
+## 4번 시도 결과 — 막혔고, 저수준 탓이 아니다
+
+게이트는 **대조군(DFS)에서도 같은 지점에서 죽는다.** 두 팔이 구분되지 않으므로
+저수준 경로에 대해서는 아무것도 주장할 수 없다.
+
+```
+lmcache/v1/gpu_connector/gpu_connectors.py:285  to_gpu
+    assert memory_obj.tensor is not None
+AssertionError
+```
+
+retrieve 중 LMCache 의 GPU 커넥터가 원격 백엔드에서 받은 MemoryObj 에 `.tensor`
+가 없다며 단언에 걸리고, vLLM 엔진이 통째로 죽는다(`EngineDeadError`). DFS
+컨테이너와 dkey/akey 컨테이너에서 **동일하게** 발생한다.
+
+cxl2 의 LMCache 가 이 게이트가 검증됐던 배포본과 다른 것으로 보이나, 확인하지
+않았다. 확인 전까지 4번은 **미완**이다.
+
+### 그래도 확인된 것
+
+가는 길에 환경 문제 넷을 통과했고, 그 과정에서 다음이 실증됐다.
+
+| | |
+|---|---|
+| 백엔드 선택 | 실제 vLLM 아래서 동작. 두 팔이 각자 `backend: DFS` / `backend: object API` 를 찍었다 |
+| 저수준 컨테이너 | vLLM 기동·LMCache 초기화·저장까지 문제없음 |
+| 게이트의 판정 | 히트가 없을 때 **거짓 통과 대신 INCONCLUSIVE** 를 보고했다 |
+
+마지막 항목은 게이트가 제 일을 한 것이다. vLLM 자체 prefix 캐시가 pass B 를
+GPU 에서 돌려주고 있어 LMCache 까지 가지 않았는데(vLLM prefix 히트율 45.4 %,
+LMCache retrieve 0건), 게이트는 그것을 통과로 세지 않았다.
+
+### 하네스에 필요했던 일반화
+
+게이트가 한 배포본에 고정돼 있어 세 곳을 매개변수로 뺐다. 값이 어긋나면 전부
+**백엔드 고장처럼 보이는 형태**로 도착한다.
+
+| 변수 | 왜 |
+|---|---|
+| `LOG_CMD` | `podman logs` 고정이었다. venv 실행은 로그 파일이다 |
+| `GATE_MODEL` | `"qwen3"` 고정. 서빙하지 않는 이름은 404 → `KeyError: 'choices'` |
+| `PARA_REPEAT` | ~6000 토큰 고정. 컨텍스트를 넘기면 400 → 같은 증상 |
+
+`tests/raw_gate_ab.sh` 는 **대조군을 먼저 돌린다.** 게이트 자신의 권고이며, 이번에
+그 권고가 값을 했다 — 저수준만 돌렸다면 네 번의 환경 실패를 전부 저수준 탓으로
+읽었을 것이다.
+
 ## 순서
 
 1. `obj_binding.py` + `serde_v3.py`, DAOS 없이 도는 단위 시험부터
