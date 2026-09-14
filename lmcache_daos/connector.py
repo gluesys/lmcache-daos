@@ -202,6 +202,11 @@ PING_TIMEOUT_SECS = float(os.environ.get("DAOS_PING_TIMEOUT", "3.0"))
 # completions keep arriving, and under a wedge there are exactly none.
 STALL_SECS = float(os.environ.get("DAOS_STALL_SECS", "60"))
 
+# DAOS_DEBUG_OBJ=1 logs what get() hands back. Off by default: it fires once per
+# chunk. Added while tracking down an assertion inside LMCache's GPU connector
+# that only appears when a remote backend is configured.
+_DEBUG_OBJ = os.environ.get("DAOS_DEBUG_OBJ") == "1"
+
 
 # How large a buffer every read of the metadata akey offers.
 #
@@ -388,6 +393,18 @@ class DaosConnector(RemoteConnector):
 
     async def get(self, key) -> Optional["MemoryObj"]:
         return await self._run(self._get_sync, self._addr(key))
+
+    def _dbg(self, mo, where):
+        """Log what a read path is about to hand back (DAOS_DEBUG_OBJ=1)."""
+        if not _DEBUG_OBJ or mo is None:
+            return mo
+        t = getattr(mo, "tensor", "<no attr>")
+        logger.info("DAOS debug: %s -> %s tensor=%s fmt=%s len=%s", where,
+                    type(mo).__name__,
+                    "None" if t is None else getattr(t, "shape", t),
+                    getattr(getattr(mo, "metadata", None), "fmt", "?"),
+                    getattr(getattr(mo, "metadata", None), "length", "?"))
+        return mo
 
     # LMCache dispatches per-chunk get() concurrently, but also probes for a
     # batched hook. Advertising it lets us gather every chunk of a request onto
@@ -603,7 +620,7 @@ class DaosConnector(RemoteConnector):
 
             def serialize(self, memory_obj):
                 memory_obj.ref_count_up()
-                return memory_obj
+                return self._dbg(memory_obj, "read")
 
         -- the same object, with one reference added FOR THE CONSUMER. And
         remote_backend.batched_submit_put_task() drops only its own::
@@ -958,7 +975,7 @@ class DaosConnector(RemoteConnector):
             # would be one buffer per torn key.
             self._release(memory_obj)
             return None
-        return memory_obj
+        return self._dbg(memory_obj, "read")
 
     def _remove_one(self, addr) -> bool:
         if self._raw:
@@ -1055,7 +1072,7 @@ class DaosConnector(RemoteConnector):
                     self._release(memory_obj)
                     return None
                 view[:n] = memoryview(tmp)[:n]
-                return memory_obj
+                return self._dbg(memory_obj, "read")
 
             dest = (ctypes.c_char * n).from_buffer(view[:n])
             got = dfs.read_obj_into(obj, off, payload_len, dest)
@@ -1063,6 +1080,6 @@ class DaosConnector(RemoteConnector):
                 # Truncated payload: give the buffer back and report a miss.
                 self._release(memory_obj)
                 return None
-            return memory_obj
+            return self._dbg(memory_obj, "read")
         finally:
             dfs.close_obj(obj)

@@ -32,7 +32,19 @@ is doing real work.
   run whose known-good arm fails the same way. Recorded in
   [doc/RAW-API-PLAN.md].
 
-  What the attempt did establish: backend selection works under real vLLM, with
+  Root cause found. The object whose `.tensor` is None is one that has already
+  been **invalidated** -- LMCache warns "Trying to access an invalidated
+  MemoryObj" milliseconds before the assertion. It is a use-after-free, it
+  happens only when a remote backend is configured (local_cpu alone: zero
+  invalidations, zero asserts, both passes 200), and it does not distinguish
+  DFS from dkey/akey. Logging every successful return of `_get_sync`/`_get_raw`
+  produced nothing in a failing run, so the object is not one we hand back --
+  which leaves the store path, where `_prep_write` aliases a MemoryObj and
+  `_drop_put_ref` puts a reference down. Same family as the double-unpin this
+  project filed as LMCache issue #5090, though not demonstrably the same bug:
+  #5090 reproduces without DAOS and this needs a remote backend.
+
+  What the attempt also established: backend selection works under real vLLM, with
   each arm logging which one it chose; a non-POSIX container serves a vLLM
   startup and LMCache init without complaint; and the gate reported
   INCONCLUSIVE rather than a false pass when vLLM's own prefix cache answered
