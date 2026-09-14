@@ -207,6 +207,26 @@ STALL_SECS = float(os.environ.get("DAOS_STALL_SECS", "60"))
 # that only appears when a remote backend is configured.
 _DEBUG_OBJ = os.environ.get("DAOS_DEBUG_OBJ") == "1"
 
+# See _drop_put_ref. A diagnostic that deliberately leaks; never set in a
+# deployment.
+_SKIP_DROP = os.environ.get("DAOS_SKIP_PUT_REF_DROP") == "1"
+
+
+def _ref_of(mo):
+    """MemoryObj reference count, or None if this build does not expose one."""
+    fn = getattr(mo, "get_ref_count", None)
+    if fn is not None:
+        try:
+            return fn()
+        except Exception:
+            return None
+    return getattr(getattr(mo, "metadata", None), "ref_count", None)
+
+
+def _pin_of(mo):
+    """Pin count. Zero pins plus zero refs is what triggers the free."""
+    return getattr(getattr(mo, "metadata", None), "pin_count", None)
+
 
 # How large a buffer every read of the metadata akey offers.
 #
@@ -651,10 +671,30 @@ class DaosConnector(RemoteConnector):
         fn = getattr(memory_obj, "ref_count_down", None)
         if fn is None:
             return
+        # DAOS_DEBUG_OBJ=1: the count either side of the drop. LMCache frees the
+        # object when ref_count reaches 0 with pin_count 0, and a freed object
+        # is invalidated, after which .tensor is None -- which is the assertion
+        # that stops the correctness gate. So "did OUR drop take it to zero" is
+        # the question, and it is answerable from here alone.
+        if _SKIP_DROP:
+            # DIAGNOSTIC ONLY, and it leaks: every stored chunk keeps a
+            # reference the CPU pool can never reclaim. It exists to answer one
+            # question -- if the object is not freed here, does the invalidated
+            # -MemoryObj crash go away? -- which distinguishes "we drop one too
+            # many" from "LMCache holds the object without holding a reference".
+            if _DEBUG_OBJ:
+                logger.info("DAOS debug: drop_put_ref SKIPPED (ref=%s)",
+                            _ref_of(memory_obj))
+            return
+        before = _ref_of(memory_obj)
         try:
             fn()
         except Exception:
             pass
+        if _DEBUG_OBJ:
+            logger.info("DAOS debug: drop_put_ref %s -> %s (pin=%s valid=%s)",
+                        before, _ref_of(memory_obj), _pin_of(memory_obj),
+                        getattr(memory_obj, "valid", "?"))
 
     async def put(self, key, memory_obj: "MemoryObj"):
         header, src, n = self._prep_write(memory_obj)

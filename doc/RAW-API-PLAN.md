@@ -243,8 +243,61 @@ docstring 이 인용한 계약도 실제 코드와 문자 그대로 일치했다
 | LMCache 의 계층 간 경쟁 | 원격 백엔드가 있을 때만 객체가 두 계층에 동시에 걸린다 |
 | 실패 경로의 이중 정리 | `gather` 가 예외를 내면 우리 `finally` 와 LMCache 정리가 겹칠 수 있다 |
 
-다음 측정은 `_drop_put_ref` 직전·직후의 실제 참조 수를 찍는 것이다. 0 으로 내려간
-뒤에도 LMCache 가 그 객체를 쓴다면 소유권 경계가 어디서 어긋나는지가 확정된다.
+### 측정 결과 — 우리 drop 이 free 를 일으킨다
+
+`_drop_put_ref` 직전·직후를 찍었다.
+
+```
+drop_put_ref 3 -> 2  (pin=0 valid=True)     정상
+drop_put_ref 1 -> 0  (pin=0 valid=False)    ← free 되고 즉시 무효화
+```
+
+그리고 **drop 을 건너뛰면 증상이 사라진다.**
+
+| | pass B | invalidated | assert |
+|---|---|---|---|
+| 평소 | **500** | 1 | 1 |
+| `DAOS_SKIP_PUT_REF_DROP=1` | **200** | **0** | **0** |
+
+`ref_count` 가 0 이 되고 `pin_count` 도 0 이면 allocator 가 free 하고, free 된 객체는
+`valid=False` 가 되어 `.tensor` 가 `None` 을 돌려준다. 그 다음이 assert 다. 사슬이
+전부 이어진다.
+
+### 소유권이 상류에서 정해져 있지 않다
+
+이게 우리 버그인지 보려고 LMCache 자신의 커넥터들을 봤더니 **갈린다.**
+
+| | |
+|---|---|
+| `ref_count_down` 함 | bigtable, hf3fs, azure, hfbucket, sagemaker, instrumented |
+| 안 함 | **redis, fs** |
+
+그리고 `cache_engine.py:562` 에 상류가 직접 적어 둔 문장이 있다.
+
+```python
+# TODO: we implicitly rely on batched_put to call ref_count_down
+# this management should be done in a cleaner way
+self.storage_manager.batched_put(keys, memory_objs, ...)
+```
+
+**상류가 이 소유권을 "암묵적 의존"이자 정리 대상으로 표시해 두었다.** 커넥터마다
+다르게 구현돼 있는 것도 그래서다. 우리 `_drop_put_ref` 는 다수파(6개)와 같은
+동작이고, 그 동작이 여기서는 free 를 일으킨다.
+
+### 그래서 무엇을 할 것인가
+
+세 선택지 모두 값을 치른다.
+
+| | |
+|---|---|
+| 지금대로 drop | 누수는 없고 **크래시가 난다** |
+| drop 건너뛰기 | 크래시는 없고 **저장한 청크마다 참조가 샌다** — CPU 풀이 영영 회수 못 한다 |
+| 상류 수정 | 옳지만 우리 손 밖이다 |
+
+**최소 재현과 `cache_engine.py:562` 의 TODO 를 들고 이슈 #5090 을 보강하는 것이
+먼저다.** 4번·5번은 이게 정해진 뒤에야 의미가 있다. 두 진단 플래그
+(`DAOS_DEBUG_OBJ`, `DAOS_SKIP_PUT_REF_DROP`)는 기본 off 로 남겨 둔다 — 다음에 이
+질문이 다시 오면 재현에 5분이면 된다.
 
 ### 그래도 확인된 것
 
