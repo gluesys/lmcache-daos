@@ -18,6 +18,24 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Added
+
+- [doc/RAW-API-PLAN.md] scopes phase 1 of the move to dkey/akey: the in-process
+  connector only, behind container-type detection, changing no default and no
+  existing data.
+
+  Two findings shape it. The key mapping can fold LAYERS but not CHUNKS --
+  `CacheEngineKey` carries no prefix identifier, so a reader holding only keys
+  cannot reconstruct which chunks belonged together, while the layers of one
+  chunk share a derivable dkey. And mode cannot be a runtime toggle: container
+  layout is fixed at creation, a POSIX container rejects `daos_obj_update` and
+  a non-POSIX one rejects `dfs_sys_connect`, so the container decides and the
+  connector should detect rather than be told.
+
+  Step 5 is a gate, not a formality: 46x is a microbenchmark difference in
+  fixed cost, and how much survives the engine overhead on the real path is
+  still unmeasured. If it does not survive, the plan stops there.
+
 ### Changed
 
 - `NIXL_DAOS_EQ_TIMEOUT` is now **on by default at 60 s**. The measurement it
@@ -148,6 +166,7 @@ is doing real work.
   assuming a red check needs fixing.
 
 [doc/FAILURE-MODES.md]: doc/FAILURE-MODES.md
+[doc/RAW-API-PLAN.md]: doc/RAW-API-PLAN.md
 [PR #12828]: https://github.com/ofiwg/libfabric/pull/12828
 [issue #2245]: https://github.com/ai-dynamo/nixl/issues/2245
 [PR #2246]: https://github.com/ai-dynamo/nixl/pull/2246
