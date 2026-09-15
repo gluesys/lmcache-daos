@@ -18,6 +18,28 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Added
+
+- `tests/bench_layerwise_ab.py` measures DFS against dkey/akey through the real
+  connector, and phase 1 step 5's stopping condition has fired: the benefit is
+  not there.
+
+  Per object, best of three, 40 objects: the raw path wins 1.21x on a 64 KiB
+  read and loses from there -- 0.66x at 1 MiB, 0.46x at 4 MiB, 0.36x at 16 MiB.
+  None of the 46x survives.
+
+  The direction is the diagnosis. A fixed-cost advantage should be largest on
+  small objects and converge to 1x on large ones; instead it drops below 1x,
+  which points at bandwidth rather than per-object cost. The likely reason is
+  placement: a dkey determines the shard, so one chunk under one dkey puts a
+  whole object on a single target, while DFS spreads a file across dkeys by
+  offset and stripes over all of them. That explanation comes from the shape of
+  the table and DAOS's placement rule, not from a measurement of per-target I/O.
+
+  Not a dead end, but the plan says stop, so step 6 (extending to MP and GDS) is
+  not being started. The fix to try is striping the payload over several dkeys,
+  or using the DAOS array API the DFS path already sits on.
+
 ### Fixed
 
 - `_drop_put_ref` released a reference that was never ours, freeing objects
