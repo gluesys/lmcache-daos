@@ -18,14 +18,39 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
+### Fixed
+
+- `_drop_put_ref` released a reference that was never ours, freeing objects
+  LMCache still read. `CreateConnector` wraps every connector in
+  `InstrumentedRemoteConnector`, which drops it in a `finally` for both `put`
+  and `batched_put`; `AzureConnector.put` says so in words ("this method must
+  not call `ref_count_down` itself"). Ours was a second drop, measured taking
+  the count `1 -> 0` and invalidating the object, which is the assertion that
+  killed the vLLM engine on every cache hit.
+
+  With it gone the correctness gate runs to completion, and the result is
+  identical in three configurations -- no DAOS, DAOS over DFS, DAOS over
+  dkey/akey: 4 match, 2 mismatch, 0 inconclusive, the same prompts and the same
+  generated text down to the character. The remaining mismatch is therefore not
+  storage; the backend reproduces the reference configuration exactly.
+
+  No upstream issue was filed. Two earlier claims here were wrong and are
+  retracted: the connector docstring's reading of who owns the serializer's
+  reference, and a file-level grep that reported six built-in connectors
+  dropping it -- those calls are get-path error cleanup and have nothing to do
+  with put.
+
 ### Added
 
 - Two diagnostics behind environment flags, both off by default:
   `DAOS_DEBUG_OBJ` logs the reference count either side of `_drop_put_ref`, and
   `DAOS_SKIP_PUT_REF_DROP` skips the drop (which leaks, deliberately).
 
-  Together they close the question the correctness gate was blocked on. Our
-  drop is the one that frees the object: `1 -> 0 (pin=0 valid=False)`, after
+  `DAOS_SKIP_PUT_REF_DROP` has since been removed: skipping the drop is no
+  longer a diagnostic, it is the behaviour. `DAOS_DEBUG_OBJ` stays.
+
+  Together they closed the question the correctness gate was blocked on. Our
+  drop was the one that freed the object: `1 -> 0 (pin=0 valid=False)`, after
   which `.tensor` returns None and the assertion fires. Skipping it makes the
   crash disappear entirely -- pass B goes 500 to 200, invalidations 1 to 0.
 

@@ -243,90 +243,59 @@ docstring 이 인용한 계약도 실제 코드와 문자 그대로 일치했다
 | LMCache 의 계층 간 경쟁 | 원격 백엔드가 있을 때만 객체가 두 계층에 동시에 걸린다 |
 | 실패 경로의 이중 정리 | `gather` 가 예외를 내면 우리 `finally` 와 LMCache 정리가 겹칠 수 있다 |
 
-### 측정 결과 — 우리 drop 이 free 를 일으킨다
+### 원인 — 우리가 참조를 두 번 내렸다
 
-`_drop_put_ref` 직전·직후를 찍었다.
+`_drop_put_ref` 직전·직후를 찍으니 우리 drop 이 0 으로 내리고 있었다.
 
 ```
-drop_put_ref 3 -> 2  (pin=0 valid=True)     정상
-drop_put_ref 1 -> 0  (pin=0 valid=False)    ← free 되고 즉시 무효화
+drop_put_ref 3 -> 2  (pin=0 valid=True)
+drop_put_ref 1 -> 0  (pin=0 valid=False)    ← free -> 무효화 -> .tensor=None -> assert
 ```
 
-그리고 **drop 을 건너뛰면 증상이 사라진다.**
-
-| | pass B | invalidated | assert |
-|---|---|---|---|
-| 평소 | **500** | 1 | 1 |
-| `DAOS_SKIP_PUT_REF_DROP=1` | **200** | **0** | **0** |
-
-`ref_count` 가 0 이 되고 `pin_count` 도 0 이면 allocator 가 free 하고, free 된 객체는
-`valid=False` 가 되어 `.tensor` 가 `None` 을 돌려준다. 그 다음이 assert 다. 사슬이
-전부 이어진다.
-
-### 소유권이 상류에서 정해져 있지 않다
-
-이게 우리 버그인지 보려고 LMCache 자신의 커넥터들을 봤더니 **갈린다.**
-
-| | |
-|---|---|
-| `ref_count_down` 함 | bigtable, hf3fs, azure, hfbucket, sagemaker, instrumented |
-| 안 함 | **redis, fs** |
-
-그리고 `cache_engine.py:562` 에 상류가 직접 적어 둔 문장이 있다.
+**그 참조는 우리 것이 아니었다.** `connector/__init__.py:423` 의 `CreateConnector`
+는 **모든** 커넥터를 `InstrumentedRemoteConnector` 로 감싸고, 그 래퍼가 두 진입점
+모두에서 `finally` 로 내린다.
 
 ```python
-# TODO: we implicitly rely on batched_put to call ref_count_down
-# this management should be done in a cleaner way
-self.storage_manager.batched_put(keys, memory_objs, ...)
+async def put(self, key, memory_obj):
+    try:     await self._connector.put(key, memory_obj)
+    finally: memory_obj.ref_count_down()                      # :34
+
+async def batched_put(self, keys, memory_objs):
+    try:     await self._connector.batched_put(keys, memory_objs)
+    finally: for mo in memory_objs: mo.ref_count_down()       # :188
 ```
 
-**상류가 이 소유권을 "암묵적 의존"이자 정리 대상으로 표시해 두었다.** 커넥터마다
-다르게 구현돼 있는 것도 그래서다. 우리 `_drop_put_ref` 는 다수파(6개)와 같은
-동작이고, 그 동작이 여기서는 free 를 일으킨다.
+상류 커넥터도 같은 말을 글로 적어 뒀다 — `AzureConnector.put`:
 
-### 그래서 무엇을 할 것인가
+> The caller (`InstrumentedRemoteConnector.put`) owns the reference count of
+> `memory_obj` and decrements it after this returns; **this method must not call
+> `ref_count_down` itself**, matching `S3Connector`.
 
-세 선택지 모두 값을 치른다.
+내가 두 번 틀렸다. 커넥터 docstring 의 "소비자가 곧 커넥터"라는 해석이 틀렸고,
+"상류 커넥터 6개가 내린다"는 주장은 **파일 단위 grep 의 결과**였다 — 그 호출들은
+전부 **get 경로의 오류 정리**이고 put 과 무관하다. 그 상태로 상류에 이슈를
+올리려던 참이었다.
 
-| | |
-|---|---|
-| 지금대로 drop | 누수는 없고 **크래시가 난다** |
-| drop 건너뛰기 | 크래시는 없고 **저장한 청크마다 참조가 샌다** — CPU 풀이 영영 회수 못 한다 |
-| 상류 수정 | 옳지만 우리 손 밖이다 |
+수정은 drop 을 없애는 것이다. 상류 버그가 아니다.
 
-**최소 재현과 `cache_engine.py:562` 의 TODO 를 들고 이슈 #5090 을 보강하는 것이
-먼저다.** 4번·5번은 이게 정해진 뒤에야 의미가 있다. 두 진단 플래그
-(`DAOS_DEBUG_OBJ`, `DAOS_SKIP_PUT_REF_DROP`)는 기본 off 로 남겨 둔다 — 다음에 이
-질문이 다시 오면 재현에 5분이면 된다.
+### 4번 — 게이트가 완주한다
 
-### 그래도 확인된 것
+엔진이 더 이상 죽지 않는다. 그리고 결과가 **세 구성에서 완전히 동일**하다.
 
-가는 길에 환경 문제 넷을 통과했고, 그 과정에서 다음이 실증됐다.
+| | match | mismatch | inconclusive |
+|---|---|---|---|
+| DAOS 없음 (local_cpu 만) | 4 | 2 | 0 |
+| DAOS DFS | 4 | 2 | 0 |
+| DAOS 저수준 | 4 | 2 | 0 |
 
-| | |
-|---|---|
-| 백엔드 선택 | 실제 vLLM 아래서 동작. 두 팔이 각자 `backend: DFS` / `backend: object API` 를 찍었다 |
-| 저수준 컨테이너 | vLLM 기동·LMCache 초기화·저장까지 문제없음 |
-| 게이트의 판정 | 히트가 없을 때 **거짓 통과 대신 INCONCLUSIVE** 를 보고했다 |
+불일치한 프롬프트도, 생성된 문장도 글자까지 같다. 즉 **남은 게이트 실패는
+저장소와 무관하다** — LMCache/vLLM/TinyLlama 조합의 성질이고, 우리 백엔드는 두
+레이아웃 모두 **기준 구성과 바이트 동일**하게 동작한다.
 
-마지막 항목은 게이트가 제 일을 한 것이다. vLLM 자체 prefix 캐시가 pass B 를
-GPU 에서 돌려주고 있어 LMCache 까지 가지 않았는데(vLLM prefix 히트율 45.4 %,
-LMCache retrieve 0건), 게이트는 그것을 통과로 세지 않았다.
-
-### 하네스에 필요했던 일반화
-
-게이트가 한 배포본에 고정돼 있어 세 곳을 매개변수로 뺐다. 값이 어긋나면 전부
-**백엔드 고장처럼 보이는 형태**로 도착한다.
-
-| 변수 | 왜 |
-|---|---|
-| `LOG_CMD` | `podman logs` 고정이었다. venv 실행은 로그 파일이다 |
-| `GATE_MODEL` | `"qwen3"` 고정. 서빙하지 않는 이름은 404 → `KeyError: 'choices'` |
-| `PARA_REPEAT` | ~6000 토큰 고정. 컨텍스트를 넘기면 400 → 같은 증상 |
-
-`tests/raw_gate_ab.sh` 는 **대조군을 먼저 돌린다.** 게이트 자신의 권고이며, 이번에
-그 권고가 값을 했다 — 저수준만 돌렸다면 네 번의 환경 실패를 전부 저수준 탓으로
-읽었을 것이다.
+게이트가 `FAIL` 을 내는 것은 옳다. 다만 그것으로 저수준 경로를 판단할 수는 없고,
+**DFS 대비 동일하다는 것까지가 4번이 줄 수 있는 결론**이다. 게이트 자체의 2/6 은
+별도 과제다.
 
 ## 순서
 

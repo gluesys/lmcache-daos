@@ -207,9 +207,6 @@ STALL_SECS = float(os.environ.get("DAOS_STALL_SECS", "60"))
 # that only appears when a remote backend is configured.
 _DEBUG_OBJ = os.environ.get("DAOS_DEBUG_OBJ") == "1"
 
-# See _drop_put_ref. A diagnostic that deliberately leaks; never set in a
-# deployment.
-_SKIP_DROP = os.environ.get("DAOS_SKIP_PUT_REF_DROP") == "1"
 
 
 def _ref_of(mo):
@@ -633,68 +630,43 @@ class DaosConnector(RemoteConnector):
 
     @staticmethod
     def _drop_put_ref(memory_obj) -> None:
-        """Release the reference the serializer took on our behalf.
+        """Do nothing. The wrapper above us owns that reference.
 
-        Required by LMCache's contract, which is only visible if you read the
-        serializer next to the backend. NaiveSerializer.serialize() is::
+        This used to call ref_count_down() once, on the reading that
+        NaiveSerializer.serialize() adds a reference "for the consumer" and the
+        consumer is the connector. The serializer does add one; the consumer is
+        not us.
 
-            def serialize(self, memory_obj):
-                memory_obj.ref_count_up()
-                return memory_obj
+        Every connector is wrapped before anyone sees it --
+        ``connector/__init__.py:423`` ends ``CreateConnector`` with
+        ``return InstrumentedRemoteConnector(connector)`` -- and that wrapper
+        drops it, in a finally, for both entry points::
 
-        -- the same object, with one reference added FOR THE CONSUMER. And
-        remote_backend.batched_submit_put_task() drops only its own::
+            async def put(self, key, memory_obj):
+                try:     await self._connector.put(key, memory_obj)
+                finally: memory_obj.ref_count_down()          # :34
 
-            for mo in memory_objs: mo.ref_count_up()
-            try:     compressed = [serialize(mo) for mo in memory_objs]
-            finally: for mo in memory_objs: mo.ref_count_down()
-            ... connection.batched_put(keys, compressed_memory_objs)
+            async def batched_put(self, keys, memory_objs):
+                try:     await self._connector.batched_put(keys, memory_objs)
+                finally: for mo in memory_objs: mo.ref_count_down()   # :188
 
-        So every memory_obj arriving at put()/batched_put() carries a reference
-        that the connector owns and must release. This connector never did, on
-        either path, and support_batched_put() is True so the batched one is the
-        one in use -- a leaked reference per stored chunk.
+        The built-in connectors say the same in words. AzureConnector.put:
+        "The caller (InstrumentedRemoteConnector.put) owns the reference count
+        of memory_obj and decrements it after this returns; this method must
+        not call ref_count_down itself, matching S3Connector."
 
-        A leak does not corrupt by itself; it stops the CPU pool from ever
-        reclaiming. What makes it a correctness problem is what the allocator
-        then does under pressure on the get path, where _get_sync() calls
-        local_cpu_backend.allocate() for every chunk. LMCache already reports
-        "Ref count of MemoryObj ... is negative: -1. Double free occurred
-        somewhere" on this path in the hundreds per run and never under
-        LocalCPUBackend, so its accounting is demonstrably inconsistent here.
+        So dropping here was a second drop. Measured, it was the one that
+        reached zero: `drop_put_ref 1 -> 0 (pin=0 valid=False)`. At zero refs
+        and zero pins the allocator frees the object, a freed MemoryObj is
+        invalidated, and .tensor on an invalidated object returns None -- which
+        is the assertion in LMCache's GPU connector that killed the vLLM engine
+        on every second pass through tests/kv_correctness_gate.sh.
 
-        Written as its own method rather than reusing _release(): that one tries
-        ref_count_down, then release, then free, for the torn-object path where
-        any of them will do. Here exactly one ref_count_down is owed, so
-        falling through to a different method would be wrong.
+        Kept as a method rather than deleted at the call sites so the reasoning
+        stays next to the thing it explains. DAOS_SKIP_PUT_REF_DROP is gone with
+        it: skipping the drop is no longer a diagnostic, it is the behaviour.
         """
-        fn = getattr(memory_obj, "ref_count_down", None)
-        if fn is None:
-            return
-        # DAOS_DEBUG_OBJ=1: the count either side of the drop. LMCache frees the
-        # object when ref_count reaches 0 with pin_count 0, and a freed object
-        # is invalidated, after which .tensor is None -- which is the assertion
-        # that stops the correctness gate. So "did OUR drop take it to zero" is
-        # the question, and it is answerable from here alone.
-        if _SKIP_DROP:
-            # DIAGNOSTIC ONLY, and it leaks: every stored chunk keeps a
-            # reference the CPU pool can never reclaim. It exists to answer one
-            # question -- if the object is not freed here, does the invalidated
-            # -MemoryObj crash go away? -- which distinguishes "we drop one too
-            # many" from "LMCache holds the object without holding a reference".
-            if _DEBUG_OBJ:
-                logger.info("DAOS debug: drop_put_ref SKIPPED (ref=%s)",
-                            _ref_of(memory_obj))
-            return
-        before = _ref_of(memory_obj)
-        try:
-            fn()
-        except Exception:
-            pass
-        if _DEBUG_OBJ:
-            logger.info("DAOS debug: drop_put_ref %s -> %s (pin=%s valid=%s)",
-                        before, _ref_of(memory_obj), _pin_of(memory_obj),
-                        getattr(memory_obj, "valid", "?"))
+        return
 
     async def put(self, key, memory_obj: "MemoryObj"):
         header, src, n = self._prep_write(memory_obj)
