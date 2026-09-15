@@ -36,9 +36,26 @@ is doing real work.
   offset and stripes over all of them. That explanation comes from the shape of
   the table and DAOS's placement rule, not from a measurement of per-target I/O.
 
-  Not a dead end, but the plan says stop, so step 6 (extending to MP and GDS) is
-  not being started. The fix to try is striping the payload over several dkeys,
-  or using the DAOS array API the DFS path already sits on.
+  Step 6 (extending to MP and GDS) is not being started.
+
+  The fix proposed alongside that result -- stripe the payload over several
+  dkeys -- was then measured and does not hold. Reading one 16 MiB object,
+  layout barely moves the number: 1.32 GB/s under one dkey, 1.43 with sixteen
+  akeys in one RPC, 0.72 across sixteen dkeys read serially, and 1.45 at best
+  with sixteen dkeys read by sixteen threads. Shard placement is not the limit
+  and neither is intra-object concurrency.
+
+  The DFS figure in the step-5 table was also not comparable: it came from 40
+  objects across 16 workers, against a single-object measurement. Rerun like for
+  like -- one 16 MiB object, one thread -- DFS reads at 2.07 GB/s and the object
+  API at 1.30, so the object API is 1.6x slower and the regression is real
+  rather than a harness artifact.
+
+  That leaves no working explanation for why `dfs_sys_read` beats
+  `daos_obj_fetch` here. `dfs_sys_read` sits on the DAOS array API, so the
+  remaining candidate is `daos_array_*` -- which is what DFS already uses. What
+  going lower-level buys is now unclear, which makes step 5's stop firmer rather
+  than provisional.
 
 ### Fixed
 
