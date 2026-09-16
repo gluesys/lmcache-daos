@@ -18,7 +18,35 @@ is doing real work.
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
   `.gitlab-ci.yml`; `.github/README.md` records the reason.
 
-### Added
+### Changed
+
+- Step 5 and the striping review were both measured on cxl2, and neither
+  generalises. cxl2 is single-node TCP where even DFS reads 16 MiB at
+  2.07 GB/s -- the fabric is saturated, so layout cannot show. Rerun on
+  client-5 against cell1/cell2 (400G verbs, 2 ranks x 8 targets):
+
+      size      DFS GB/s   raw GB/s   ratio
+      64 KiB       0.21       0.19    0.92x
+      256 KiB      0.62       0.60    0.97x
+      1 MiB        1.92       3.46    1.81x
+      4 MiB        8.87       3.89    0.44x
+      16 MiB      19.51       2.86    0.15x
+
+  DFS scales with size to 19.5 GB/s; the object API plateaus near 3. But at
+  1 MiB the object API is 1.81x FASTER -- the fixed-cost advantage appears
+  exactly where it should, and the crossover sits between 1 and 4 MiB.
+
+  The retraction of the striping hypothesis is itself retracted. Splitting
+  16 MiB across dkeys read concurrently does help here -- 2.82 GB/s at one
+  dkey, 5.51 at sixteen -- where on cxl2 it did nothing. It still falls 3.5x
+  short of DFS, which reaches 19.5 single-threaded, so that parallelism lives
+  inside the array API rather than in how the keys are split.
+
+  So step 5's stop rested on a platform that could not answer the question.
+  What the measurements now say is not "do not switch" but "DFS for large
+  objects, dkey/akey at layer sizes" -- and layerwise is precisely what makes
+  objects small. Whether carrying two paths is worth that is a separate
+  question and is not measured.
 
 - `tests/bench_layerwise_ab.py` measures DFS against dkey/akey through the real
   connector, and phase 1 step 5's stopping condition has fired: the benefit is
