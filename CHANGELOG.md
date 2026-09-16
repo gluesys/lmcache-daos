@@ -20,6 +20,29 @@ is doing real work.
 
 ### Changed
 
+- The last unexplained number is explained, and it is `chunk_size`. Driving
+  `daos_array_*` directly, single-threaded, varying only the array chunk size
+  while reading the same 16 MiB:
+
+      chunk 1 MiB    0.943 ms   17.80 GB/s
+      chunk 4 MiB    1.868       8.98
+      chunk 16 MiB   5.750       2.92
+      chunk 32 MiB   5.774       2.91
+
+  Both ends land on the references: DFS reads the same object at 19.51 GB/s and
+  defaults to a 1 MiB chunk, and our dkey/akey path reads it at 2.86, which is
+  chunk-equals-object. DFS's speed is entirely the array API's chunking --
+  `daos_array_read` splits the byte range over dkeys and issues those RPCs
+  concurrently inside one call. Sixteen ctypes calls across Python threads
+  reached 5.51, which is why the manual version fell short.
+
+  That reframes the transition. Our layout puts a whole chunk under one dkey,
+  which is the worst row of that table. Recovering the bandwidth means using
+  `daos_array_*` -- which is what DFS already does -- so what going lower-level
+  actually buys is the per-object fixed cost, not throughput, and that shows up
+  only on small objects: 1.81x at 1 MiB. Carrying bulk payloads on raw dkey/akey
+  is reimplementing the array API by hand, and the table is the result.
+
 - Step 5 and the striping review were both measured on cxl2, and neither
   generalises. cxl2 is single-node TCP where even DFS reads 16 MiB at
   2.07 GB/s -- the fabric is saturated, so layout cannot show. Rerun on
