@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import os
 import stat
 from typing import Optional
@@ -671,18 +672,35 @@ def warm_up_all_targets(dfs, probe_path: str, nchunks: int = 64, executor=None,
     endpoint stays half-open until the kernel CM retransmits REP (~16 s);
     every RPC to that rank:tag waits meanwhile (doc/MP-MODE-PLAN.md 7.7e).
 
-    Phase 1 -- connect: an SX probe file (one shard per target) gets one tiny
+    Phase 1 -- connect: a probe file (one shard per target) gets one tiny
     write per DFS chunk, sequentially, so the first RPC to each target is
     issued one at a time on a quiet fabric. Phase 2 -- bandwidth warm-up: a
     full chunk write per shard in parallel, then read back. The probe is
     removed. ``nchunks`` must be >= the pool's target count. Returns a dict
-    with ``connect_ms``, ``total_ms``, ``ok`` (chunks read back complete).
+    with ``connect_ms``, ``total_ms``, ``ok`` (chunks read back complete) and
+    ``oclass`` (the class the probe was created with).
+
+    SX is preferred -- one shard per target and no replication cost -- but a
+    container created with rd_fac >= 1 refuses it: the object must tolerate at
+    least as many failures as the container promises, so
+    ``dc_obj_redun_check()`` returns DER_INVAL and nothing is warmed up at all.
+    Measured on daos-ib (2026-09-30) against a container whose classes are
+    RP_2GX/RP_2G1. The container's own default class is used instead, which is
+    the redundant *GX class such a container was created with and still puts a
+    shard on every target.
     """
     import time as _time
     t0 = _time.monotonic()
     tiny = 4096
     small = (ctypes.c_char * tiny).from_buffer(bytearray(b"\x5a" * tiny))
-    h = dfs.open_rdwr_create(probe_path, oclass=OC_SX)
+    oclass = OC_SX
+    try:
+        h = dfs.open_rdwr_create(probe_path, oclass=oclass)
+    except OSError as e:  # DaosError is an OSError
+        if getattr(e, "errno", None) != errno.EINVAL:
+            raise
+        oclass = 0  # the container's default
+        h = dfs.open_rdwr_create(probe_path, oclass=oclass)
     try:
         for i in range(nchunks):
             dfs.write_obj_from(h, i * chunk, tiny, small)
@@ -711,4 +729,5 @@ def warm_up_all_targets(dfs, probe_path: str, nchunks: int = 64, executor=None,
     except Exception:  # pragma: no cover - best effort
         pass
     return {"connect_ms": (t1 - t0) * 1e3, "total_ms": (_time.monotonic() - t0) * 1e3,
-            "ok": sum(1 for g in got if g == chunk), "n": nchunks}
+            "ok": sum(1 for g in got if g == chunk), "n": nchunks,
+            "oclass": "SX" if oclass == OC_SX else "container default"}

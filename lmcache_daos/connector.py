@@ -352,10 +352,17 @@ class DaosConnector(RemoteConnector):
                 return
             r = warm_up_all_targets(self._dfs, f"/.daos-probe.{os.getpid()}",
                                     nchunks, self._pool)
-            _s.stderr.write(f"[DaosConnector] warm-up: SX probe, {r['n']} targets contacted "
-                            f"in {r['connect_ms']:.1f} ms, {r['ok']}/{r['n']} chunks ok, "
+            _s.stderr.write(f"[DaosConnector] warm-up: {r['oclass']} probe, {r['n']} targets "
+                            f"contacted in {r['connect_ms']:.1f} ms, {r['ok']}/{r['n']} chunks ok, "
                             f"total {r['total_ms']:.1f} ms\n")
         except Exception as e:  # best effort
+            # Loud, because what follows is a slow first store rather than an
+            # error: without the warm-up the first RPC to each target pays the
+            # lazy connect, and the health monitor's ping can lose its race
+            # against that (exastor/lmcache-daos#3).
+            logger.warning("DAOS warm-up failed after %.1f ms (%s); the first "
+                           "store will pay the per-target connect",
+                           (_t.monotonic() - t0) * 1e3, e)
             _s.stderr.write(f"[DaosConnector] warm-up failed ({e}) after "
                             f"{(_t.monotonic() - t0) * 1e3:.1f} ms\n")
         _s.stderr.flush()
