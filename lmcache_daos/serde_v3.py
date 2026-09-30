@@ -22,6 +22,7 @@ Layout::
     akey  "M"                              header: fixed(36) + meta, unpadded
     akey  "P"                              payload            (whole-chunk mode)
     akey  "L000".."L999"                   payload per layer  (layerwise mode)
+    akey  "M000".."M999"                   header per layer   (layerwise mode)
 
 Two properties follow from the placement, and they are the point of v3:
 
@@ -77,6 +78,11 @@ AKEY_PAYLOAD = b"P"
 _MAX_LAYER = 999
 
 
+def dkey_for_str(s: str) -> bytes:
+    """The dkey for an already-rendered key string."""
+    return hashlib.sha256(s.encode()).digest()
+
+
 def dkey_for(key) -> bytes:
     """One dkey per chunk.
 
@@ -85,9 +91,14 @@ def dkey_for(key) -> bytes:
     nothing. ``key.to_string()`` is used rather than the object itself because
     that is what v1 and v2 hash, so the same logical key maps to corresponding
     names in all three layouts -- which makes a migration comparable.
+
+    In layerwise mode the caller renders the CHUNK's string -- the layer key
+    without its layer field -- and calls dkey_for_str(), so that a chunk's
+    layers land under one dkey and can be folded into a single RPC. Passing a
+    layer key here would give each layer its own dkey, which is the layout this
+    one exists to avoid.
     """
-    s = key.to_string() if hasattr(key, "to_string") else str(key)
-    return hashlib.sha256(s.encode()).digest()
+    return dkey_for_str(key.to_string() if hasattr(key, "to_string") else str(key))
 
 
 def akey_layer(i: int) -> bytes:
@@ -95,6 +106,28 @@ def akey_layer(i: int) -> bytes:
     if not 0 <= i <= _MAX_LAYER:
         raise ValueError(f"layer {i} outside 0..{_MAX_LAYER}")
     return b"L%03d" % i
+
+
+def akey_meta_layer(i: int) -> bytes:
+    """Metadata akey for layer ``i`` in layerwise mode.
+
+    Each layer carries its own header rather than sharing the chunk's "M".
+    Sharing would assume every layer of a chunk has the same shape and length,
+    which is true of a uniform transformer and not of a hybrid one, and it would
+    leave a store of a single layer with nothing to commit against: the metadata
+    akey IS the commit record, so a per-layer record is what makes one layer
+    readable on its own.
+    """
+    if not 0 <= i <= _MAX_LAYER:
+        raise ValueError(f"layer {i} outside 0..{_MAX_LAYER}")
+    return b"M%03d" % i
+
+
+def meta_akeys(n_layers: int) -> Tuple[bytes, ...]:
+    """Metadata akeys for a chunk: one, or one per layer. Mirrors payload_akeys."""
+    if n_layers <= 0:
+        return (AKEY_META,)
+    return tuple(akey_meta_layer(i) for i in range(n_layers))
 
 
 def pack_meta(meta: bytes, payload_len: int, state: int = STATE_COMMITTED) -> bytes:

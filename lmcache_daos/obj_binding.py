@@ -290,6 +290,11 @@ def _load() -> None:
         DaosHandle, DaosHandle, ctypes.c_uint64, ctypes.c_uint,
         ctypes.POINTER(DIov), ctypes.c_void_p,
     ]
+    _daos.daos_obj_punch_akeys.restype = ctypes.c_int
+    _daos.daos_obj_punch_akeys.argtypes = [
+        DaosHandle, DaosHandle, ctypes.c_uint64, ctypes.POINTER(DIov),
+        ctypes.c_uint, ctypes.POINTER(DIov), ctypes.c_void_p,
+    ]
 
     _daos.daos_cont_query.restype = ctypes.c_int
     _daos.daos_cont_query.argtypes = [
@@ -418,6 +423,27 @@ class ObjSys:
                                         ctypes.byref(dk_iov), None),
              "daos_obj_punch_dkeys")
         del dk_buf
+
+    def punch_akeys(self, dkey: bytes, akeys: Sequence[bytes]) -> None:
+        """Remove named akeys under a dkey, leaving the rest of it alone.
+
+        Layerwise needs this: a chunk's layers share a dkey, so punching the
+        dkey to evict one layer would take the other thirty-nine with it.
+        """
+        if not akeys:
+            return
+        dk_iov, dk_buf = build_key(dkey)
+        arr = (DIov * len(akeys))()
+        keep = [dk_buf]
+        for i, ak in enumerate(akeys):
+            iov, buf = build_key(ak)
+            arr[i] = iov
+            keep.append(buf)
+        _chk(_daos.daos_obj_punch_akeys(self._oh, DaosHandle(0), 0,
+                                        ctypes.byref(dk_iov), len(akeys),
+                                        arr, None),
+             "daos_obj_punch_akeys")
+        del keep
 
     def close(self) -> None:
         if self._open:

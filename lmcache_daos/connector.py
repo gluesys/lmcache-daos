@@ -115,6 +115,62 @@ def _parse_daos_url(url: str):
     return pool, cont, parse_qs(parsed.query).get("sys", [None])[0]
 
 
+def _layer_of(key):
+    """The layer this key addresses, or None in whole-chunk mode.
+
+    LMCache's layerwise path hands the connector a ``LayerCacheEngineKey`` per
+    layer (``CacheEngineKey.split_layers``). Duck-typed rather than isinstance'd
+    so the module stays importable without LMCache.
+    """
+    return getattr(key, "layer_id", None)
+
+
+def _chunk_str(key) -> str:
+    """The chunk's identity string -- a layer key without its layer field.
+
+    This is what the dkey hashes, so the layers of one chunk share a dkey and a
+    batched call can fold them into a single RPC. The layer's own string would
+    scatter them across N dkeys, which is the layout serde_v3 exists to avoid.
+
+    ``LayerCacheEngineKey`` subclasses ``CacheEngineKey`` and its to_string()
+    only inserts the layer field, so the PARENT's to_string() is exactly the
+    chunk string. It is reached through the MRO rather than by importing
+    CacheEngineKey, for two reasons: this module stays importable without
+    LMCache (so the mapping is unit-testable off the serving host), and
+    rebuilding the format by hand here would drift from theirs.
+    """
+    if _layer_of(key) is not None:
+        for base in type(key).__mro__[1:]:
+            fn = base.__dict__.get("to_string")
+            if fn is not None:
+                return fn(key)
+    return key.to_string() if hasattr(key, "to_string") else str(key)
+
+
+def _raw_addr(key):
+    """Raw-mode address: ``(dkey, layer)``. ``layer`` is None in whole-chunk mode."""
+    return serde_v3.dkey_for_str(_chunk_str(key)), _layer_of(key)
+
+
+def _akeys_for(layer):
+    """``(payload akey, metadata akey)`` for a layer, or for the whole chunk."""
+    if layer is None:
+        return serde_v3.AKEY_PAYLOAD, serde_v3.AKEY_META
+    return serde_v3.akey_layer(layer), serde_v3.akey_meta_layer(layer)
+
+
+def _repack_header(header) -> bytes:
+    """v1 header (what _prep_write builds, and what the DFS path writes) -> v3.
+
+    Repacked here rather than teaching _prep_write about two formats: the
+    metadata is ~28 bytes, so the cost is a slice, and the DFS path stays
+    byte-identical.
+    """
+    ps = serde.prefix_size()
+    meta_len, payload_len = serde.parse_prefix(bytes(header[:ps]))
+    return serde_v3.pack_meta(bytes(header[ps:ps + meta_len]), payload_len)
+
+
 def _choose_backend(pool: str, cont: str, sysname) -> bool:
     """True for the object API, False for DFS.
 
@@ -291,7 +347,7 @@ class DaosConnector(RemoteConnector):
         if self._raw:
             self._obj = ObjSys(pool=pool, cont=cont, sys=sysname)
             self._dfs = None
-            self._addr = serde_v3.dkey_for
+            self._addr = _raw_addr
             logger.info("DAOS: %s/%s is a non-POSIX container, using the "
                         "object API (dkey/akey)", pool, cont)
         else:
@@ -405,9 +461,13 @@ class DaosConnector(RemoteConnector):
     def _exists_sync(self, addr) -> bool:
         if self._raw:
             # Presence of the metadata akey, not of the payload: metadata is
-            # written last, so it is the commit record (serde_v3).
+            # written last, so it is the commit record (serde_v3). In layerwise
+            # mode the question is whether THIS layer committed -- the chunk's
+            # other layers live under the same dkey and say nothing about it.
+            dkey, layer = addr
+            mak = serde_v3.AKEY_META if layer is None else serde_v3.akey_meta_layer(layer)
             probe = ctypes.create_string_buffer(_META_CAP)
-            (got,) = self._obj.fetch(addr, [(serde_v3.AKEY_META, probe, _META_CAP)],
+            (got,) = self._obj.fetch(dkey, [(mak, probe, _META_CAP)],
                                      single=True)
             return got > 0
         return self._dfs.exists(addr)
@@ -447,10 +507,25 @@ class DaosConnector(RemoteConnector):
         # return_exceptions: one unreadable object must not fail the whole
         # batch. A cache reports a miss and lets the engine recompute that
         # range. (Adopted from the main branch's batched_get.)
-        gathered = await asyncio.gather(
-            *(self._run(self._get_sync, p) for p in paths),
-            return_exceptions=True)
-        res = [None if isinstance(r, BaseException) else r for r in gathered]
+        groups = self._group_layers(paths) if self._raw else None
+        if groups:
+            # Layerwise: one RPC pair per chunk instead of per layer.
+            order = list(groups.items())
+            gathered = await asyncio.gather(
+                *(self._run(self._get_raw_folded, dkey, [l for _, l in members])
+                  for dkey, members in order),
+                return_exceptions=True)
+            res = [None] * len(keys)
+            for (_dkey, members), got in zip(order, gathered):
+                if isinstance(got, BaseException):
+                    continue                     # whole chunk reads as a miss
+                for (pos, _layer), mo in zip(members, got):
+                    res[pos] = mo
+        else:
+            gathered = await asyncio.gather(
+                *(self._run(self._get_sync, p) for p in paths),
+                return_exceptions=True)
+            res = [None if isinstance(r, BaseException) else r for r in gathered]
         # Instrumentation: connector-side batched_get wall time. LMCache's own
         # "Retrieved ... cost" covers connector-read + H2D staging; subtracting
         # this isolates the H2D stage (env DAOS_BG_PROF=1 to enable).
@@ -829,11 +904,22 @@ class DaosConnector(RemoteConnector):
         # the asyncio loop thread plus a 5.24 GB transient. _prep_write only
         # aliases each buffer, so nothing is materialised here.
         prepped = [self._prep_write(mo) for mo in memory_objs]
+        addrs = [self._addr(k) for k in keys]
+        groups = self._group_layers(addrs) if self._raw else None
         try:
-            await asyncio.gather(*(
-                self._run(self._put_sync, self._addr(k), h, s, n)
-                for k, (h, s, n) in zip(keys, prepped)
-            ))
+            if groups:
+                # Layerwise: the chunk's layers go out in one update each for
+                # payload and metadata, rather than two RPCs per layer.
+                await asyncio.gather(*(
+                    self._run(self._put_raw_folded, dkey,
+                              [(layer, *prepped[pos]) for pos, layer in members])
+                    for dkey, members in groups.items()
+                ))
+            else:
+                await asyncio.gather(*(
+                    self._run(self._put_sync, a, h, s, n)
+                    for a, (h, s, n) in zip(addrs, prepped)
+                ))
         finally:
             # One reference owed per object -- see _drop_put_ref. This is the
             # path LMCache actually uses, since support_batched_put() is True.
@@ -919,7 +1005,7 @@ class DaosConnector(RemoteConnector):
                     pass
                 return
 
-    def _put_raw(self, dkey, header, src, n) -> None:
+    def _put_raw(self, addr, header, src, n) -> None:
         """Payload akey first, metadata akey last.
 
         The order is the commit protocol, not an optimisation: the metadata
@@ -928,21 +1014,15 @@ class DaosConnector(RemoteConnector):
         a round trip and would not be a single commit point -- a dkey's akeys
         can land on different shards under replication or EC. See serde_v3.
         """
-        # _prep_write builds a v1 header (8-byte prefix + metadata) because that
-        # is what the DFS path writes, and it is left alone so the DFS path stays
-        # byte-identical. Repack it here rather than teach _prep_write about two
-        # formats: the metadata is ~28 bytes, so the cost is a slice.
-        ps = serde.prefix_size()
-        meta_len, payload_len = serde.parse_prefix(bytes(header[:ps]))
-        meta_bytes = bytes(header[ps:ps + meta_len])
-        hdr = serde_v3.pack_meta(meta_bytes, payload_len)
+        dkey, layer = addr
+        pak, mak = _akeys_for(layer)
+        hdr = _repack_header(header)
 
-        self._obj.update(dkey, [(serde_v3.AKEY_PAYLOAD, src, n)])
+        self._obj.update(dkey, [(pak, src, n)])
         meta = (ctypes.c_char * len(hdr)).from_buffer_copy(hdr)
-        self._obj.update(dkey, [(serde_v3.AKEY_META, meta, len(hdr))],
-                         single=True)
+        self._obj.update(dkey, [(mak, meta, len(hdr))], single=True)
 
-    def _get_raw(self, dkey) -> Optional["MemoryObj"]:
+    def _get_raw(self, addr) -> Optional["MemoryObj"]:
         """The object-API read. Same contract as _get_sync: absent or
         incomplete is None, never a raise and never a partial object.
 
@@ -955,8 +1035,10 @@ class DaosConnector(RemoteConnector):
         buffer of uninitialised memory as a hit -- DAOS leaves that field
         untouched for an akey that is not there. See ObjSys.fetch.
         """
+        dkey, layer = addr
+        pak, mak = _akeys_for(layer)
         hdr_buf = ctypes.create_string_buffer(_META_CAP)
-        (got,) = self._obj.fetch(dkey, [(serde_v3.AKEY_META, hdr_buf, _META_CAP)],
+        (got,) = self._obj.fetch(dkey, [(mak, hdr_buf, _META_CAP)],
                                  single=True)
         if got == 0:
             return None                          # no metadata akey => miss
@@ -983,7 +1065,7 @@ class DaosConnector(RemoteConnector):
         n = metadata.length
         dst = (ctypes.c_char * n).from_buffer(view)
         try:
-            (readn,) = self._obj.fetch(dkey, [(serde_v3.AKEY_PAYLOAD, dst, n)])
+            (readn,) = self._obj.fetch(dkey, [(pak, dst, n)])
         except Exception:
             self._release(memory_obj)
             raise
@@ -996,8 +1078,114 @@ class DaosConnector(RemoteConnector):
             return None
         return self._dbg(memory_obj, "read")
 
+    # -- layerwise folding ---------------------------------------------------
+    # The point of the dkey/akey layout: a chunk's layers share a dkey, so N
+    # layers become N iods in ONE RPC instead of N round trips (obj_binding
+    # .build_vectors). Without this, layerwise pays the per-object fixed cost
+    # (~0.63 ms, doc/LAYERWISE-MEASUREMENT.md) once per layer, which is why
+    # measured hit TTFT was 11.5x worse than whole-chunk at the same chunk size.
+
+    @staticmethod
+    def _group_layers(addrs):
+        """``{dkey: [(position, layer), ...]}`` for addresses that carry a layer.
+
+        Returns None when the batch is not foldable -- whole-chunk keys, or a
+        mix -- so the caller keeps the per-key path rather than growing a second
+        code path for a case that does not arise.
+        """
+        groups = {}
+        for i, (dkey, layer) in enumerate(addrs):
+            if layer is None:
+                return None
+            groups.setdefault(dkey, []).append((i, layer))
+        return groups
+
+    def _put_raw_folded(self, dkey, entries) -> None:
+        """Write every layer of one chunk: one update for payloads, one for
+        metadata.
+
+        The two-call order is the same commit protocol as _put_raw and for the
+        same reason: metadata is what a reader looks for. Folding actually
+        strengthens it -- a crash between the calls now leaves the whole chunk
+        reading as a miss rather than a torn subset of layers.
+        """
+        payloads, metas, keep = [], [], []
+        for layer, header, src, n in entries:
+            pak, mak = _akeys_for(layer)
+            hdr = _repack_header(header)
+            buf = (ctypes.c_char * len(hdr)).from_buffer_copy(hdr)
+            keep.append(buf)
+            payloads.append((pak, src, n))
+            metas.append((mak, buf, len(hdr)))
+        self._obj.update(dkey, payloads)
+        self._obj.update(dkey, metas, single=True)
+        del keep
+
+    def _get_raw_folded(self, dkey, layers):
+        """Read the named layers of one chunk. Returns a list positional to
+        ``layers``, with None for a miss -- same contract as _get_raw, per layer.
+
+        Two RPCs, metadata then payload, for the reason _get_raw gives: a
+        payload's size is not known until its header is read.
+        """
+        hdr_bufs = [ctypes.create_string_buffer(_META_CAP) for _ in layers]
+        got = self._obj.fetch(
+            dkey,
+            [(serde_v3.akey_meta_layer(l), b, _META_CAP)
+             for l, b in zip(layers, hdr_bufs)],
+            single=True)
+
+        out = [None] * len(layers)
+        items, staged = [], []
+        for i, (layer, n_meta, buf) in enumerate(zip(layers, got, hdr_bufs)):
+            if n_meta == 0:
+                continue                         # no metadata akey => miss
+            try:
+                hdr = serde_v3.parse_meta(bytes(buf[:n_meta]))
+                metadata = RemoteMetadata.deserialize(hdr.meta)
+            except Exception:
+                continue                         # torn, uncommitted => miss
+            if hdr.payload_len < metadata.length:
+                continue                         # header disagrees with itself
+            mo = self.local_cpu_backend.allocate(
+                metadata.shapes, metadata.dtypes, metadata.fmt)
+            if mo is None:
+                continue
+            view = mo.byte_array
+            if not isinstance(view, memoryview):
+                view = memoryview(view)
+            n = metadata.length
+            dst = (ctypes.c_char * n).from_buffer(view.cast("B"))
+            items.append((serde_v3.akey_layer(layer), dst, n))
+            staged.append((i, mo, n))
+
+        if not items:
+            return out
+        try:
+            readn = self._obj.fetch(dkey, items)
+        except Exception:
+            for _, mo, _n in staged:
+                self._release(mo)
+            raise
+        for (i, mo, n), got_n in zip(staged, readn):
+            if got_n != n:
+                # Short payload: writer died between the payload and metadata
+                # updates, or the value is shorter than the header promised.
+                # A miss either way, and the staging buffer goes back.
+                self._release(mo)
+            else:
+                out[i] = self._dbg(mo, "read")
+        return out
+
     def _remove_one(self, addr) -> bool:
         if self._raw:
+            dkey, layer = addr
+            if layer is not None:
+                # One layer, not the chunk: its siblings share this dkey, so
+                # punching the dkey would evict thirty-nine innocent layers.
+                self._obj.punch_akeys(dkey, list(_akeys_for(layer)))
+                return True
+            addr = dkey
             self._obj.punch(addr)
             return True
         return self._dfs.remove(addr)
