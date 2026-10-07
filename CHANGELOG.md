@@ -13,6 +13,11 @@ is doing real work.
 
 ### Removed
 
+- `nixl/plugin`, `nixl/tests`, `nixl/integration.patch`. The NIXL DAOS backend
+  moved to exastor/nixl-daos (`src/plugins/daos`, `test/unit/plugins/daos`,
+  `upstream/`), which is where it is built, tested and prepared for upstream
+  NIXL. `nixl/README.md` maps the old paths to the new ones; the measurement
+  documents stay here.
 - `.github/workflows/ci.yml`. The GitHub repository is a push mirror whose token
   lacks the `workflow` scope, so GitHub rejected every push touching that file
   and the mirror had been stuck at 2026-09-09. CI is unchanged and runs from
