@@ -332,7 +332,7 @@ class ObjSys:
     """
 
     def __init__(self, pool: str, cont: str, sys: Optional[str] = None,
-                 oid_lo: int = 1, oid_hi: int = 0):
+                 oid_lo: int = 1, oid_hi: int = 0, oclass: Optional[str] = None):
         _load()
         _chk(_daos.daos_init(), "daos_init")
         self._poh = DaosHandle()
@@ -351,9 +351,21 @@ class ObjSys:
             # daos_obj_generate_oid() is a placement helper, not a lookup. The
             # low bits are ours; generate_oid stamps class and feature bits into
             # the high word, so it is still called -- with our lo preserved.
+            # oclass names a class (e.g. "EC_2P1GX"); None lets DAOS pick from
+            # the container's rd_fac. A non-POSIX container has no default
+            # class property of its own, so naming one is the only way to get
+            # EC here. Changing it for an existing container changes the oid,
+            # i.e. starts an empty cache.
+            cid = OC_UNKNOWN
+            if oclass:
+                _daos.daos_oclass_name2id.restype = ctypes.c_int
+                _daos.daos_oclass_name2id.argtypes = [ctypes.c_char_p]
+                cid = _daos.daos_oclass_name2id(oclass.encode())
+                if cid <= 0:
+                    raise ValueError("unknown DAOS object class %r" % oclass)
             oid = DaosObjId(oid_lo, oid_hi)
             _chk(_daos.daos_obj_generate_oid(
-                self._coh, ctypes.byref(oid), 0, OC_UNKNOWN, 0, 0),
+                self._coh, ctypes.byref(oid), 0, cid, 0, 0),
                 "daos_obj_generate_oid")
             self.oid = oid
             _chk(_daos.daos_obj_open(self._coh, oid, DAOS_OO_RW,

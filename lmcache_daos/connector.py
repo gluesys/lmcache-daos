@@ -388,7 +388,8 @@ class DaosConnector(RemoteConnector):
                 rg_log.setLevel(logging.INFO)
                 rg_log.propagate = False
         elif self._raw:
-            self._obj = ObjSys(pool=pool, cont=cont, sys=sysname)
+            self._obj = ObjSys(pool=pool, cont=cont, sys=sysname,
+                               oclass=os.environ.get("DAOS_OBJ_CLASS") or None)
             self._dfs = None
             self._addr = _raw_addr
             logger.info("DAOS: %s/%s is a non-POSIX container, using the "
