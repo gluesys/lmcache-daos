@@ -555,6 +555,30 @@ def op_deadline_scales_with_bytes():
     ck("deadline: min_bw 0 means fixed", d(10.0, 1 << 30, 0) == 10.0)
 
 
+def answered_zombie_closes_breaker():
+    eq, clock, br, eng, cl = setup(threshold=1, open_secs=60.0)
+    cl.down.add(1)
+    eng.run(1, cl.submit(1), Keep(), 64, 0.05)
+    ck("reap: rank open after the deadline", br.state(1) == G.OPEN)
+    cl.revive(1)
+    ok = wait_until(lambda: eng.zombies() == 0)
+    ck("reap: rc 0 zombie closes the rank, no probe needed",
+       ok and br.state(1) == G.CLOSED, "(%s)" % br.state(1))
+    eng.close()
+
+
+def unreachable_zombie_keeps_breaker_open():
+    eq, clock, br, eng, cl = setup(threshold=1, open_secs=60.0)
+    cl.down.add(1)
+    eng.run(1, cl.submit(1), Keep(), 64, 0.05)
+    for slot in cl.held.pop(1):
+        eq.complete(slot, G.DER_TIMEDOUT)
+    ok = wait_until(lambda: eng.zombies() == 0)
+    ck("reap: DER_TIMEDOUT zombie does not close the rank",
+       ok and br.state(1) != G.CLOSED, "(%s)" % br.state(1))
+    eng.close()
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -567,7 +591,8 @@ def main():
               guarded_obj_live_rank, guarded_obj_dead_rank_fetch_is_a_miss,
               guarded_obj_parks_the_destination, guarded_obj_skip_keeps_ownership,
               guarded_obj_writes_raise_dropped, guarded_obj_surfaces_connect_error,
-              reap_callback_failure_keeps_poller, op_deadline_scales_with_bytes):
+              reap_callback_failure_keeps_poller, op_deadline_scales_with_bytes,
+              answered_zombie_closes_breaker, unreachable_zombie_keeps_breaker_open):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)

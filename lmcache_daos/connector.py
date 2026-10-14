@@ -1060,6 +1060,8 @@ class DaosConnector(RemoteConnector):
         dkey, layer = addr
         pak, mak = _akeys_for(layer)
         hdr = _repack_header(header)
+        if self._guard and self._committed(dkey, [mak])[0]:
+            return              # same key, same bytes: already there
 
         try:
             self._obj.update(dkey, [(pak, src, n)])
@@ -1148,6 +1150,21 @@ class DaosConnector(RemoteConnector):
             groups.setdefault(dkey, []).append((i, layer))
         return groups
 
+    def _committed(self, dkey, meta_akeys):
+        """Which of these metadata akeys are present, in one fetch.
+
+        Under the rank guard a put first asks, because keys are content
+        hashes: a present key already holds these bytes. It matters during
+        an outage -- a partly hit prompt makes LMCache store again every
+        chunk after its first miss, most of them already on live ranks, and
+        those overwrites ran the live ranks out of space (DER_NOSPACE with
+        8.5 GB of the pool free, vLLM run I). Unknown counts as absent.
+        """
+        bufs = [ctypes.create_string_buffer(_META_CAP) for _ in meta_akeys]
+        got = self._obj.fetch(dkey, [(ak, b, _META_CAP) for ak, b in zip(meta_akeys, bufs)],
+                              single=True)
+        return [g > 0 for g in got]
+
     def _fetch_into(self, dkey, items, owners):
         """Fetch into MemoryObj buffers.
 
@@ -1175,6 +1192,11 @@ class DaosConnector(RemoteConnector):
         strengthens it -- a crash between the calls now leaves the whole chunk
         reading as a miss rather than a torn subset of layers.
         """
+        if self._guard:
+            have = self._committed(dkey, [serde_v3.akey_meta_layer(e[0]) for e in entries])
+            entries = [e for e, h in zip(entries, have) if not h]
+            if not entries:
+                return
         payloads, metas, keep = [], [], []
         for layer, header, src, n in entries:
             pak, mak = _akeys_for(layer)

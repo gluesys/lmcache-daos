@@ -103,7 +103,11 @@ class Breaker:
     probe adds one.
 
     A zombie that completes means DAOS reached the rank again, so it cuts the
-    current open period short and lets the next request probe.
+    current open period short and lets the next request probe. One that
+    completes with an rc other than :data:`UNREACHABLE` closes the rank
+    outright (DeadlineEngine): after a reboot the first new RPC can sit 60 s
+    in mercury, and a probe that lands there kept the rank open for another
+    60 s although its zombies had all come back with rc 0 (vLLM run I).
     """
 
     def __init__(self, threshold: int = 2, open_secs: float = 5.0,
@@ -363,6 +367,8 @@ class DeadlineEngine:
         rc = z.slot.error()
         z.eq.fini_event(z.slot)               # DAOS is done with it now
         self.breaker.zombie_done(z.rank, z.nbytes)
+        if rc not in UNREACHABLE:
+            self.breaker.success(z.rank)      # the rank answered this request
         self._count("zombie_reaped")
         if rc == 0:
             self._count("zombie_reaped_ok")
