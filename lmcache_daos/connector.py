@@ -45,6 +45,7 @@ from . import serde
 from . import serde_v3
 from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
+from .rank_guard import Dropped, GuardedObj, Parked, S1BucketStore
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -343,8 +344,29 @@ class DaosConnector(RemoteConnector):
         # DAOS_FORCE_LAYOUT=posix|raw overrides the probe, for a host where the
         # probe itself cannot run. It is checked against the container anyway,
         # because a silent disagreement is the thing being avoided.
-        self._raw = _choose_backend(pool, cont, sysname)
-        if self._raw:
+        #
+        # DAOS_RANK_GUARD=1 is the kvcache pool profile (rd_fac 0,
+        # self_heal:none; hub 1f09478a 6.3): keys over S1 bucket objects, a
+        # deadline on every request and a breaker per rank, so a rebooting
+        # node costs its share of the cache as misses rather than stalling
+        # every worker. It implies the object API and skips the probe, which
+        # is a pool connect -- and a pool connect does not complete while any
+        # rank is down (hub 2.2), where the store's own connect runs in the
+        # background instead. DAOS_RANK_GUARD_BUCKETS must not change for a
+        # container: keys would move to other buckets and read as misses,
+        # leaving the old copies unreachable.
+        self._guard = os.environ.get("DAOS_RANK_GUARD") == "1"
+        self._raw = self._guard or _choose_backend(pool, cont, sysname)
+        if self._guard:
+            self._obj = GuardedObj(S1BucketStore(
+                pool, cont, sys=sysname,
+                nbuckets=int(os.environ.get("DAOS_RANK_GUARD_BUCKETS", "64")),
+                deadline=float(os.environ.get("DAOS_RANK_GUARD_DEADLINE", "0.5"))))
+            self._dfs = None
+            self._addr = _raw_addr
+            logger.info("DAOS: %s/%s through the rank guard (S1 buckets, "
+                        "per-rank breaker)", pool, cont)
+        elif self._raw:
             self._obj = ObjSys(pool=pool, cont=cont, sys=sysname)
             self._dfs = None
             self._addr = _raw_addr
@@ -1018,9 +1040,12 @@ class DaosConnector(RemoteConnector):
         pak, mak = _akeys_for(layer)
         hdr = _repack_header(header)
 
-        self._obj.update(dkey, [(pak, src, n)])
-        meta = (ctypes.c_char * len(hdr)).from_buffer_copy(hdr)
-        self._obj.update(dkey, [(mak, meta, len(hdr))], single=True)
+        try:
+            self._obj.update(dkey, [(pak, src, n)])
+            meta = (ctypes.c_char * len(hdr)).from_buffer_copy(hdr)
+            self._obj.update(dkey, [(mak, meta, len(hdr))], single=True)
+        except Dropped:
+            return              # rank guard: not stored, which a cache allows
 
     def _get_raw(self, addr) -> Optional["MemoryObj"]:
         """The object-API read. Same contract as _get_sync: absent or
@@ -1065,7 +1090,9 @@ class DaosConnector(RemoteConnector):
         n = metadata.length
         dst = (ctypes.c_char * n).from_buffer(view)
         try:
-            (readn,) = self._obj.fetch(dkey, [(pak, dst, n)])
+            (readn,) = self._fetch_into(dkey, [(pak, dst, n)], [memory_obj])
+        except Parked:
+            return None                          # released when DAOS lets go
         except Exception:
             self._release(memory_obj)
             raise
@@ -1100,6 +1127,24 @@ class DaosConnector(RemoteConnector):
             groups.setdefault(dkey, []).append((i, layer))
         return groups
 
+    def _fetch_into(self, dkey, items, owners):
+        """Fetch into MemoryObj buffers.
+
+        Under the rank guard a fetch past its deadline goes on writing into
+        its destination until the rank returns (check 2a, hub 2.4). Releasing
+        the MemoryObj then would hand the allocator a buffer DAOS still
+        writes to -- someone else's KV, overwritten minutes later. So the
+        release is deferred to the reap, and Parked tells the caller it no
+        longer owns them.
+        """
+        if not self._guard:
+            return self._obj.fetch(dkey, items)
+
+        def release():
+            for mo in owners:
+                self._release(mo)
+        return self._obj.fetch(dkey, items, release=release)
+
     def _put_raw_folded(self, dkey, entries) -> None:
         """Write every layer of one chunk: one update for payloads, one for
         metadata.
@@ -1117,8 +1162,11 @@ class DaosConnector(RemoteConnector):
             keep.append(buf)
             payloads.append((pak, src, n))
             metas.append((mak, buf, len(hdr)))
-        self._obj.update(dkey, payloads)
-        self._obj.update(dkey, metas, single=True)
+        try:
+            self._obj.update(dkey, payloads)
+            self._obj.update(dkey, metas, single=True)
+        except Dropped:
+            pass                # rank guard: not stored, which a cache allows
         del keep
 
     def _get_raw_folded(self, dkey, layers):
@@ -1162,7 +1210,9 @@ class DaosConnector(RemoteConnector):
         if not items:
             return out
         try:
-            readn = self._obj.fetch(dkey, items)
+            readn = self._fetch_into(dkey, items, [mo for _, mo, _n in staged])
+        except Parked:
+            return out                           # released when DAOS lets go
         except Exception:
             for _, mo, _n in staged:
                 self._release(mo)
@@ -1180,13 +1230,16 @@ class DaosConnector(RemoteConnector):
     def _remove_one(self, addr) -> bool:
         if self._raw:
             dkey, layer = addr
-            if layer is not None:
-                # One layer, not the chunk: its siblings share this dkey, so
-                # punching the dkey would evict thirty-nine innocent layers.
-                self._obj.punch_akeys(dkey, list(_akeys_for(layer)))
-                return True
-            addr = dkey
-            self._obj.punch(addr)
+            try:
+                if layer is not None:
+                    # One layer, not the chunk: its siblings share this dkey, so
+                    # punching the dkey would evict thirty-nine innocent layers.
+                    self._obj.punch_akeys(dkey, list(_akeys_for(layer)))
+                    return True
+                addr = dkey
+                self._obj.punch(addr)
+            except Dropped:
+                return False
             return True
         return self._dfs.remove(addr)
 

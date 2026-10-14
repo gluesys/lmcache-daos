@@ -42,8 +42,11 @@ Pieces, each testable without DAOS (tests/test_rank_guard.py):
     every op, aborted ops parked as zombies and reaped when DAOS completes them
   * :class:`BucketPlacement` -- key -> bucket -> rank
   * :class:`S1BucketStore` -- the above over real libdaos
+  * :class:`GuardedObj`   -- ObjSys's interface over the store, which is how
+    DaosConnector uses it (``DAOS_RANK_GUARD=1``)
 
-Status: prototype, not wired into DaosConnector.
+Status: prototype. Measured on a real outage with tests/rank_guard_outage.py;
+the connector wiring has unit tests only.
 """
 
 from __future__ import annotations
@@ -184,9 +187,9 @@ class Breaker:
 
 # ---- deadline engine --------------------------------------------------------
 class _Op:
-    __slots__ = ("eq", "slot", "rank", "keep", "nbytes", "done", "rc", "t0")
+    __slots__ = ("eq", "slot", "rank", "keep", "nbytes", "done", "rc", "t0", "on_reap")
 
-    def __init__(self, eq, slot, rank, keep, nbytes):
+    def __init__(self, eq, slot, rank, keep, nbytes, on_reap=None):
         self.eq = eq              # the queue the slot belongs to
         self.slot = slot
         self.rank = rank
@@ -195,6 +198,7 @@ class _Op:
         self.done = threading.Event()
         self.rc = None
         self.t0 = time.monotonic()
+        self.on_reap = on_reap    # called with the rc if this becomes a zombie
 
 
 class DeadlineEngine:
@@ -255,19 +259,24 @@ class DeadlineEngine:
 
     # -- caller side ----------------------------------------------------------
     def run(self, rank: int, submit: Callable[[object], int], keep: object,
-            nbytes: int, deadline: float):
+            nbytes: int, deadline: float,
+            on_reap: Optional[Callable[[int], None]] = None):
         """Submit one op and wait at most ``deadline`` seconds.
 
         ``submit(slot)`` starts the DAOS call with that event and returns its
         immediate rc. ``keep`` must hold every buffer the call reads or
         writes. Returns the DAOS rc, :data:`DEADLINE` or :data:`SKIPPED`.
+
+        ``on_reap(rc)`` runs on the poller thread if the op became a zombie
+        and DAOS has now completed it -- for buffers ``keep`` cannot own,
+        such as an allocator's, which must not go back before then.
         """
         if not self.breaker.allow(rank):
             self._count("skipped")
             return SKIPPED
         eq = self._rank_eqs.get(rank, self.eq)
         slot = eq.new_event()
-        op = _Op(eq, slot, rank, keep, nbytes)
+        op = _Op(eq, slot, rank, keep, nbytes, on_reap)
         with self._lock:
             self._pending[slot.addr] = op
         rc = submit(slot)
@@ -359,6 +368,11 @@ class DeadlineEngine:
             self._count("zombie_reaped_ok")
         logger.info("rank %d: zombie reaped rc=%d after %.1fs", z.rank, rc,
                     time.monotonic() - z.t0)
+        if z.on_reap is not None:
+            try:
+                z.on_reap(rc)
+            except Exception:                 # the poller must survive a bad callback
+                logger.exception("zombie on_reap failed")
 
     # -- misc -----------------------------------------------------------------
     def _count(self, k: str) -> None:
@@ -523,7 +537,7 @@ class S1BucketStore:
             self.error = e
             logger.exception("S1BucketStore connect failed")
 
-    def _op(self, dkey: bytes, items, single: bool, fetch: bool):
+    def _op(self, dkey: bytes, items, single: bool, fetch: bool, on_reap=None):
         from . import obj_binding as ob
         if not self.ready.is_set():
             return NOT_READY, None
@@ -543,22 +557,60 @@ class S1BucketStore:
             def submit(slot):
                 return d.daos_obj_update(oh, ob.DaosHandle(0), 0, ctypes.byref(dk_iov), n,
                                          iods, sgls, slot.addr)
-        rc = self.engine.run(rank, submit, hold, nbytes, self.deadline)
+        rc = self.engine.run(rank, submit, hold, nbytes, self.deadline, on_reap)
         if rc == 0 and fetch:
             return 0, [int(sgls[i].sg_iovs[0].iov_len) if sgls[i].sg_nr_out else 0
                        for i in range(n)]
         return rc, None
 
     def fetch(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
-              single: bool = False):
+              single: bool = False, on_reap=None):
         """Returns ``(rc, got)``. Anything but rc 0 is a miss to the caller;
-        ``got`` gates presence the same way ObjSys.fetch does."""
-        return self._op(dkey, items, single, fetch=True)
+        ``got`` gates presence the same way ObjSys.fetch does. An aborted
+        fetch still writes into its buffers when the rank returns (check 2a);
+        ``on_reap`` is when they are free again."""
+        return self._op(dkey, items, single, fetch=True, on_reap=on_reap)
 
     def update(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
                single: bool = False):
         """Returns rc. A put that is not 0 is dropped -- it is a cache."""
         return self._op(dkey, items, single, fetch=False)[0]
+
+    def punch(self, dkey: bytes, akeys: Optional[Sequence[bytes]] = None):
+        """Remove a dkey, or only the named akeys under it. Returns rc. An
+        aborted punch still lands when the rank returns; for a cache that is
+        a late eviction."""
+        from . import obj_binding as ob
+        if not self.ready.is_set():
+            return NOT_READY
+        b = self.placement.bucket(dkey)
+        oh = self._ohs[b]
+        dk_iov, dk_buf = ob.build_key(dkey)
+        keep = [dk_iov, dk_buf]
+        d = ob._daos
+        if akeys:
+            arr = (ob.DIov * len(akeys))()
+            for i, ak in enumerate(akeys):
+                arr[i], buf = ob.build_key(ak)
+                keep.append(buf)
+            keep.append(arr)
+
+            def submit(slot):
+                return d.daos_obj_punch_akeys(oh, ob.DaosHandle(0), 0, ctypes.byref(dk_iov),
+                                              len(akeys), arr, slot.addr)
+        else:
+            def submit(slot):
+                return d.daos_obj_punch_dkeys(oh, ob.DaosHandle(0), 0, 1,
+                                              ctypes.byref(dk_iov), slot.addr)
+        return self.engine.run(self.placement.rank(b), submit, keep, 0, self.deadline)
+
+    def close(self) -> None:
+        """Stop polling. Handles stay open and zombies stay referenced, for
+        the reason DeadlineEngine.close gives."""
+        if self.engine is not None:
+            left = self.engine.close()
+            if left:
+                logger.warning("S1BucketStore closed with %d zombies outstanding", left)
 
     def snapshot(self) -> dict:
         eng = self.engine
@@ -566,3 +618,82 @@ class S1BucketStore:
                 "stats": dict(eng.stats) if eng else {},
                 "zombies": eng.zombies() if eng else 0,
                 "poll_max": eng.poll_max() if eng else {}}
+
+
+# ---- connector adapter ------------------------------------------------------
+class Parked(Exception):
+    """A fetch hit its deadline, and its destination now belongs to a zombie.
+
+    DAOS still writes into it when the rank returns (check 2a), so the caller
+    must neither reuse nor release it. The ``release`` given to the fetch runs
+    once DAOS has let go.
+    """
+
+
+class Dropped(Exception):
+    """A write or punch that was not done: skipped, past its deadline, store
+    not ready, or a DAOS error. One past its deadline may still land when the
+    rank returns (check 2a), which is harmless only for keys whose value never
+    changes -- this cache's keys are content hashes.
+    """
+
+    def __init__(self, what: str, rc):
+        super().__init__("%s: %s" % (what, rc))
+        self.rc = rc
+
+
+class GuardedObj:
+    """ObjSys's interface over an :class:`S1BucketStore`, for DaosConnector.
+
+    The connector's raw path stays as it is; what changes is how a request
+    that cannot be served ends. A fetch that is skipped, aborted or not ready
+    reports 0 bytes for every akey, which the connector already reads as a
+    miss. A write or punch raises :class:`Dropped`, so the caller does not
+    commit metadata over a payload that did not land.
+    """
+
+    def __init__(self, store: "S1BucketStore"):
+        self.store = store
+
+    def _check(self) -> None:
+        if self.store.error is not None:      # connect failed for good: say so
+            raise self.store.error
+
+    def fetch(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
+              single: bool = False, release: Optional[Callable[[], None]] = None
+              ) -> List[int]:
+        """``release`` frees the destination buffers. Pass it when they are not
+        the caller's to keep (an allocator's): on a deadline it is deferred to
+        the reap and :class:`Parked` is raised instead of returning."""
+        self._check()
+        on_reap = (lambda rc: release()) if release is not None else None
+        rc, got = self.store.fetch(dkey, items, single=single, on_reap=on_reap)
+        if rc == 0:
+            return got
+        if rc == DEADLINE and release is not None:
+            raise Parked(dkey)
+        return [0] * len(items)
+
+    def update(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
+               single: bool = False) -> None:
+        self._check()
+        rc = self.store.update(dkey, items, single=single)
+        if rc != 0:
+            raise Dropped("update", rc)
+
+    def punch(self, dkey: bytes) -> None:
+        self._check()
+        rc = self.store.punch(dkey)
+        if rc != 0:
+            raise Dropped("punch", rc)
+
+    def punch_akeys(self, dkey: bytes, akeys: Sequence[bytes]) -> None:
+        if not akeys:
+            return
+        self._check()
+        rc = self.store.punch(dkey, akeys)
+        if rc != 0:
+            raise Dropped("punch_akeys", rc)
+
+    def close(self) -> None:
+        self.store.close()

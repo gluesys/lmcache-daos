@@ -410,6 +410,143 @@ def layout_parse():
     ck("layout: rank of shard 0 replica 0", r == 7, "(%r)" % r)
 
 
+class FakeStore:
+    """S1BucketStore's call shape over a DeadlineEngine, every key on ``rank``."""
+
+    def __init__(self, eng, cl, rank, deadline=0.05):
+        self.eng, self.cl, self.rank, self.deadline = eng, cl, rank, deadline
+        self.error = None
+
+    def fetch(self, dkey, items, single=False, on_reap=None):
+        rc = self.eng.run(self.rank, self.cl.submit(self.rank), list(items), 64,
+                          self.deadline, on_reap)
+        return rc, ([n for _, _, n in items] if rc == 0 else None)
+
+    def update(self, dkey, items, single=False):
+        return self.eng.run(self.rank, self.cl.submit(self.rank), list(items), 64,
+                            self.deadline)
+
+    def punch(self, dkey, akeys=None):
+        return self.eng.run(self.rank, self.cl.submit(self.rank), dkey, 0, self.deadline)
+
+
+def guarded_obj_live_rank():
+    eq, _, br, eng, cl = setup()
+    g = G.GuardedObj(FakeStore(eng, cl, 0))
+    got = g.fetch(b"k", [(b"m", None, 8), (b"p", None, 64)], single=True)
+    ck("guarded: live fetch returns the byte counts", got == [8, 64], "(%r)" % got)
+    try:
+        g.update(b"k", [(b"p", None, 64)])
+        g.punch(b"k")
+        g.punch_akeys(b"k", [b"p"])
+        ok = True
+    except Exception as e:
+        ok = False
+        print("   ", e)
+    ck("guarded: live update and punch do not raise", ok)
+    eng.close()
+
+
+def guarded_obj_dead_rank_fetch_is_a_miss():
+    eq, _, br, eng, cl = setup(threshold=5)
+    cl.down.add(1)
+    g = G.GuardedObj(FakeStore(eng, cl, 1))
+    got = g.fetch(b"k", [(b"m", None, 8)], single=True)
+    ck("guarded: dead fetch without release reads as a miss", got == [0], "(%r)" % got)
+    cl.revive(1)
+    wait_until(lambda: eng.zombies() == 0)
+    eng.close()
+
+
+def guarded_obj_parks_the_destination():
+    eq, _, br, eng, cl = setup(threshold=5)
+    cl.down.add(1)
+    g = G.GuardedObj(FakeStore(eng, cl, 1))
+    released = []
+    try:
+        g.fetch(b"k", [(b"p", None, 64)], release=lambda: released.append(1))
+        parked = False
+    except G.Parked:
+        parked = True
+    ck("guarded: dead fetch with a release raises Parked", parked)
+    ck("guarded: destination not released while DAOS may write it", released == [])
+    cl.revive(1)
+    ok = wait_until(lambda: released == [1])
+    time.sleep(0.02)
+    ck("guarded: released exactly once, at the reap", ok and released == [1],
+       "(%r)" % released)
+    eng.close()
+
+
+def guarded_obj_skip_keeps_ownership():
+    eq, _, br, eng, cl = setup(threshold=1, open_secs=60.0)
+    cl.down.add(1)
+    g = G.GuardedObj(FakeStore(eng, cl, 1))
+    try:
+        g.fetch(b"k", [(b"p", None, 64)])     # opens the breaker
+    except G.Parked:
+        pass
+    released = []
+    try:
+        got = g.fetch(b"k", [(b"p", None, 64)], release=lambda: released.append(1))
+    except G.Parked:
+        got = "parked"
+    ck("guarded: skipped fetch is a plain miss, not Parked", got == [0], "(%r)" % (got,))
+    cl.revive(1)
+    wait_until(lambda: eng.zombies() == 0)
+    time.sleep(0.02)
+    ck("guarded: skipped fetch's release never called by the guard", released == [])
+    eng.close()
+
+
+def guarded_obj_writes_raise_dropped():
+    eq, _, br, eng, cl = setup(threshold=1, open_secs=60.0)
+    cl.down.add(1)
+    g = G.GuardedObj(FakeStore(eng, cl, 1))
+    rcs = []
+    for call in (lambda: g.update(b"k", [(b"p", None, 64)]),
+                 lambda: g.update(b"k", [(b"m", None, 8)], single=True),
+                 lambda: g.punch(b"k"), lambda: g.punch_akeys(b"k", [b"p"])):
+        try:
+            call()
+            rcs.append(None)
+        except G.Dropped as e:
+            rcs.append(e.rc)
+    ck("guarded: dead write is Dropped(DEADLINE), then SKIPPED",
+       rcs == [G.DEADLINE, G.SKIPPED, G.SKIPPED, G.SKIPPED], "(%r)" % rcs)
+    cl.revive(1)
+    wait_until(lambda: eng.zombies() == 0)
+    eng.close()
+
+
+def guarded_obj_surfaces_connect_error():
+    eq, _, br, eng, cl = setup()
+    st = FakeStore(eng, cl, 0)
+    st.error = RuntimeError("daos_pool_connect failed")
+    g = G.GuardedObj(st)
+    try:
+        g.fetch(b"k", [(b"m", None, 8)])
+        ok = False
+    except RuntimeError:
+        ok = True
+    ck("guarded: a failed connect is raised, not served as misses", ok)
+    eng.close()
+
+
+def reap_callback_failure_keeps_poller():
+    eq, _, br, eng, cl = setup(threshold=5)
+    cl.down.add(1)
+
+    def boom(rc):
+        raise ValueError("bad callback")
+    eng.run(1, cl.submit(1), Keep(), 64, 0.05, boom)
+    cl.revive(1)
+    wait_until(lambda: eng.zombies() == 0)
+    rc = eng.run(0, cl.submit(0), Keep(), 64, 0.5)
+    ck("on_reap: a raising callback does not stop the poller", rc == 0, "(rc=%r)" % rc)
+    eng.close()
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -418,7 +555,11 @@ def main():
               unreachable_rc_counts_as_a_miss, submit_failure_is_finalised_not_parked,
               per_rank_queues_one_poller, open_rank_queue_polled_slowly,
               open_rank_poll_interval_adapts_to_cost,
-              placement_is_stable_and_spread, layout_parse):
+              placement_is_stable_and_spread, layout_parse,
+              guarded_obj_live_rank, guarded_obj_dead_rank_fetch_is_a_miss,
+              guarded_obj_parks_the_destination, guarded_obj_skip_keeps_ownership,
+              guarded_obj_writes_raise_dropped, guarded_obj_surfaces_connect_error,
+              reap_callback_failure_keeps_poller):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)
