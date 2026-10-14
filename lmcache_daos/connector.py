@@ -34,6 +34,7 @@ import concurrent.futures
 import ctypes
 import errno
 import hashlib
+import logging
 import os
 import sys
 import threading
@@ -324,11 +325,20 @@ class DaosConnector(RemoteConnector):
         cfg = config if config is not None else local_cpu_backend.config
         super().__init__(cfg, local_cpu_backend.metadata)
 
+        #
+        # remote_url alone does not reach us: LMCache registers the plugin
+        # adapter only for names in remote_storage_plugins. Both together
+        # build two RemoteBackends on the same container (LMCache 0.5.5) --
+        # every chunk stored twice, two connectors. So the plugin route can
+        # carry the target in extra_config instead, with remote_url unset.
         if url is None:
-            url = getattr(cfg, "remote_url", None)
+            extra = getattr(cfg, "extra_config", None) or {}
+            url = getattr(cfg, "remote_url", None) or extra.get(
+                "remote_storage_plugin.daos.url")
             if not url:
                 raise ValueError(
-                    "DaosConnector: no url given and config.remote_url is unset")
+                    "DaosConnector: no url given, and neither config.remote_url "
+                    "nor extra_config remote_storage_plugin.daos.url is set")
         pool, cont, sysname = _parse_daos_url(url)
 
         self.loop = loop
@@ -366,6 +376,15 @@ class DaosConnector(RemoteConnector):
             self._addr = _raw_addr
             logger.info("DAOS: %s/%s through the rank guard (S1 buckets, "
                         "per-rank breaker)", pool, cont)
+            # rank_guard logs breaker transitions and zombie reaps on a stdlib
+            # logger with no handler, where INFO is dropped. Send them where
+            # this module's lines go, which under LMCache is its own handler.
+            rg_log = logging.getLogger("lmcache_daos.rank_guard")
+            if not rg_log.handlers and logger.handlers:
+                for h in logger.handlers:
+                    rg_log.addHandler(h)
+                rg_log.setLevel(logging.INFO)
+                rg_log.propagate = False
         elif self._raw:
             self._obj = ObjSys(pool=pool, cont=cont, sys=sysname)
             self._dfs = None
