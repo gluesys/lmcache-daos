@@ -364,14 +364,16 @@ class DaosConnector(RemoteConnector):
         # rank is down (hub 2.2), where the store's own connect runs in the
         # background instead. DAOS_RANK_GUARD_BUCKETS must not change for a
         # container: keys would move to other buckets and read as misses,
-        # leaving the old copies unreachable.
+        # leaving the old copies unreachable. Deadlines: rank_guard.op_deadline.
         self._guard = os.environ.get("DAOS_RANK_GUARD") == "1"
         self._raw = self._guard or _choose_backend(pool, cont, sysname)
         if self._guard:
             self._obj = GuardedObj(S1BucketStore(
                 pool, cont, sys=sysname,
                 nbuckets=int(os.environ.get("DAOS_RANK_GUARD_BUCKETS", "64")),
-                deadline=float(os.environ.get("DAOS_RANK_GUARD_DEADLINE", "0.5"))))
+                deadline=float(os.environ.get("DAOS_RANK_GUARD_DEADLINE", "0.5")),
+                write_deadline=float(os.environ.get("DAOS_RANK_GUARD_WRITE_DEADLINE", "10")),
+                min_bw=float(os.environ.get("DAOS_RANK_GUARD_MIN_BW", "50e6"))))
             self._dfs = None
             self._addr = _raw_addr
             logger.info("DAOS: %s/%s through the rank guard (S1 buckets, "

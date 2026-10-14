@@ -547,6 +547,14 @@ def reap_callback_failure_keeps_poller():
     eng.close()
 
 
+def op_deadline_scales_with_bytes():
+    d = G.op_deadline
+    ck("deadline: header-sized read is the base", abs(d(0.5, 28, 50e6) - 0.5) < 1e-3)
+    ck("deadline: 7.3 MiB chunk adds its time at min_bw",
+       abs(d(0.5, 7340032, 50e6) - (0.5 + 7340032 / 50e6)) < 1e-9, "(%.3f)" % d(0.5, 7340032, 50e6))
+    ck("deadline: min_bw 0 means fixed", d(10.0, 1 << 30, 0) == 10.0)
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -559,7 +567,7 @@ def main():
               guarded_obj_live_rank, guarded_obj_dead_rank_fetch_is_a_miss,
               guarded_obj_parks_the_destination, guarded_obj_skip_keeps_ownership,
               guarded_obj_writes_raise_dropped, guarded_obj_surfaces_connect_error,
-              reap_callback_failure_keeps_poller):
+              reap_callback_failure_keeps_poller, op_deadline_scales_with_bytes):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)

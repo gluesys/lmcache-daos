@@ -452,6 +452,17 @@ def _first_rank(layout_p) -> int:
     return _ShardLoc.from_address(shard0 + ctypes.sizeof(_ObjShard)).sd_rank
 
 
+def op_deadline(base: float, nbytes: int, min_bw: float) -> float:
+    """``base`` plus the time ``nbytes`` takes at ``min_bw`` bytes/s.
+
+    A fixed deadline cannot fit both a 28-byte header and a 7.3 MiB KV chunk:
+    on lane A's zvol-backed targets the chunk writes of one batched put took
+    0.5-0.8 s on healthy ranks, and a fixed 0.5 s opened the breaker on them
+    15 times a minute (vLLM run H, 2026-10-14).
+    """
+    return base + (nbytes / min_bw if min_bw > 0 else 0.0)
+
+
 class S1BucketStore:
     """Keys over ``nbuckets`` S1 objects, every op through a DeadlineEngine.
 
@@ -462,16 +473,24 @@ class S1BucketStore:
     itself, when the rank rejoins (154 s and 586 s measured). A thread parked
     in that call is the whole cost, and it turns a start-up during an outage
     into "no cache until the rank is back" instead of "no start-up".
+
+    Deadlines (:func:`op_deadline`): a fetch gets ``deadline``, a write or
+    punch ``write_deadline``, each plus its bytes at ``min_bw``. Reads are
+    on the TTFT path; writes are not -- LMCache stores after the fact -- so
+    they may wait long enough that only a rank that does not answer misses.
     """
 
     def __init__(self, pool: str, cont: str, nbuckets: int = 64,
                  oid_base: int = 1 << 40, deadline: float = 0.5,
                  breaker: Optional[Breaker] = None, sys: Optional[str] = None,
-                 per_rank_eq: bool = True, slow_poll_secs: float = 0.05):
+                 per_rank_eq: bool = True, slow_poll_secs: float = 0.05,
+                 write_deadline: float = 10.0, min_bw: float = 50e6):
         self.pool, self.cont, self.sys = pool, cont, sys
         self.nbuckets = nbuckets
         self.oid_base = oid_base
         self.deadline = deadline
+        self.write_deadline = write_deadline
+        self.min_bw = min_bw
         self.breaker = breaker or Breaker()
         self.engine: Optional[DeadlineEngine] = None
         # Each EQ is its own CaRT context. per_rank_eq keeps a dead rank's
@@ -557,7 +576,9 @@ class S1BucketStore:
             def submit(slot):
                 return d.daos_obj_update(oh, ob.DaosHandle(0), 0, ctypes.byref(dk_iov), n,
                                          iods, sgls, slot.addr)
-        rc = self.engine.run(rank, submit, hold, nbytes, self.deadline, on_reap)
+        dl = op_deadline(self.deadline if fetch else self.write_deadline, nbytes,
+                         self.min_bw)
+        rc = self.engine.run(rank, submit, hold, nbytes, dl, on_reap)
         if rc == 0 and fetch:
             return 0, [int(sgls[i].sg_iovs[0].iov_len) if sgls[i].sg_nr_out else 0
                        for i in range(n)]
@@ -602,7 +623,8 @@ class S1BucketStore:
             def submit(slot):
                 return d.daos_obj_punch_dkeys(oh, ob.DaosHandle(0), 0, 1,
                                               ctypes.byref(dk_iov), slot.addr)
-        return self.engine.run(self.placement.rank(b), submit, keep, 0, self.deadline)
+        return self.engine.run(self.placement.rank(b), submit, keep, 0,
+                               self.write_deadline)
 
     def close(self) -> None:
         """Stop polling. Handles stay open and zombies stay referenced, for
