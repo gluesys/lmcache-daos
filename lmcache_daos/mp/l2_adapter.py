@@ -31,6 +31,10 @@ Design choices (see doc/MP-MODE-PLAN.md):
   ``native_connector_l2_adapter``: DAOS does not evict behind our back, so a
   lock only has to stop *our* ``delete()`` from removing an object that a
   prefetch is about to load.
+* ``"rank_guard": true`` swaps DFS for :class:`.guarded_kv.GuardedKV` -- the
+  same calls over the rank guard, for an rd_fac 0 ``self_heal:none`` pool where
+  a rebooting node should cost misses, not stalls. See guarded_kv.py for why
+  its loads and stores go through a private buffer.
 * Blocking libdfs calls run on a private thread pool; ``dfs_sys_read`` /
   ``dfs_sys_write`` release the GIL, so per-key I/O inside a task really does
   overlap.
@@ -62,6 +66,8 @@ from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_facto
 from lmcache.v1.platform import create_event_notifier
 
 from ..dfs_binding import DaosError, DfsSys, warm_up_all_targets
+from ..rank_guard import S1BucketStore
+from .guarded_kv import GuardedKV
 
 logger = init_logger(__name__)
 
@@ -205,6 +211,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         task_workers: int = 32,
         load_schedule: str = "fifo",
         probe_chunks: int = 64,
+        rank_guard: bool = False,
+        guard: Optional[dict] = None,
     ):
         self.pool = pool
         self.container = container
@@ -217,6 +225,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         self.task_workers = task_workers
         self.load_schedule = load_schedule
         self.probe_chunks = probe_chunks
+        self.rank_guard = rank_guard
+        self.guard = dict(guard or {})
 
     @classmethod
     def from_dict(cls, d: dict) -> "DaosL2AdapterConfig":
@@ -253,6 +263,17 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         probe_chunks = d.get("probe_chunks", 64)
         if not isinstance(probe_chunks, int) or probe_chunks < 0:
             raise ValueError("daos: 'probe_chunks' must be a non-negative integer")
+        rank_guard = d.get("rank_guard", False)
+        if not isinstance(rank_guard, bool):
+            raise ValueError("daos: 'rank_guard' must be a boolean")
+        guard = {}
+        for k, typ in (("buckets", int), ("deadline", (int, float)),
+                       ("write_deadline", (int, float)), ("min_bw", (int, float))):
+            if "guard_" + k in d:
+                v = d["guard_" + k]
+                if not isinstance(v, typ) or isinstance(v, bool) or v <= 0:
+                    raise ValueError("daos: 'guard_%s' must be a positive number" % k)
+                guard[k] = v
         cfg = cls(
             pool=pool,
             container=container,
@@ -265,6 +286,8 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             task_workers=task_workers,
             load_schedule=load_schedule,
             probe_chunks=probe_chunks,
+            rank_guard=rank_guard,
+            guard=guard,
         )
         # Optional common sub-configs handled by the base class parsers.
         cfg.eviction_config = cls._parse_eviction_config(d)
@@ -295,6 +318,12 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "- status_interval_s (number): log report_status() this often "
             "while active; 0 disables (optional). The MP server's own "
             "--enable-extra-logging needs observability, which the image lacks\n"
+            "- rank_guard (bool): store keys through the rank guard (S1 buckets, "
+            "per-request deadline, per-rank breaker) instead of DFS, for an "
+            "rd_fac 0 self_heal:none pool where a rebooting node should cost "
+            "misses, not stalls. The container must be non-POSIX (optional, "
+            "default false). guard_buckets / guard_deadline / "
+            "guard_write_deadline / guard_min_bw tune it (see rank_guard.py)\n"
             "- eviction / persist_enabled / serde: common L2 options"
         )
 
@@ -310,6 +339,14 @@ class DaosL2Adapter(L2AdapterInterface):
         self._root = config.root
         self._verify_size = config.verify_size
 
+        if dfs_factory is None and config.rank_guard:
+            def dfs_factory():
+                g = config.guard
+                return GuardedKV(S1BucketStore(
+                    config.pool, config.container, sys=config.sys,
+                    nbuckets=g.get("buckets", 64), deadline=g.get("deadline", 0.5),
+                    write_deadline=g.get("write_deadline", 10.0),
+                    min_bw=g.get("min_bw", 50e6)))
         factory = dfs_factory or (
             lambda: DfsSys(pool=config.pool, cont=config.container, sys=config.sys)
         )
@@ -387,9 +424,10 @@ class DaosL2Adapter(L2AdapterInterface):
             self._status_thread.start()
         logger.info(
             "DaosL2Adapter: pool=%s container=%s root=%s workers=%d "
-            "capacity=%d verify_size=%s schedule=%s",
+            "capacity=%d verify_size=%s schedule=%s rank_guard=%s",
             config.pool, config.container, self._root, config.workers,
             self._max_capacity_bytes, self._verify_size, config.load_schedule,
+            config.rank_guard,
         )
 
     def _warm_up(self) -> None:
@@ -412,7 +450,10 @@ class DaosL2Adapter(L2AdapterInterface):
         removed afterwards; ``probe_chunks: 0`` disables the warm-up.
         """
         nchunks = int(getattr(self._config, "probe_chunks", 64) or 0)
-        if nchunks <= 0:
+        if nchunks <= 0 or getattr(self._config, "rank_guard", False):
+            # The probe writes DFS files; the guarded store has none, and its
+            # own connect runs in the background (it may be waiting out an
+            # outage, where a pool connect does not complete).
             return
         path = f"{self._root}/.daos-l2-probe.{os.getpid()}"
         t0 = time.monotonic()
