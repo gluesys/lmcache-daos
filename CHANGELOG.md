@@ -11,6 +11,37 @@ is doing real work.
 
 ## [Unreleased]
 
+### Added
+
+- Rank guard for the object path (`DAOS_RANK_GUARD=1`, `lmcache_daos/rank_guard.py`),
+  for an rd_fac 0, `self_heal:none` pool where a rebooting storage node should
+  cost its share of the cache as misses instead of stalling every request.
+  Keys are spread over S1 bucket objects so the rank is known before sending;
+  every request has a deadline sized by its bytes (`DAOS_RANK_GUARD_DEADLINE`,
+  `DAOS_RANK_GUARD_WRITE_DEADLINE`, `DAOS_RANK_GUARD_MIN_BW`); aborted
+  requests are kept as zombies until DAOS completes them (an aborted fetch
+  still writes its buffer, an aborted put still lands), and a MemoryObj under
+  a parked fetch goes back to the allocator only then; a breaker per rank
+  skips a dead rank and closes when its zombies come back answered. One
+  poller thread drives one event queue per rank, polling an open rank's queue
+  at `max(50 ms, 10 x its last poll)`. Under the guard a put is skipped when
+  the key already exists (keys are content hashes).
+  Measured on a 3-node IB lane with vLLM + LMCache, one node powered off for
+  240 s: no failed request, TTFT during the outage at or below recompute, hits
+  back 6 s after the rank rejoins. Prototype: no MP-mode wiring yet.
+- `DAOS_OBJ_CLASS` names the object class of the raw-path object (for example
+  `EC_2P1GX`); a non-POSIX container has no default class property.
+- `tests/vllm_reboot_ttft.py`, `tests/rank_guard_outage.py`,
+  `tests/rank_guard_connector_outage.py`: outage drivers (manual, not CI).
+
+### Fixed
+
+- The plugin route alone now reaches the connector: with `remote_url` unset,
+  the target is read from `extra_config` `remote_storage_plugin.daos.url`.
+  Setting both `remote_url` and `remote_storage_plugins`, which was the only
+  way before, makes LMCache 0.5.5 build two RemoteBackends on the same
+  container -- every chunk stored twice, two connectors.
+
 ### Removed
 
 - `nixl/plugin`, `nixl/tests`, `nixl/integration.patch`. The NIXL DAOS backend
