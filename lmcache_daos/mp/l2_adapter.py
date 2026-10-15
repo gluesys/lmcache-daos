@@ -47,7 +47,10 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from lmcache.logging import init_logger
-from lmcache.native_storage_ops import Bitmap
+try:  # LMCache >= 0.5.5 moved Bitmap into its native module
+    from lmcache.lmcache_native import Bitmap
+except ImportError:  # 0.5.2
+    from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
@@ -549,10 +552,20 @@ class DaosL2Adapter(L2AdapterInterface):
 
     # -- lookup and lock ----------------------------------------------------
     def submit_lookup_and_lock_task(
-        self, keys: List[ObjectKey], layout_desc: MemoryLayoutDesc
+        self, keys: List[ObjectKey], layout_desc
     ) -> L2TaskId:
+        """``layout_desc`` is one MemoryLayoutDesc (LMCache 0.5.2) or a dict
+        ``object_group_id -> MemoryLayoutDesc`` (0.5.5, ``group_layout_descs``).
+        Given a dict, each key is checked against its own group's size; a
+        group missing from it is checked by length at load time only."""
         tid = self._new_task_id()
-        expected = _expected_bytes(layout_desc) if self._verify_size else None
+        if not self._verify_size:
+            expected = [None] * len(keys)
+        elif isinstance(layout_desc, dict):
+            sizes = {g: _expected_bytes(d) for g, d in layout_desc.items()}
+            expected = [sizes.get(k.object_group_id) for k in keys]
+        else:
+            expected = [_expected_bytes(layout_desc)] * len(keys)
         self._tasks.submit(self._execute_lookup, list(keys), expected, tid)
         return tid
 
@@ -575,7 +588,7 @@ class DaosL2Adapter(L2AdapterInterface):
         t0 = time.monotonic()
         bitmap = Bitmap(len(keys))
         try:
-            hits = list(self._meta.map(self._lookup_one, [(k, expected) for k in keys]))
+            hits = list(self._meta.map(self._lookup_one, list(zip(keys, expected))))
             with self._lock:
                 for i, (key, hit) in enumerate(zip(keys, hits)):
                     if hit:
