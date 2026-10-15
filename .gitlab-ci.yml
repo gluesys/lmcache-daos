@@ -55,6 +55,11 @@ unit:
     # corrupts, and the runner has no libdaos to catch it any other way.
     - python3 tests/test_serde_v3.py
     - python3 tests/test_obj_binding.py
+    # The rank guard's breaker, zombie pool and deadline engine, against a fake
+    # event queue that behaves as DAOS was measured to on a dead rank (abort does
+    # not complete, fini of an uncompleted event is DER_BUSY). A zombie freed or
+    # finalised early fails here instead of segfaulting on a real outage.
+    - python3 tests/test_rank_guard.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
