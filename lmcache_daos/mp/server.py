@@ -7,11 +7,13 @@ populated at import time, and only its own built-in adapter modules are
 discovered lazily. An out-of-tree adapter therefore has to be imported
 *before* the arguments are parsed -- which is all this entry point does:
 
-    python -m lmcache_daos.mp.server --host tcp://localhost --port 5555 \\
+    python -m lmcache_daos.mp.server --host 127.0.0.1 --port 5555 \\
         --chunk-size 256 --l1-size-gb 100 --eviction-policy LRU \\
         --l2-adapter '{"type":"daos","pool":"attr1","container":"kvlmc5"}'
 
-Every other option is LMCache's own (``--help`` lists them).
+Every other option is LMCache's own (``--help`` lists them). ``--host`` is a
+bare address on LMCache 0.5.5, which adds ``tcp://`` itself: ``tcp://127.0.0.1``
+binds ``tcp://tcp://...`` and the server dies at start-up (0.5.2 took the URL).
 """
 
 from __future__ import annotations

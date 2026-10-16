@@ -41,6 +41,14 @@ is doing real work.
   Setting both `remote_url` and `remote_storage_plugins`, which was the only
   way before, makes LMCache 0.5.5 build two RemoteBackends on the same
   container -- every chunk stored twice, two connectors.
+- The MP L2 adapter loads on LMCache 0.5.5. It was written against 0.5.2 and
+  failed at import on the 0.5.5 image: `Bitmap` moved from
+  `lmcache.native_storage_ops` to `lmcache.lmcache_native`, and the second
+  argument of `submit_lookup_and_lock_task` became `group_layout_descs`, a
+  dict `object_group_id -> MemoryLayoutDesc`, where a single layout used to
+  be. Given a dict, the size check had silently switched off; now each key is
+  checked against its own group's size. Both versions are accepted.
+
 
 ### Removed
 
