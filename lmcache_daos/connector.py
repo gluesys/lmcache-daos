@@ -46,7 +46,8 @@ from . import serde
 from . import serde_v3
 from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
-from .rank_guard import Dropped, GuardedObj, Parked, S1BucketStore
+from .rank_guard import (CLOSED, CapacityIndex, Dropped, GuardedObj, Parked,
+                         S1BucketStore)
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -366,6 +367,7 @@ class DaosConnector(RemoteConnector):
         # container: keys would move to other buckets and read as misses,
         # leaving the old copies unreachable. Deadlines: rank_guard.op_deadline.
         self._guard = os.environ.get("DAOS_RANK_GUARD") == "1"
+        self._cap = None
         self._raw = self._guard or _choose_backend(pool, cont, sysname)
         if self._guard:
             self._obj = GuardedObj(S1BucketStore(
@@ -387,6 +389,14 @@ class DaosConnector(RemoteConnector):
                     rg_log.addHandler(h)
                 rg_log.setLevel(logging.INFO)
                 rg_log.propagate = False
+            # DAOS_RANK_GUARD_CAPACITY_GB bounds what this process keeps in the
+            # container: an approximate LRU, evicted by punching the oldest
+            # dkeys (rank_guard.CapacityIndex). 0 or unset = unbounded.
+            cap_gb = float(os.environ.get("DAOS_RANK_GUARD_CAPACITY_GB", "0") or 0)
+            self._cap = CapacityIndex(int(cap_gb * (1 << 30))) if cap_gb > 0 else None
+            if self._cap is not None:
+                threading.Thread(target=self._evict_loop, name="daos-evict",
+                                 daemon=True).start()
         elif self._raw:
             self._obj = ObjSys(pool=pool, cont=cont, sys=sysname,
                                oclass=os.environ.get("DAOS_OBJ_CLASS") or None)
@@ -1062,6 +1072,8 @@ class DaosConnector(RemoteConnector):
         pak, mak = _akeys_for(layer)
         hdr = _repack_header(header)
         if self._guard and self._committed(dkey, [mak])[0]:
+            if self._cap is not None:
+                self._cap.touch(dkey)
             return              # same key, same bytes: already there
 
         try:
@@ -1070,6 +1082,8 @@ class DaosConnector(RemoteConnector):
             self._obj.update(dkey, [(mak, meta, len(hdr))], single=True)
         except Dropped:
             return              # rank guard: not stored, which a cache allows
+        if self._cap is not None:
+            self._cap.add(dkey, n + len(hdr))
 
     def _get_raw(self, addr) -> Optional["MemoryObj"]:
         """The object-API read. Same contract as _get_sync: absent or
@@ -1127,6 +1141,8 @@ class DaosConnector(RemoteConnector):
             # would be one buffer per torn key.
             self._release(memory_obj)
             return None
+        if self._cap is not None:
+            self._cap.touch(dkey)
         return self._dbg(memory_obj, "read")
 
     # -- layerwise folding ---------------------------------------------------
@@ -1165,6 +1181,63 @@ class DaosConnector(RemoteConnector):
         got = self._obj.fetch(dkey, [(ak, b, _META_CAP) for ak, b in zip(meta_akeys, bufs)],
                               single=True)
         return [g > 0 for g in got]
+
+    # -- capacity (rank guard) ---------------------------------------------
+    def _evict_loop(self) -> None:
+        """Rebuild the index from what is stored, then keep under capacity.
+
+        Start-up scan: each bucket's dkeys (``list_dkeys``, deadline-bound) and
+        each one's committed payload length from its whole-chunk metadata akey.
+        A dkey without one (layerwise, or not committed) is left out: it is
+        not counted, so layerwise data written before this process started
+        is not bounded by this index.
+
+        Then once a second: punch the oldest keys until under the low mark.
+        Keys on a rank whose breaker is not closed are passed over and stay
+        for a later round, so a dead rank does not stop eviction elsewhere.
+        """
+        st = self._obj.store
+        st.ready.wait()
+        if st.error is not None:
+            return
+        t0 = time.monotonic()
+        found = 0
+        for b in range(st.nbuckets):
+            keys = st.list_dkeys(b)
+            for dk in keys or ():
+                buf = ctypes.create_string_buffer(_META_CAP)
+                (got,) = self._obj.fetch(dk, [(serde_v3.AKEY_META, buf, _META_CAP)],
+                                         single=True)
+                if not got:
+                    continue
+                try:
+                    hdr = serde_v3.parse_meta(bytes(buf[:got]))
+                except serde_v3.BadHeader:
+                    continue
+                self._cap.add_old(dk, hdr.payload_len + got)
+                found += 1
+        logger.info("DAOS rank guard: capacity %.1f GiB, %d stored keys found "
+                    "(%.1f GiB) in %.1f s", self._cap.capacity / 2**30, found,
+                    self._cap.total / 2**30, time.monotonic() - t0)
+        while True:
+            time.sleep(1.0)
+            victims = self._cap.victims()
+            if not victims:
+                continue
+            freed = 0
+            for dk in victims:
+                rank = st.placement.rank(st.placement.bucket(dk))
+                if st.breaker.state(rank) != CLOSED:
+                    continue
+                try:
+                    self._obj.punch(dk)
+                except Dropped:
+                    continue
+                self._cap.discard(dk)
+                freed += 1
+            if freed:
+                logger.info("DAOS rank guard: evicted %d keys, %.2f GiB stored",
+                            freed, self._cap.total / 2**30)
 
     def _fetch_into(self, dkey, items, owners):
         """Fetch into MemoryObj buffers.
@@ -1210,8 +1283,12 @@ class DaosConnector(RemoteConnector):
             self._obj.update(dkey, payloads)
             self._obj.update(dkey, metas, single=True)
         except Dropped:
-            pass                # rank guard: not stored, which a cache allows
+            del keep
+            return              # rank guard: not stored, which a cache allows
         del keep
+        if self._cap is not None:
+            # layers of one chunk share the dkey and are evicted together
+            self._cap.add(dkey, sum(n for _l, _h, _s, n in entries))
 
     def _get_raw_folded(self, dkey, layers):
         """Read the named layers of one chunk. Returns a list positional to
@@ -1269,6 +1346,8 @@ class DaosConnector(RemoteConnector):
                 self._release(mo)
             else:
                 out[i] = self._dbg(mo, "read")
+        if self._cap is not None and any(o is not None for o in out):
+            self._cap.touch(dkey)
         return out
 
     def _remove_one(self, addr) -> bool:
@@ -1284,6 +1363,8 @@ class DaosConnector(RemoteConnector):
                 self._obj.punch(addr)
             except Dropped:
                 return False
+            if self._cap is not None:
+                self._cap.discard(dkey)
             return True
         return self._dfs.remove(addr)
 

@@ -469,6 +469,19 @@ def op_deadline(base: float, nbytes: int, min_bw: float) -> float:
     return base + (nbytes / min_bw if min_bw > 0 else 0.0)
 
 
+class _KeyDesc(ctypes.Structure):     # daos_obj.h daos_key_desc_t
+    _fields_ = [("kd_key_len", ctypes.c_uint64), ("kd_val_type", ctypes.c_uint32)]
+
+
+class _Anchor(ctypes.Structure):      # daos_types.h daos_anchor_t
+    _fields_ = [("da_type", ctypes.c_uint16), ("da_shard", ctypes.c_uint16),
+                ("da_flags", ctypes.c_uint32), ("da_sub_anchors", ctypes.c_uint64),
+                ("da_buf", ctypes.c_uint8 * 104)]
+
+
+_ANCHOR_EOF = 3                       # DAOS_ANCHOR_TYPE_EOF
+
+
 class S1BucketStore:
     """Keys over ``nbuckets`` S1 objects, every op through a DeadlineEngine.
 
@@ -632,6 +645,55 @@ class S1BucketStore:
         return self.engine.run(self.placement.rank(b), submit, keep, 0,
                                self.write_deadline)
 
+    def list_dkeys(self, bucket: int, batch: int = 128, keylen: int = 64):
+        """The dkeys of one bucket object, as a list, or None if the listing
+        did not complete (rank skipped or past its deadline, store not ready).
+
+        Each call goes through the engine with the read deadline, so listing a
+        bucket on a dead rank costs one deadline, not an outage. Used to rebuild
+        the capacity index at start-up, when the keys already in the container
+        are unknown to this process.
+        """
+        from . import obj_binding as ob
+        if not self.ready.is_set():
+            return None
+        d = ob._daos
+        d.daos_obj_list_dkey.restype = ctypes.c_int
+        d.daos_obj_list_dkey.argtypes = [ob.DaosHandle, ob.DaosHandle,
+                                         ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+                                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        oh = self._ohs[bucket]
+        rank = self.placement.rank(bucket)
+        anchor = _Anchor()
+        out = []
+        while anchor.da_type != _ANCHOR_EOF:
+            nr = ctypes.c_uint32(batch)
+            kds = (_KeyDesc * batch)()
+            buf = ctypes.create_string_buffer(batch * keylen)
+            iov = ob.DIov()
+            ob.set_iov(iov, buf, batch * keylen)
+            sgl = ob.DSgList()
+            sgl.sg_nr = 1
+            sgl.sg_nr_out = 0
+            sgl.sg_iovs = ctypes.pointer(iov)
+            keep = (nr, kds, buf, iov, sgl, anchor)
+
+            def submit(slot):
+                return d.daos_obj_list_dkey(oh, ob.DaosHandle(0), ctypes.byref(nr),
+                                            ctypes.addressof(kds), ctypes.addressof(sgl),
+                                            ctypes.addressof(anchor), slot.addr)
+            rc = self.engine.run(rank, submit, keep, 0, self.deadline)
+            if rc != 0:
+                return None
+            off = 0
+            for i in range(nr.value):
+                n = int(kds[i].kd_key_len)
+                out.append(buf.raw[off:off + n])
+                off += n
+            # a deadline would have parked anchor with the zombie; a fresh one
+            # is used for the next bucket, so reusing it here is safe
+        return out
+
     def close(self) -> None:
         """Stop polling. Handles stay open and zombies stay referenced, for
         the reason DeadlineEngine.close gives."""
@@ -646,6 +708,81 @@ class S1BucketStore:
                 "stats": dict(eng.stats) if eng else {},
                 "zombies": eng.zombies() if eng else 0,
                 "poll_max": eng.poll_max() if eng else {}}
+
+
+# ---- capacity ---------------------------------------------------------------
+class CapacityIndex:
+    """Approximate LRU over this process's view of the cache: dkey -> bytes.
+
+    DAOS has no eviction of its own, and a cache without a bound fills the pool
+    (DER_NOSPACE on the live ranks, vLLM runs G-I on lane A). Keys are added on
+    a committed put, moved to the young end on a hit, and handed out oldest
+    first once the total passes ``capacity``, until it is back under
+    ``low_water`` x capacity. Keys found at start-up go in at the old end.
+
+    Process-local on purpose: one in-process connector per vLLM instance and
+    container. Several processes writing one container each see only their
+    own puts; MP mode, where one server owns the cache, uses LMCache's own L2
+    eviction instead.
+    """
+
+    def __init__(self, capacity: int, low_water: float = 0.9):
+        from collections import OrderedDict
+        self.capacity = int(capacity)
+        self.low = int(capacity * low_water)
+        self._lru: "OrderedDict[bytes, int]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.total = 0
+
+    def add(self, key: bytes, nbytes: int) -> None:
+        with self._lock:
+            old = self._lru.pop(key, None)
+            if old is not None:
+                self.total -= old
+            self._lru[key] = nbytes
+            self.total += nbytes
+
+    def add_old(self, key: bytes, nbytes: int) -> None:
+        """A key found already stored: oldest, unless this process has it."""
+        with self._lock:
+            if key in self._lru:
+                return
+            self._lru[key] = nbytes
+            self._lru.move_to_end(key, last=False)
+            self.total += nbytes
+
+    def touch(self, key: bytes) -> None:
+        with self._lock:
+            if key in self._lru:
+                self._lru.move_to_end(key)
+
+    def discard(self, key: bytes) -> None:
+        with self._lock:
+            n = self._lru.pop(key, None)
+            if n is not None:
+                self.total -= n
+
+    def victims(self, skip=()) -> List[bytes]:
+        """Oldest keys whose removal brings the total under the low mark, or
+        [] while under capacity. ``skip`` keys (e.g. on a dead rank) are
+        passed over and stay; they are offered again on a later call."""
+        with self._lock:
+            if self.total <= self.capacity:
+                return []
+            need = self.total - self.low
+            out = []
+            for k, n in self._lru.items():
+                if need <= 0:
+                    break
+                if k in skip:
+                    continue
+                out.append(k)
+                need -= n
+            return out
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._lru)
 
 
 # ---- connector adapter ------------------------------------------------------
