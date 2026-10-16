@@ -375,7 +375,8 @@ class DaosConnector(RemoteConnector):
                 nbuckets=int(os.environ.get("DAOS_RANK_GUARD_BUCKETS", "64")),
                 deadline=float(os.environ.get("DAOS_RANK_GUARD_DEADLINE", "0.5")),
                 write_deadline=float(os.environ.get("DAOS_RANK_GUARD_WRITE_DEADLINE", "10")),
-                min_bw=float(os.environ.get("DAOS_RANK_GUARD_MIN_BW", "50e6"))))
+                min_bw=float(os.environ.get("DAOS_RANK_GUARD_MIN_BW", "50e6")),
+                oclass=os.environ.get("DAOS_RANK_GUARD_OCLASS", "S1")))
             self._dfs = None
             self._addr = _raw_addr
             logger.info("DAOS: %s/%s through the rank guard (S1 buckets, "

@@ -503,8 +503,17 @@ class S1BucketStore:
                  oid_base: int = 1 << 40, deadline: float = 0.5,
                  breaker: Optional[Breaker] = None, sys: Optional[str] = None,
                  per_rank_eq: bool = True, slow_poll_secs: float = 0.05,
-                 write_deadline: float = 10.0, min_bw: float = 50e6):
+                 write_deadline: float = 10.0, min_bw: float = 50e6,
+                 oclass: str = "S1"):
         self.pool, self.cont, self.sys = pool, cont, sys
+        # S1: one shard per bucket, so a bucket lives on one rank and the
+        # breaker is per rank. Any other class (e.g. EC_2P1G1 on an rd_fac 1
+        # pool) spreads a bucket over several ranks: DAOS itself survives a
+        # dead rank there (degraded reads, rebuild), and the breaker becomes
+        # one for the whole pool (pseudo-rank 0) whose job is only to cut the
+        # stall right after a node stops (40-60 s at ~3.7 s per request with
+        # EC and no guard, lane A runs L-O).
+        self.oclass = oclass
         self.nbuckets = nbuckets
         self.oid_base = oid_base
         self.deadline = deadline
@@ -538,9 +547,10 @@ class S1BucketStore:
                                      ctypes.byref(coh), None, None), "daos_cont_open")
             d.daos_oclass_name2id.restype = ctypes.c_int
             d.daos_oclass_name2id.argtypes = [ctypes.c_char_p]
-            s1 = d.daos_oclass_name2id(b"S1")
+            s1 = d.daos_oclass_name2id(self.oclass.encode())
             if s1 <= 0:
-                raise RuntimeError("oclass S1 unknown to this libdaos")
+                raise RuntimeError("oclass %s unknown to this libdaos" % self.oclass)
+            single = self.oclass == "S1"
             d.daos_obj_layout_get.restype = ctypes.c_int
             d.daos_obj_layout_get.argtypes = [ob.DaosHandle, ob.DaosObjId,
                                               ctypes.POINTER(ctypes.c_void_p)]
@@ -554,13 +564,16 @@ class S1BucketStore:
                 oh = ob.DaosHandle()
                 ob._chk(d.daos_obj_open(coh, oid, ob.DAOS_OO_RW, ctypes.byref(oh), None),
                         "daos_obj_open")
-                lay = ctypes.c_void_p()
-                ob._chk(d.daos_obj_layout_get(coh, oid, ctypes.byref(lay)),
-                        "daos_obj_layout_get")
-                try:
-                    ranks.append(_first_rank(lay))
-                finally:
-                    d.daos_obj_layout_free(lay)
+                if single:
+                    lay = ctypes.c_void_p()
+                    ob._chk(d.daos_obj_layout_get(coh, oid, ctypes.byref(lay)),
+                            "daos_obj_layout_get")
+                    try:
+                        ranks.append(_first_rank(lay))
+                    finally:
+                        d.daos_obj_layout_free(lay)
+                else:
+                    ranks.append(0)           # one breaker for the pool
                 self._ohs.append(oh)
             self._poh, self._coh = poh, coh
             self.placement = BucketPlacement(self.nbuckets, lambda b: ranks[b])
@@ -569,8 +582,9 @@ class S1BucketStore:
             self.engine = DeadlineEngine(EventQueue(), self.breaker, rank_eqs=rank_eqs,
                                          slow_poll_secs=self.slow_poll_secs)
             self.ready.set()
-            logger.info("S1BucketStore ready: %d buckets over ranks %s",
-                        self.nbuckets, sorted(set(ranks)))
+            logger.info("S1BucketStore ready: %d %s buckets over ranks %s",
+                        self.nbuckets, self.oclass,
+                        sorted(set(ranks)) if single else "(pool-wide breaker)")
         except BaseException as e:            # surfaced through .error
             self.error = e
             logger.exception("S1BucketStore connect failed")
