@@ -60,6 +60,10 @@ unit:
     # not complete, fini of an uncompleted event is DER_BUSY). A zombie freed or
     # finalised early fails here instead of segfaulting on a real outage.
     - python3 tests/test_rank_guard.py
+    # The MP adapter's storage over the rank guard (GuardedKV), against a dict
+    # store: in particular that L1's buffers never reach DAOS, which is what
+    # keeps a request past its deadline from writing into another key's KV.
+    - python3 tests/test_guarded_kv.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
