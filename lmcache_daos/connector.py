@@ -46,8 +46,8 @@ from . import serde
 from . import serde_v3
 from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
-from .rank_guard import (CLOSED, CapacityIndex, Dropped, GuardedObj, Parked,
-                         S1BucketStore)
+from .rank_guard import (CLOSED, Breaker, CapacityIndex, Dropped, GuardedObj,
+                         Parked, S1BucketStore)
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -376,7 +376,11 @@ class DaosConnector(RemoteConnector):
                 deadline=float(os.environ.get("DAOS_RANK_GUARD_DEADLINE", "0.5")),
                 write_deadline=float(os.environ.get("DAOS_RANK_GUARD_WRITE_DEADLINE", "10")),
                 min_bw=float(os.environ.get("DAOS_RANK_GUARD_MIN_BW", "50e6")),
-                oclass=os.environ.get("DAOS_RANK_GUARD_OCLASS", "S1")))
+                oclass=os.environ.get("DAOS_RANK_GUARD_OCLASS", "S1"),
+                # the longest a rank (or, with EC buckets, the pool) stays open
+                # between probes; probe failures double the period up to it
+                breaker=Breaker(max_open_secs=float(
+                    os.environ.get("DAOS_RANK_GUARD_MAX_OPEN", "60")))))
             self._dfs = None
             self._addr = _raw_addr
             logger.info("DAOS: %s/%s through the rank guard (S1 buckets, "
