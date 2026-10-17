@@ -445,6 +445,7 @@ doc/              설계·검증 기록, 그림, 상류 제출 초안
 | [`doc/DESIGN-AND-VALIDATION.md`](doc/DESIGN-AND-VALIDATION.md) | **전체 기록** — 설계 근거, 실측 검증 결과, 운영 주의사항, 미해결 지점 |
 | [`deploy/README.md`](deploy/README.md) | 환경 재구성 가이드 + 측정 전 체크리스트 (모르면 결과가 조용히 무효가 된다) |
 | [`gpudirect/README.md`](gpudirect/README.md) | GPU-direct 스택의 패치와 검증 절차 |
+| [`doc/RANK-GUARD.md`](doc/RANK-GUARD.md) | rank 가드 — 저장 노드 재부팅 중 캐시가 멈추지 않게 하는 설정·풀 선택·상한 기준·실측 |
 | [`doc/MP-MODE-PLAN.md`](doc/MP-MODE-PLAN.md) | MP 모드 L2 어댑터 설계·결과 |
 | [`doc/MP-VS-HUB-BENCHMARK.md`](doc/MP-VS-HUB-BENCHMARK.md) | MP 모드 vs 기존 벤치마크 재측정 |
 | [`doc/lmcache-mp-l2-assessment.md`](doc/lmcache-mp-l2-assessment.md) | LMCache MP 모드 L2 어댑터 평가 |

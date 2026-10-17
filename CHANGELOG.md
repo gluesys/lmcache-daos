@@ -38,6 +38,15 @@ is doing real work.
   `guard_write_deadline`, `guard_min_bw` tune it. Measured with the MP server
   and vLLM on the same lane: same outcome as in-process (no failed request,
   outage TTFT below recompute, hits back within a minute of the rejoin).
+- The rank guard on an EC pool: `DAOS_RANK_GUARD_OCLASS=EC_2P1G1` makes the
+  buckets EC objects. A bucket then spans three ranks, so the breaker covers
+  the whole pool; DAOS itself serves degraded reads and rebuilds, and the guard
+  bounds each request. On lane A (3 nodes, one powered off for 240 s) this
+  turned EC's post-stop window -- about 45 s at 3.7 s per request without the
+  guard -- into about 80-90 s of recompute-speed misses (0.78 s), with hits
+  kept for the rest of the outage (p50 0.18 s) and no failed request. The
+  window's length is DAOS's own degraded recovery time; a shorter breaker
+  period (`DAOS_RANK_GUARD_MAX_OPEN`, default 60 s) did not change it.
 - Eviction for the rank guard. In-process: `DAOS_RANK_GUARD_CAPACITY_GB` keeps
   an approximate LRU per process (`rank_guard.CapacityIndex`), rebuilt at
   start-up from each bucket's dkeys (`daos_obj_list_dkey`, deadline-bound) and
