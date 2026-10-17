@@ -38,6 +38,17 @@ is doing real work.
   `guard_write_deadline`, `guard_min_bw` tune it. Measured with the MP server
   and vLLM on the same lane: same outcome as in-process (no failed request,
   outage TTFT below recompute, hits back within a minute of the rejoin).
+- Eviction for the rank guard. In-process: `DAOS_RANK_GUARD_CAPACITY_GB` keeps
+  an approximate LRU per process (`rank_guard.CapacityIndex`), rebuilt at
+  start-up from each bucket's dkeys (`daos_obj_list_dkey`, deadline-bound) and
+  their committed payload lengths. A `daos-evict` thread punches the oldest
+  dkeys and passes over keys on a rank whose breaker is open. MP mode uses
+  LMCache's L2 eviction (`max_capacity_gb` + `eviction`), which reaches
+  `GuardedKV.remove`. Sizing: physical use ran 2.5-3x the logical cap, and
+  while any rank of an rd_fac 0 `self_heal:none` pool is down, VOS aggregation
+  and GC stop on every live rank (measured with `daos_metrics`), so nothing
+  punched or overwritten is reclaimed until it rejoins. Start at a third of
+  the pool or less, plus the outage's write volume.
 - `DAOS_OBJ_CLASS` names the object class of the raw-path object (for example
   `EC_2P1GX`); a non-POSIX container has no default class property.
 - `tests/vllm_reboot_ttft.py`, `tests/rank_guard_outage.py`,

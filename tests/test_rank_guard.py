@@ -579,6 +579,32 @@ def unreachable_zombie_keeps_breaker_open():
     eng.close()
 
 
+def capacity_index_lru():
+    c = G.CapacityIndex(100, low_water=0.5)
+    for i in range(5):
+        c.add(b"k%d" % i, 20)                  # 100: at capacity, not over
+    ck("cap: at capacity offers nothing", c.victims() == [] and c.total == 100)
+    c.touch(b"k0")                             # k0 becomes youngest
+    c.add(b"k5", 20)                           # 120 > 100: evict down to 50
+    v = c.victims()
+    ck("cap: oldest first, touched key spared", v == [b"k1", b"k2", b"k3", b"k4"], "(%r)" % v)
+    for k in v:
+        c.discard(k)
+    ck("cap: total after discards", c.total == 40 and len(c) == 2, "(%d)" % c.total)
+    c.add(b"k5", 30)                           # re-add replaces the size
+    ck("cap: re-add replaces, not doubles", c.total == 50, "(%d)" % c.total)
+
+
+def capacity_index_startup_and_skip():
+    c = G.CapacityIndex(100, low_water=0.5)
+    c.add(b"new", 60)
+    c.add_old(b"old", 60)                      # found at start-up: oldest
+    c.add_old(b"new", 99)                      # known to this process: kept as is
+    ck("cap: start-up keys go in oldest, known keys untouched",
+       c.total == 120 and c.victims()[0] == b"old", "(%r %d)" % (c.victims(), c.total))
+    ck("cap: skipped keys are passed over", c.victims(skip={b"old"}) == [b"new"])
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -592,7 +618,8 @@ def main():
               guarded_obj_parks_the_destination, guarded_obj_skip_keeps_ownership,
               guarded_obj_writes_raise_dropped, guarded_obj_surfaces_connect_error,
               reap_callback_failure_keeps_poller, op_deadline_scales_with_bytes,
-              answered_zombie_closes_breaker, unreachable_zombie_keeps_breaker_open):
+              answered_zombie_closes_breaker, unreachable_zombie_keeps_breaker_open,
+              capacity_index_lru, capacity_index_startup_and_skip):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)
