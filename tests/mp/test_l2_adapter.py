@@ -209,6 +209,33 @@ def test_idempotent_store_and_size_check():
     ad.close()
 
 
+
+def test_lookup_with_group_layout_dict():
+    """LMCache 0.5.5 passes ``{object_group_id: MemoryLayoutDesc}``: each key is
+    checked against its own group's size, and a group the dict does not name is
+    not size-checked at lookup (the load still checks the length)."""
+    ad, dfs = make()
+    n = 1024
+    a = ObjectKey(chunk_hash=b"\x01" * 32, model_name="m", kv_rank=0,
+                  object_group_id=0, cache_salt="")
+    b = ObjectKey(chunk_hash=b"\x02" * 32, model_name="m", kv_rank=0,
+                  object_group_id=1, cache_salt="")
+    c = ObjectKey(chunk_hash=b"\x03" * 32, model_name="m", kv_rank=0,
+                  object_group_id=2, cache_salt="")
+    tid = ad.submit_store_task([a, b, c], [FakeObj(n, b"a" * n), FakeObj(n, b"b" * n),
+                                           FakeObj(n, b"c" * n)])
+    wait_fd(ad.get_store_event_fd())
+    ad.pop_completed_store_tasks()
+    right = MemoryLayoutDesc(shapes=[torch.Size([n])], dtypes=[torch.uint8])
+    wrong = MemoryLayoutDesc(shapes=[torch.Size([n * 2])], dtypes=[torch.uint8])
+    tid = ad.submit_lookup_and_lock_task([a, b, c], {0: right, 1: wrong})
+    bm = wait_result(ad.query_lookup_and_lock_result, tid, ad.get_lookup_and_lock_event_fd())
+    assert bm.test(0), "group 0 has the right size"
+    assert not bm.test(1), "group 1's layout says 2x: a miss"
+    assert bm.test(2), "group 2 is not in the dict: not size-checked at lookup"
+    ad.close()
+
+
 def test_concurrent_tasks_complete_once_each():
     ad, _ = make()
     n = 1024

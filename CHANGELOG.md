@@ -29,6 +29,15 @@ is doing real work.
   Measured on a 3-node IB lane with vLLM + LMCache, one node powered off for
   240 s: no failed request, TTFT during the outage at or below recompute, hits
   back 6 s after the rank rejoins. Prototype: no MP-mode wiring yet.
+- The rank guard in MP mode: `"rank_guard": true` in the `--l2-adapter` JSON
+  stores keys through `lmcache_daos/mp/guarded_kv.py` instead of DFS (one dkey
+  per key, payload then length as the commit record). Loads and stores go
+  through a private buffer, because L1 reuses its buffers as soon as a task
+  reports back and a request past its deadline still writes or reads its
+  buffer when the rank returns. `guard_buckets`, `guard_deadline`,
+  `guard_write_deadline`, `guard_min_bw` tune it. Measured with the MP server
+  and vLLM on the same lane: same outcome as in-process (no failed request,
+  outage TTFT below recompute, hits back within a minute of the rejoin).
 - `DAOS_OBJ_CLASS` names the object class of the raw-path object (for example
   `EC_2P1GX`); a non-POSIX container has no default class property.
 - `tests/vllm_reboot_ttft.py`, `tests/rank_guard_outage.py`,
@@ -41,6 +50,14 @@ is doing real work.
   Setting both `remote_url` and `remote_storage_plugins`, which was the only
   way before, makes LMCache 0.5.5 build two RemoteBackends on the same
   container -- every chunk stored twice, two connectors.
+- The MP L2 adapter loads on LMCache 0.5.5. It was written against 0.5.2 and
+  failed at import on the 0.5.5 image: `Bitmap` moved from
+  `lmcache.native_storage_ops` to `lmcache.lmcache_native`, and the second
+  argument of `submit_lookup_and_lock_task` became `group_layout_descs`, a
+  dict `object_group_id -> MemoryLayoutDesc`, where a single layout used to
+  be. Given a dict, the size check had silently switched off; now each key is
+  checked against its own group's size. Both versions are accepted.
+
 
 ### Removed
 
