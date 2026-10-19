@@ -5,8 +5,8 @@
 
 `DAOS_RANK_GUARD=1` 로 켜는 raw 객체 경로의 장애 격리 계층이다. 이 문서는
 운영자가 알아야 할 것만 적는다. 왜 이런 모양인지는 `lmcache_daos/rank_guard.py`
-머리말과 FlexA Hub `1f09478a` §2.1~§2.9 에, 실험 원자료는
-`daos-reboot-repro/FINDINGS.md`(10-13~10-17, 레인 A) 에 있다.
+머리말과 FlexA Hub `1f09478a` §2.1~§2.9 에 있다. 아래 실측을 다시 내는 시험
+스크립트는 `bench/reboot/` 에 있다.
 
 ## 1. 무엇을 해결하나
 

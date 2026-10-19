@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+# dmg for the reboot test (setup.sh admin). daos-control is the ConfigMap daos-operator writes.
+apiVersion: v1
+kind: Pod
+metadata: {name: ${ADMIN_POD}, namespace: ${NS}}
+spec:
+  nodeName: ${GPU_NODE}
+  hostNetwork: true
+  containers:
+    - name: dmg
+      image: ${ADMIN_IMAGE}
+      command: [sleep, infinity]
+      resources: {requests: {cpu: 250m}}
+      volumeMounts: [{name: control, mountPath: /etc/daos/daos_control.yml, subPath: daos_control.yml, readOnly: true}]
+  volumes: [{name: control, configMap: {name: daos-control}}]
