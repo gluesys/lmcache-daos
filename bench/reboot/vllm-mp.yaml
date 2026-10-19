@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Gluesys Co., Ltd.
+# MP mode with the rank guard: one container runs the LMCache MP cache server (L1 0.5 GB, L2 = DAOS
+# adapter with "rank_guard": true on ${POOL}/${CONT}) and vLLM with DaosMPConnector. Code from
+# /opt/lmcd on the GPU node. Set VLLM_POD=vllm-mp. The rest as vllm-guard.yaml.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: nvidia}
+handler: nvidia
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${VLLM_POD}
+  namespace: ${NS}
+spec:
+  nodeName: ${GPU_NODE}
+  runtimeClassName: nvidia
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  initContainers:
+    - name: agent
+      image: ${AGENT_IMAGE}
+      restartPolicy: Always
+      securityContext: {privileged: true}
+      volumeMounts:
+        - {name: agentcfg, mountPath: /etc/daos/daos_agent.yml, subPath: daos_agent.yml, readOnly: true}
+        - {name: agentsock, mountPath: /var/run/daos_agent}
+        - {name: dev, mountPath: /dev}
+  containers:
+    - name: vllm
+      image: ${VLLM_IMAGE}
+      command: ["sh", "-c"]
+      args:
+        - |
+          python3.12 -m lmcache_daos.mp.server --host 127.0.0.1 --port 5555 \
+            --chunk-size 256 --l1-size-gb 0.5 --eviction-policy LRU \
+            --l2-adapter '{"type":"daos","pool":"${POOL}","container":"${CONT}","sys":"${DAOS_SYS}","rank_guard":true,"status_interval_s":30}' &
+          sleep 20
+          exec python3.12 -m vllm.entrypoints.openai.api_server \
+            --model=/data/hf_cache/qwen2.5-1.5b-instruct --served-model-name=qwen \
+            --host=0.0.0.0 --port=8100 --dtype=bfloat16 --max-model-len=16384 \
+            --gpu-memory-utilization=0.85 --no-enable-prefix-caching \
+            --kv-transfer-config='{"kv_connector":"DaosMPConnector","kv_connector_module_path":"lmcache_daos.mp.vllm_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555}}'
+      env:
+        - {name: DAOS_AGENT_DRPC_DIR, value: /var/run/daos_agent}
+        - {name: PYTHONHASHSEED, value: "0"}
+        - {name: VLLM_USE_FLASHINFER_SAMPLER, value: "0"}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: PYTHONPATH, value: /opt/lmcd}
+        - {name: NVIDIA_VISIBLE_DEVICES, value: all}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+      securityContext: {privileged: true}
+      volumeMounts:
+        - {name: agentsock, mountPath: /var/run/daos_agent}
+        - {name: model, mountPath: /data/hf_cache, readOnly: true}
+        - {name: lmcd, mountPath: /opt/lmcd, readOnly: true}
+        - {name: shm, mountPath: /dev/shm}
+        - {name: ib, mountPath: /dev/infiniband}
+  volumes:
+    - {name: agentcfg, configMap: {name: daos-agent}}
+    - {name: agentsock, emptyDir: {}}
+    - {name: dev, hostPath: {path: /dev, type: Directory}}
+    - {name: model, hostPath: {path: ${MODEL_DIR}, type: Directory}}
+    - {name: lmcd, hostPath: {path: /opt/lmcd, type: Directory}}
+    - {name: shm, emptyDir: {medium: Memory, sizeLimit: 4Gi}}
+    - {name: ib, hostPath: {path: /dev/infiniband, type: Directory}}

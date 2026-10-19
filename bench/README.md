@@ -49,6 +49,11 @@ podman exec -e ARM=daos-c7 -e POPULATE=0 -e NDOC=149 -e DOCTOK=4096 \
 크로스노드 히트에는 모델경로·`served-model-name`·`chunk_size`·TP·`PYTHONHASHSEED`·
 MML/YaRN factor 가 노드 간 완전히 일치해야 한다(`../deploy/README.md` §7).
 
+## 저장 노드 재부팅 시험
+
+`reboot/` — vLLM 이 DAOS 를 KV 캐시로 쓰는 동안 저장 노드 전원을 끊었다 켜서 rank 가드를
+재는 스크립트. Kubernetes(daos-operator) 위에서 돈다. `reboot/README.md` 참조.
+
 ## 초기 탐색용 (역사적 기록)
 
 `bench2.py` `bench_conc.py` `bench_daos.py` `bench_final.py` `bench_fresh.py`

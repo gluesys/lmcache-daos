@@ -13,6 +13,11 @@ is doing real work.
 
 ### Added
 
+- `bench/reboot/`: the storage-node reboot test behind `doc/RANK-GUARD.md` §5 --
+  vLLM TTFT while a node is powered off (`reboot.sh`), VOS aggregation on the
+  live ranks during the outage (`agg.sh`), reintegration under load
+  (`reint.sh`). Site values (GPU node, images, power commands) come from the
+  environment (`env.sh`).
 - Rank guard for the object path (`DAOS_RANK_GUARD=1`, `lmcache_daos/rank_guard.py`),
   for an rd_fac 0, `self_heal:none` pool where a rebooting storage node should
   cost its share of the cache as misses instead of stalling every request.
