@@ -67,7 +67,7 @@ from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_facto
 from lmcache.v1.platform import create_event_notifier
 
 from ..dfs_binding import DaosError, DfsSys, warm_up_all_targets
-from ..rank_guard import S1BucketStore
+from ..rank_guard import Breaker, S1BucketStore
 from .guarded_kv import GuardedKV
 
 logger = init_logger(__name__)
@@ -269,12 +269,18 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("daos: 'rank_guard' must be a boolean")
         guard = {}
         for k, typ in (("buckets", int), ("deadline", (int, float)),
-                       ("write_deadline", (int, float)), ("min_bw", (int, float))):
+                       ("write_deadline", (int, float)), ("min_bw", (int, float)),
+                       ("max_open", (int, float))):
             if "guard_" + k in d:
                 v = d["guard_" + k]
                 if not isinstance(v, typ) or isinstance(v, bool) or v <= 0:
                     raise ValueError("daos: 'guard_%s' must be a positive number" % k)
                 guard[k] = v
+        if "guard_oclass" in d:
+            v = d["guard_oclass"]
+            if not isinstance(v, str) or not v:
+                raise ValueError("daos: 'guard_oclass' must be a non-empty string")
+            guard["oclass"] = v
         cfg = cls(
             pool=pool,
             container=container,
@@ -324,7 +330,11 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "rd_fac 0 self_heal:none pool where a rebooting node should cost "
             "misses, not stalls. The container must be non-POSIX (optional, "
             "default false). guard_buckets / guard_deadline / "
-            "guard_write_deadline / guard_min_bw tune it (see rank_guard.py)\n"
+            "guard_write_deadline / guard_min_bw tune it (see rank_guard.py). "
+            "guard_oclass (default S1) picks the buckets' object class: any other "
+            "class (e.g. EC_2P1G1 on an rd_fac 1 pool) spreads a bucket over "
+            "ranks and the breaker covers the whole pool. guard_max_open "
+            "(default 60 s) is the longest a breaker stays open between probes\n"
             "- eviction / persist_enabled / serde: common L2 options"
         )
 
@@ -358,7 +368,9 @@ class DaosL2Adapter(L2AdapterInterface):
                     config.pool, config.container, sys=config.sys,
                     nbuckets=g.get("buckets", 64), deadline=g.get("deadline", 0.5),
                     write_deadline=g.get("write_deadline", 10.0),
-                    min_bw=g.get("min_bw", 50e6)))
+                    min_bw=g.get("min_bw", 50e6),
+                    oclass=g.get("oclass", "S1"),
+                    breaker=Breaker(max_open_secs=g.get("max_open", 60.0))))
         factory = dfs_factory or (
             lambda: DfsSys(pool=config.pool, cont=config.container, sys=config.sys)
         )

@@ -35,7 +35,7 @@ spec:
         - |
           python3.12 -m lmcache_daos.mp.server --host 127.0.0.1 --port 5555 \
             --chunk-size 256 --l1-size-gb 0.5 --eviction-policy LRU \
-            --l2-adapter '{"type":"daos","pool":"${POOL}","container":"${CONT}","sys":"${DAOS_SYS}","rank_guard":true,"status_interval_s":30}' &
+            --l2-adapter '{"type":"daos","pool":"${POOL}","container":"${CONT}","sys":"${DAOS_SYS}","rank_guard":true,"guard_oclass":"${GUARD_OCLASS}","status_interval_s":30}' &
           sleep 20
           exec python3.12 -m vllm.entrypoints.openai.api_server \
             --model=/data/hf_cache/qwen2.5-1.5b-instruct --served-model-name=qwen \

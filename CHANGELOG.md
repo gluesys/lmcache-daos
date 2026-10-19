@@ -74,6 +74,11 @@ is doing real work.
 
 ### Fixed
 
+- MP mode could not use EC buckets: `DaosL2Adapter` passed the guard no
+  object class or breaker cap, so it was always S1 with a 60 s cap. New
+  `--l2-adapter` keys `guard_oclass` and `guard_max_open` match
+  `DAOS_RANK_GUARD_OCLASS` / `DAOS_RANK_GUARD_MAX_OPEN`; `bench/reboot`'s MP
+  manifest passes `GUARD_OCLASS`.
 - MP mode: the rank guard's log lines (store ready, breaker transitions,
   zombie reaps) were dropped -- `DaosL2Adapter` did not route the
   `lmcache_daos.rank_guard` logger to LMCache's handler as `DaosConnector`

@@ -62,7 +62,9 @@ vLLM 은 `--kv-transfer-config` 에 `"kv_load_failure_policy":"recompute"` 를 �
 컨테이너는 비 POSIX(`daos cont create <pool> <cont>`, 타입 지정 없음). 풀은
 daos-operator 의 `spec.profile: kvcache` 로 만들면 아래 조건이 맞춰진다.
 
-MP 모드는 `--l2-adapter` JSON 에 `"rank_guard": true` 와 `guard_*` 를 쓴다.
+MP 모드는 `--l2-adapter` JSON 에 `"rank_guard": true` 와 `guard_*` 를 쓴다. 위 환경변수와
+1:1 이다: `guard_oclass`, `guard_buckets`, `guard_deadline`, `guard_write_deadline`,
+`guard_min_bw`, `guard_max_open`. 용량은 `max_capacity_gb` 가 맡는다.
 LMCache 의 L2 축출(`max_capacity_gb` + `eviction`)이 가드의 삭제 경로를 부른다.
 
 ## 3. 풀 두 가지와 고르는 기준
