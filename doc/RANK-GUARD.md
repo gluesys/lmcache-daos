@@ -71,7 +71,7 @@ LMCache 의 L2 축출(`max_capacity_gb` + `eviction`)이 가드의 삭제 경로
 |---|---|---|
 | 노드 240 s 정지 중 | 그 노드 블록은 miss(TTFT ≈ 재계산 0.66 s), 최악 1.3 s | hit 유지(p50 0.18 s). 정지 직후 80~90 s 는 재계산 수준 miss |
 | 복귀 | Joined 6 s 뒤 바로 hit | DAOS 가 rebuild(약 2 분) 뒤 `dmg pool reintegrate` 필요 |
-| 장애 중 새 pool connect | 불가(rank 복귀까지) | 가능 |
+| 장애 중 새 pool connect | 불가(rank 복귀까지). 가드가 접속을 백그라운드로 돌려 vLLM 은 정상 시간에 기동하고, 복귀 약 7 s 뒤 캐시가 켜진다(그 전엔 전부 miss) | 가능 |
 | 장애 중 공간 회수 | **멈춤**(아래 4절) | 계속 |
 | 공간 | 1 배 | 1.5 배 + rebuild 여유 |
 | 노드 | 제한 없음 | 3 개 이상 |

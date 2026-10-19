@@ -24,7 +24,9 @@ LMCD=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)   # this checkout; copi
 D() { timeout 60 kubectl exec -n $NS $ADMIN_POD -- dmg -o /etc/daos/daos_control.yml "$@" 2>&1; }
 # the daos CLI in the CSI node pod on the GPU node (it has an agent)
 X() {
-  local p=$(kubectl get pod -n $NS -o wide --no-headers | awk -v n=$GPU_NODE '/^daos-csi-node-/ && $7==n {print $1}')
+  # by field name: -o wide shifts its columns when RESTARTS reads "1 (5m ago)"
+  local p=$(kubectl get pod -n $NS --no-headers -o custom-columns=N:.metadata.name,H:.spec.nodeName |
+            awk -v n=$GPU_NODE '/^daos-csi-node-/ && $2==n {print $1}')
   timeout ${XT:-60} kubectl exec -n $NS $p -c daos-csi -- sh -c "$1" 2>&1
 }
 # power a storage node off / on: POWER_OFF and POWER_ON are commands with %s for the node id,
