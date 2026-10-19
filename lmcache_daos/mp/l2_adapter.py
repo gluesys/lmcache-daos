@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import logging
 import os
 import math
 import threading
@@ -340,6 +341,17 @@ class DaosL2Adapter(L2AdapterInterface):
         self._verify_size = config.verify_size
 
         if dfs_factory is None and config.rank_guard:
+            # As in DaosConnector: rank_guard logs breaker transitions, zombie
+            # reaps and "S1BucketStore ready" (the cache coming on after a
+            # start-up during an outage) on a stdlib logger with no handler,
+            # where INFO is dropped. Send them where this module's lines go.
+            rg_log = logging.getLogger("lmcache_daos.rank_guard")
+            if not rg_log.handlers and logger.handlers:
+                for h in logger.handlers:
+                    rg_log.addHandler(h)
+                rg_log.setLevel(logging.INFO)
+                rg_log.propagate = False
+
             def dfs_factory():
                 g = config.guard
                 return GuardedKV(S1BucketStore(

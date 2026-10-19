@@ -54,6 +54,7 @@ bench/reboot/reboot.sh out/k1 <rank> <노드 id>   # 약 15 분
 |---|---|---|
 | `reboot.sh <out> <rank> <노드 id>` | 예열 60 s 뒤 전원 차단, 240 s(`DOWN_SECS`) 뒤 전원 투입, Joined 까지 감시 | `ttft.txt`, `states.log`, `v.log` |
 | `agg.sh <out> <풀> <rank> <노드 id>` | 같은 장애 동안 살아 있는 rank 의 VOS aggregation·GC 카운터(`daos_metrics`) | `agg.log` |
+| `restart.sh <out> <rank> <노드 id>` | 노드를 끈 상태에서 vLLM 을 새로 띄워 기동 시간을 재고, 복귀 뒤 캐시가 스스로 켜지는지 본다 | `ttft.txt`, `states.log`, `v.log` |
 | `reint.sh <out> <풀> <rank>` | rd_fac 1 이상 풀에서 제외된 rank 를 부하 중에 재편입하고 rebuild 를 기록 | `ttft.txt` |
 
 `ttft.txt` 는 `tests/vllm_reboot_ttft.py` 의 출력이다. 반복 요청(hit 대상)과 새 요청
@@ -65,6 +66,8 @@ bench/reboot/reboot.sh out/k1 <rank> <노드 id>   # 약 15 분
 - 실패 요청 수(`ttft.txt` 끝의 오류 수)는 0 이어야 한다.
 - 장애 중 반복 요청의 p50 이 새 요청(재계산)보다 크지 않아야 한다.
 - rd_fac 0 풀은 rank 가 Joined 된 뒤 수 초 안에 hit 가 돌아와야 한다.
+- `restart.sh`: vLLM 기동 시간이 정상 때와 같아야 하고, rank 가 Joined 된 뒤 수 초 안에
+  `S1BucketStore ready` 가 로그에 나와야 한다. 그 전까지는 모든 요청이 miss 다.
 - EC 풀은 장애 직후 60~90 s 동안 재계산 수준 miss 가 나온다. DAOS 가 degraded 로
   다시 빨라지는 시간이며, breaker 상한을 줄여도 짧아지지 않는다.
 - `self_heal:none` 풀은 rank 가 내려가 있는 동안 살아 있는 rank 의 aggregation·GC 도

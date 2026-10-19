@@ -18,6 +18,10 @@ is doing real work.
   live ranks during the outage (`agg.sh`), reintegration under load
   (`reint.sh`). Site values (GPU node, images, power commands) come from the
   environment (`env.sh`).
+- `bench/reboot/restart.sh`: vLLM started while a storage node is down. On
+  lane A (in-process and MP, an ordinary rank and the MS leader) vLLM came up
+  in its usual time, every request was a miss at recompute cost until the
+  rank was back, and the cache came on by itself ~7 s after it was Joined.
 - Rank guard for the object path (`DAOS_RANK_GUARD=1`, `lmcache_daos/rank_guard.py`),
   for an rd_fac 0, `self_heal:none` pool where a rebooting storage node should
   cost its share of the cache as misses instead of stalling every request.
@@ -70,6 +74,12 @@ is doing real work.
 
 ### Fixed
 
+- MP mode: the rank guard's log lines (store ready, breaker transitions,
+  zombie reaps) were dropped -- `DaosL2Adapter` did not route the
+  `lmcache_daos.rank_guard` logger to LMCache's handler as `DaosConnector`
+  does.
+- `bench/reboot/env.sh`: the CSI node pod lookup read `kubectl -o wide`
+  columns, which shift once the pod has restarted; now by field name.
 - The plugin route alone now reaches the connector: with `remote_url` unset,
   the target is read from `extra_config` `remote_storage_plugin.daos.url`.
   Setting both `remote_url` and `remote_storage_plugins`, which was the only
