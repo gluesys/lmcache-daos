@@ -423,6 +423,75 @@ class BucketPlacement:
             r = self._rank[bucket] = self._resolve(bucket)
         return r
 
+    def alt(self, dkey: bytes) -> Optional[int]:
+        """The key's relocation bucket: the first of a salted hash sequence
+        that sits on another rank than its home bucket, or None when every
+        bucket is on that rank. Depends only on the key and the layout, so
+        every process opening the container computes the same one."""
+        r0 = self.rank(self.bucket(dkey))
+        for i in range(1, 8 * self.nbuckets):
+            h = hashlib.blake2b(dkey + b"\x00alt" + i.to_bytes(4, "little"),
+                                digest_size=8).digest()
+            b = int.from_bytes(h, "little") % self.nbuckets
+            if self.rank(b) != r0:
+                return b
+        return None
+
+
+class Relocator:
+    """Relocation of keys whose home rank is down (doc/RANK-GUARD-RELOCATION.md).
+
+    A write whose home bucket's rank is not closed goes to the key's
+    relocation bucket instead (:meth:`BucketPlacement.alt`, another rank). A
+    read tries home first and the relocation bucket on a miss -- during the
+    outage and after it, since keys written meanwhile are only there. Keys are
+    content hashes, so whichever copy is read holds the same bytes.
+
+    ``do(bucket)`` runs the op on one bucket: for fetch it returns ``(rc,
+    got)``, for update and punch an rc. Only for S1 buckets on a
+    ``self_heal:none`` pool, where a bucket never moves.
+    """
+
+    def __init__(self, placement: BucketPlacement, breaker: Breaker):
+        self.placement, self.breaker = placement, breaker
+        self.relocated_writes = 0
+        self.alt_hits = 0
+
+    def fetch(self, dkey: bytes, do: Callable[[int], tuple]):
+        rc, got = do(self.placement.bucket(dkey))
+        if rc == 0 and got and any(got):
+            return rc, got
+        if rc == DEADLINE:
+            return rc, got      # the destination now belongs to a zombie
+        b1 = self.placement.alt(dkey)
+        if b1 is None:
+            return rc, got
+        rc1, got1 = do(b1)
+        if rc1 == 0 and got1 and any(got1):
+            self.alt_hits += 1
+            return rc1, got1
+        if rc1 == DEADLINE or rc != 0:
+            return rc1, got1
+        return rc, got
+
+    def update(self, dkey: bytes, do: Callable[[int], int]):
+        b0 = self.placement.bucket(dkey)
+        if self.breaker.state(self.placement.rank(b0)) != CLOSED:
+            b1 = self.placement.alt(dkey)
+            if b1 is not None:
+                self.relocated_writes += 1
+                return do(b1)
+        return do(b0)
+
+    def punch(self, dkey: bytes, do: Callable[[int], int]):
+        """Both copies: where a key lives is not recorded. Success if either
+        went; a copy on a rank that was down stays until a later punch or
+        the next start-up scan finds it."""
+        rc = do(self.placement.bucket(dkey))
+        b1 = self.placement.alt(dkey)
+        rc1 = do(b1) if b1 is not None else rc
+        return 0 if 0 in (rc, rc1) else rc
+
 
 # ---- real backend -----------------------------------------------------------
 class _ShardLoc(ctypes.Structure):
@@ -504,8 +573,12 @@ class S1BucketStore:
                  breaker: Optional[Breaker] = None, sys: Optional[str] = None,
                  per_rank_eq: bool = True, slow_poll_secs: float = 0.05,
                  write_deadline: float = 10.0, min_bw: float = 50e6,
-                 oclass: str = "S1"):
+                 oclass: str = "S1", relocate: bool = False):
         self.pool, self.cont, self.sys = pool, cont, sys
+        # relocate: write keys whose home rank is down to another rank's
+        # bucket and read them back from there (Relocator). S1 only.
+        self.relocate = relocate
+        self.relocator: Optional[Relocator] = None
         # S1: one shard per bucket, so a bucket lives on one rank and the
         # breaker is per rank. Any other class (e.g. EC_2P1G1 on an rd_fac 1
         # pool) spreads a bucket over several ranks: DAOS itself survives a
@@ -581,19 +654,33 @@ class S1BucketStore:
                         if self.per_rank_eq else None)
             self.engine = DeadlineEngine(EventQueue(), self.breaker, rank_eqs=rank_eqs,
                                          slow_poll_secs=self.slow_poll_secs)
+            if self.relocate and single and len(set(ranks)) > 1:
+                self.relocator = Relocator(self.placement, self.breaker)
             self.ready.set()
-            logger.info("S1BucketStore ready: %d %s buckets over ranks %s",
+            logger.info("S1BucketStore ready: %d %s buckets over ranks %s%s",
                         self.nbuckets, self.oclass,
-                        sorted(set(ranks)) if single else "(pool-wide breaker)")
+                        sorted(set(ranks)) if single else "(pool-wide breaker)",
+                        ", relocation on" if self.relocator else "")
         except BaseException as e:            # surfaced through .error
             self.error = e
             logger.exception("S1BucketStore connect failed")
 
     def _op(self, dkey: bytes, items, single: bool, fetch: bool, on_reap=None):
-        from . import obj_binding as ob
         if not self.ready.is_set():
             return NOT_READY, None
-        b = self.placement.bucket(dkey)
+        rl = self.relocator
+        if rl is None:
+            return self._bucket_op(self.placement.bucket(dkey), dkey, items, single,
+                                   fetch, on_reap)
+        if fetch:
+            return rl.fetch(dkey, lambda b: self._bucket_op(b, dkey, items, single,
+                                                             True, on_reap))
+        return rl.update(dkey, lambda b: self._bucket_op(b, dkey, items, single,
+                                                          False)[0]), None
+
+    def _bucket_op(self, b: int, dkey: bytes, items, single: bool, fetch: bool,
+                   on_reap=None):
+        from . import obj_binding as ob
         rank = self.placement.rank(b)
         oh = self._ohs[b]
         dk_iov, dk_buf = ob.build_key(dkey)
@@ -634,10 +721,14 @@ class S1BucketStore:
         """Remove a dkey, or only the named akeys under it. Returns rc. An
         aborted punch still lands when the rank returns; for a cache that is
         a late eviction."""
-        from . import obj_binding as ob
         if not self.ready.is_set():
             return NOT_READY
-        b = self.placement.bucket(dkey)
+        if self.relocator is not None:
+            return self.relocator.punch(dkey, lambda b: self._bucket_punch(b, dkey, akeys))
+        return self._bucket_punch(self.placement.bucket(dkey), dkey, akeys)
+
+    def _bucket_punch(self, b: int, dkey: bytes, akeys: Optional[Sequence[bytes]]):
+        from . import obj_binding as ob
         oh = self._ohs[b]
         dk_iov, dk_buf = ob.build_key(dkey)
         keep = [dk_iov, dk_buf]
@@ -718,8 +809,11 @@ class S1BucketStore:
 
     def snapshot(self) -> dict:
         eng = self.engine
+        rl = self.relocator
         return {"ready": self.ready.is_set(), "ranks": self.breaker.snapshot(),
                 "stats": dict(eng.stats) if eng else {},
+                "relocation": ({"writes": rl.relocated_writes, "alt_hits": rl.alt_hits}
+                               if rl else None),
                 "zombies": eng.zombies() if eng else 0,
                 "poll_max": eng.poll_max() if eng else {}}
 

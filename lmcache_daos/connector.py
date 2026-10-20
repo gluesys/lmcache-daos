@@ -377,6 +377,9 @@ class DaosConnector(RemoteConnector):
                 write_deadline=float(os.environ.get("DAOS_RANK_GUARD_WRITE_DEADLINE", "10")),
                 min_bw=float(os.environ.get("DAOS_RANK_GUARD_MIN_BW", "50e6")),
                 oclass=os.environ.get("DAOS_RANK_GUARD_OCLASS", "S1"),
+                # keys whose home rank is down go to another rank's bucket
+                # (doc/RANK-GUARD-RELOCATION.md); S1 buckets only
+                relocate=os.environ.get("DAOS_RANK_GUARD_RELOCATE") == "1",
                 # the longest a rank (or, with EC buckets, the pool) stays open
                 # between probes; probe failures double the period up to it
                 breaker=Breaker(max_open_secs=float(

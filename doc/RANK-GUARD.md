@@ -41,6 +41,7 @@ DAOS_RANK_GUARD_DEADLINE=0.5       # 읽기 base(s)
 DAOS_RANK_GUARD_WRITE_DEADLINE=10  # 쓰기·punch base(s)
 DAOS_RANK_GUARD_MIN_BW=50e6        # 기한에 더할 크기/대역폭(B/s)
 DAOS_RANK_GUARD_MAX_OPEN=60        # breaker 열림 상한(s)
+DAOS_RANK_GUARD_RELOCATE=0         # 1: 기본 rank 가 열린 키를 다른 rank 버킷에(S1 만, RANK-GUARD-RELOCATION.md)
 ```
 
 LMCache 설정은 **플러그인 경로만** 쓴다. `remote_url` 과 `remote_storage_plugins`
@@ -64,7 +65,7 @@ daos-operator 의 `spec.profile: kvcache` 로 만들면 아래 조건이 맞춰�
 
 MP 모드는 `--l2-adapter` JSON 에 `"rank_guard": true` 와 `guard_*` 를 쓴다. 위 환경변수와
 1:1 이다: `guard_oclass`, `guard_buckets`, `guard_deadline`, `guard_write_deadline`,
-`guard_min_bw`, `guard_max_open`. 용량은 `max_capacity_gb` 가 맡는다.
+`guard_min_bw`, `guard_max_open`, `guard_relocate`. 용량은 `max_capacity_gb` 가 맡는다.
 LMCache 의 L2 축출(`max_capacity_gb` + `eviction`)이 가드의 삭제 경로를 부른다.
 
 ## 3. 풀 두 가지와 고르는 기준

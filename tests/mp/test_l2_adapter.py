@@ -375,9 +375,10 @@ def test_guard_oclass_and_max_open_reach_the_store():
     real = l2.S1BucketStore
     l2.S1BucketStore = fake_store
     try:
-        for extra, oclass, max_open in (
-                ({}, "S1", 60.0),
-                ({"guard_oclass": "EC_2P1G1", "guard_max_open": 20}, "EC_2P1G1", 20)):
+        for extra, oclass, max_open, relocate in (
+                ({}, "S1", 60.0, False),
+                ({"guard_oclass": "EC_2P1G1", "guard_max_open": 20}, "EC_2P1G1", 20, False),
+                ({"guard_relocate": True}, "S1", 60.0, True)):
             seen.clear()
             try:
                 DaosL2Adapter(DaosL2AdapterConfig.from_dict({**base, **extra}))
@@ -385,11 +386,13 @@ def test_guard_oclass_and_max_open_reach_the_store():
                 pass
             assert seen["oclass"] == oclass, seen
             assert seen["breaker"].max_open_secs == max_open, seen
+            assert seen["relocate"] is relocate, seen
     finally:
         l2.S1BucketStore = real
 
     for bad in ({"guard_oclass": ""}, {"guard_oclass": 5},
-                {"guard_max_open": 0}, {"guard_max_open": True}):
+                {"guard_max_open": 0}, {"guard_max_open": True},
+                {"guard_relocate": "yes"}):
         try:
             DaosL2AdapterConfig.from_dict({**base, **bad})
         except ValueError:
