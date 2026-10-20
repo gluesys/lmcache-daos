@@ -82,6 +82,23 @@ LMCache 의 L2 축출(`max_capacity_gb` + `eviction`)이 가드의 삭제 경로
 rd_fac 0 + 가드. 가드 없는 EC 는 정지 직후 40~60 s 동안 요청당 3.7 s 가 걸려
 권하지 않는다.
 
+### rd_fac 0 풀의 self_heal 과 exclude
+
+rd_fac 0 풀에서 rank 의 target 이 한 번이라도 제외되면 컨테이너가 UNCLEAN 이 되고
+모든 I/O 가 DER_RF 로 실패한다. 막는 것은 풀 `self_heal:none` 하나다.
+
+- DAOS 2.8 은 rank 사망으로 풀 target 을 제외할 때 시스템 self_heal 의 `pool_exclude`
+  와 풀 self_heal 의 `exclude` 를 **둘 다** 요구한다. 풀이 `none` 이면 시스템
+  self_heal 과 엔진 `DAOS_POOL_RF` 를 바꾸거나 점검할 필요가 없다. `DAOS_POOL_RF` 는
+  제외를 거부할 수만 있다. 같은 시스템의 다른 풀은 기본 self_heal 을 그대로 쓴다.
+- **장애 중에 풀 self_heal 을 `exclude` 로 바꾸지 않는다.** 장애 동안 보류된 사망
+  이벤트가 그 자리에서 처리돼 target 이 제외될 수 있다(소스 근거, 미실측). rank 가
+  Joined 로 돌아온 뒤 바꾸는 것은 제외를 일으키지 않았다(실측).
+- 재부팅만 하는 rank 를 `dmg system exclude` / `dmg pool exclude` 하지 않는다.
+- NVMe 장치가 고장으로 판정되면 DAOS 는 self_heal 과 관계없이 그 엔진의 **모든 풀**
+  에서 해당 target 을 제외한다. rd_fac 0 풀은 이때 UNCLEAN 이 된다. 캐시이므로
+  컨테이너를 다시 만드는 것이 복구다.
+
 ## 4. 용량 상한을 잡는 법
 
 - 물리 사용은 논리 상한의 **2.5~3 배**로 돌았다(회수 지연, 64 버킷의 target 편차).
