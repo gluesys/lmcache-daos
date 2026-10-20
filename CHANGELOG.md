@@ -13,6 +13,11 @@ is doing real work.
 
 ### Added
 
+- Rank guard relocation (`DAOS_RANK_GUARD_RELOCATE=1`, MP `"guard_relocate": true`,
+  off by default): on an S1 pool, a key whose home bucket's rank is down is
+  written to a relocation bucket on another rank, chosen by hash so every
+  process agrees, and read back from there during and after the outage.
+  `doc/RANK-GUARD-RELOCATION.md`.
 - `bench/reboot/`: the storage-node reboot test behind `doc/RANK-GUARD.md` §5 --
   vLLM TTFT while a node is powered off (`reboot.sh`), VOS aggregation on the
   live ranks during the outage (`agg.sh`), reintegration under load

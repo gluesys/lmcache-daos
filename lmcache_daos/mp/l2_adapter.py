@@ -276,6 +276,11 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
                 if not isinstance(v, typ) or isinstance(v, bool) or v <= 0:
                     raise ValueError("daos: 'guard_%s' must be a positive number" % k)
                 guard[k] = v
+        if "guard_relocate" in d:
+            v = d["guard_relocate"]
+            if not isinstance(v, bool):
+                raise ValueError("daos: 'guard_relocate' must be a boolean")
+            guard["relocate"] = v
         if "guard_oclass" in d:
             v = d["guard_oclass"]
             if not isinstance(v, str) or not v:
@@ -334,7 +339,10 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "guard_oclass (default S1) picks the buckets' object class: any other "
             "class (e.g. EC_2P1G1 on an rd_fac 1 pool) spreads a bucket over "
             "ranks and the breaker covers the whole pool. guard_max_open "
-            "(default 60 s) is the longest a breaker stays open between probes\n"
+            "(default 60 s) is the longest a breaker stays open between probes. "
+            "guard_relocate (default false) writes keys whose home rank is down "
+            "to another rank's bucket and reads them back from there "
+            "(S1 buckets only, doc/RANK-GUARD-RELOCATION.md)\n"
             "- eviction / persist_enabled / serde: common L2 options"
         )
 
@@ -370,6 +378,7 @@ class DaosL2Adapter(L2AdapterInterface):
                     write_deadline=g.get("write_deadline", 10.0),
                     min_bw=g.get("min_bw", 50e6),
                     oclass=g.get("oclass", "S1"),
+                    relocate=g.get("relocate", False),
                     breaker=Breaker(max_open_secs=g.get("max_open", 60.0))))
         factory = dfs_factory or (
             lambda: DfsSys(pool=config.pool, cont=config.container, sys=config.sys)

@@ -605,6 +605,122 @@ def capacity_index_startup_and_skip():
     ck("cap: skipped keys are passed over", c.victims(skip={b"old"}) == [b"new"])
 
 
+class RelocWorld:
+    """Buckets as dicts over 3 ranks (bucket % 3), for Relocator. A bucket on
+    a down rank answers SKIPPED once its breaker is open, DEADLINE before."""
+
+    def __init__(self, nbuckets=12):
+        self.clock = [0.0]
+        self.br = G.Breaker(threshold=1, open_secs=5.0, clock=lambda: self.clock[0])
+        self.pl = G.BucketPlacement(nbuckets, lambda b: b % 3)
+        self.rl = G.Relocator(self.pl, self.br)
+        self.data = {b: {} for b in range(nbuckets)}
+        self.down = set()
+        self.calls = []
+
+    def _gate(self, b):
+        r = self.pl.rank(b)
+        self.calls.append(b)
+        if not self.br.allow(r):
+            return G.SKIPPED
+        if r in self.down:
+            self.br.miss(r)
+            return G.DEADLINE
+        self.br.success(r)
+        return 0
+
+    def fetch(self, k):
+        def do(b):
+            rc = self._gate(b)
+            if rc != 0:
+                return rc, None
+            return 0, [len(self.data[b].get(k, b""))]
+        return self.rl.fetch(k, do)
+
+    def update(self, k, v):
+        def do(b):
+            rc = self._gate(b)
+            if rc == 0:
+                self.data[b][k] = v
+            return rc
+        return self.rl.update(k, do)
+
+    def punch(self, k):
+        def do(b):
+            rc = self._gate(b)
+            if rc == 0:
+                self.data[b].pop(k, None)
+            return rc
+        return self.rl.punch(k, do)
+
+    def where(self, k):
+        return [b for b in self.data if k in self.data[b]]
+
+
+def relocation_alt_bucket():
+    w = RelocWorld()
+    keys = [b"k%d" % i for i in range(200)]
+    ok = all(w.pl.rank(w.pl.alt(k)) != w.pl.rank(w.pl.bucket(k)) for k in keys)
+    ck("reloc: alt bucket is always on another rank", ok)
+    w2 = RelocWorld()
+    ck("reloc: alt bucket is the same in another process",
+       all(w.pl.alt(k) == w2.pl.alt(k) for k in keys))
+    one = G.BucketPlacement(8, lambda b: 0)
+    ck("reloc: no alt when every bucket is on one rank", one.alt(b"k") is None)
+
+
+def relocation_outage_and_return():
+    w = RelocWorld()
+    k = next(b"k%d" % i for i in range(100) if w.pl.rank(w.pl.bucket(b"k%d" % i)) == 1)
+    b0, b1 = w.pl.bucket(k), w.pl.alt(k)
+    ck("reloc: healthy write goes home", w.update(k, b"v" * 8) == 0 and w.where(k) == [b0])
+    w.data[b0].pop(k)
+    w.down.add(1)
+    rc, _ = w.fetch(k)                           # first request finds the rank dead
+    ck("reloc: a fetch past its deadline does not try the alt bucket",
+       rc == G.DEADLINE and w.calls[-1] == b0, "(%r)" % (rc,))
+    ck("reloc: write while home rank is open goes to the alt bucket",
+       w.update(k, b"v" * 8) == 0 and w.where(k) == [b1] and w.rl.relocated_writes == 1)
+    rc, got = w.fetch(k)
+    ck("reloc: read while home rank is open hits the alt bucket",
+       rc == 0 and got == [8] and w.rl.alt_hits == 1, "(%r %r)" % (rc, got))
+    w.down.discard(1)
+    w.clock[0] += 10                             # past open_secs: next request probes
+    rc, got = w.fetch(k)
+    ck("reloc: after the rank is back, home misses and the alt copy hits",
+       rc == 0 and got == [8] and w.br.state(1) == G.CLOSED, "(%r %r)" % (rc, got))
+    k2 = next(b"x%d" % i for i in range(100) if w.pl.rank(w.pl.bucket(b"x%d" % i)) == 1)
+    ck("reloc: after the rank is back, a new write goes home again",
+       w.update(k2, b"w") == 0 and w.where(k2) == [w.pl.bucket(k2)])
+    ck("reloc: punch removes the alt copy too", w.punch(k) == 0 and w.where(k) == [])
+
+
+def relocation_two_ranks_down():
+    w = RelocWorld()
+    k = b"k1"
+    w.down.update({w.pl.rank(w.pl.bucket(k)), w.pl.rank(w.pl.alt(k))})
+    w.fetch(k)                                   # opens the home rank
+    rc = w.update(k, b"v")
+    ck("reloc: home and alt both down: the write is not stored",
+       rc != 0 and w.where(k) == [], "(%r)" % (rc,))
+    w.fetch(k)                                   # opens the alt rank too
+    rc, got = w.fetch(k)
+    ck("reloc: home and alt both down: the read is a miss",
+       rc != 0 or not any(got or []), "(%r %r)" % (rc, got))
+
+
+def relocation_miss_costs_one_more_fetch():
+    w = RelocWorld()
+    n0 = len(w.calls)
+    rc, got = w.fetch(b"absent")
+    ck("reloc: a healthy miss asks home, then the alt bucket, once each",
+       rc == 0 and got == [0] and len(w.calls) - n0 == 2, "(%d)" % (len(w.calls) - n0))
+    w.update(b"present", b"v")
+    n0 = len(w.calls)
+    w.fetch(b"present")
+    ck("reloc: a healthy hit asks home only", len(w.calls) - n0 == 1)
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -619,7 +735,9 @@ def main():
               guarded_obj_writes_raise_dropped, guarded_obj_surfaces_connect_error,
               reap_callback_failure_keeps_poller, op_deadline_scales_with_bytes,
               answered_zombie_closes_breaker, unreachable_zombie_keeps_breaker_open,
-              capacity_index_lru, capacity_index_startup_and_skip):
+              capacity_index_lru, capacity_index_startup_and_skip,
+              relocation_alt_bucket, relocation_outage_and_return,
+              relocation_two_ranks_down, relocation_miss_costs_one_more_fetch):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)
