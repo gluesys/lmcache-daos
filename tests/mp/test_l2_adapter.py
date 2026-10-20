@@ -358,6 +358,45 @@ def test_errors_are_attributed_to_the_operation():
         ad.close()
 
 
+def test_guard_oclass_and_max_open_reach_the_store():
+    """MP mode once dropped them, so its buckets were always S1 (no EC)."""
+    import lmcache_daos.mp.l2_adapter as l2
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_store(pool, cont, **kw):
+        seen.update(kw)
+        raise Stop
+
+    base = {"type": "daos", "pool": "p", "container": "c", "rank_guard": True}
+    real = l2.S1BucketStore
+    l2.S1BucketStore = fake_store
+    try:
+        for extra, oclass, max_open in (
+                ({}, "S1", 60.0),
+                ({"guard_oclass": "EC_2P1G1", "guard_max_open": 20}, "EC_2P1G1", 20)):
+            seen.clear()
+            try:
+                DaosL2Adapter(DaosL2AdapterConfig.from_dict({**base, **extra}))
+            except Stop:
+                pass
+            assert seen["oclass"] == oclass, seen
+            assert seen["breaker"].max_open_secs == max_open, seen
+    finally:
+        l2.S1BucketStore = real
+
+    for bad in ({"guard_oclass": ""}, {"guard_oclass": 5},
+                {"guard_max_open": 0}, {"guard_max_open": True}):
+        try:
+            DaosL2AdapterConfig.from_dict({**base, **bad})
+        except ValueError:
+            continue
+        raise AssertionError("accepted %r" % bad)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
