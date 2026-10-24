@@ -907,7 +907,7 @@ class S1BucketStore:
             time.monotonic() - self._closed_since < grace
 
     def _maint_loop(self) -> None:
-        next_poll = 0.0
+        next_poll = next_log = 0.0
         while True:
             now = time.monotonic()
             if self.space is not None and now >= next_poll:
@@ -916,6 +916,12 @@ class S1BucketStore:
                 except Exception:              # a query bug must not stop the flush
                     logger.exception("space poll failed")
                 next_poll = now + self.space_poll
+                if now >= next_log:            # what the marks act on, once a minute
+                    snap = self.space.snapshot()
+                    logger.info("target free share: min %s over %d targets, %d writes refused, "
+                                "%d punches held", min(snap.values()) if snap else "unknown",
+                                len(snap), self.full_skips, len(self._held))
+                    next_log = now + 60.0
             self._flush_held()
             time.sleep(1.0)
 
