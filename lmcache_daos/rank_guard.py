@@ -811,13 +811,12 @@ class S1BucketStore:
                 d.daos_pool_query_target.argtypes = [ob.DaosHandle, ctypes.c_uint32,
                                                      ctypes.c_uint32, ctypes.c_void_p,
                                                      ctypes.c_void_p]
-                # its own engine and breaker: the query goes through the pool
-                # service, so a slow answer says nothing about the target's rank
-                self._space_engine = DeadlineEngine(EventQueue(), Breaker())
                 self.space = SpaceMonitor(locs, self._query_target, self.breaker,
                                           interval=self.space_poll)
+                threading.Thread(target=self._space_loop, name="daos-space",
+                                 daemon=True).start()
             if single:
-                threading.Thread(target=self._maint_loop, name="daos-space",
+                threading.Thread(target=self._maint_loop, name="daos-maint",
                                  daemon=True).start()
             self.ready.set()
             logger.info("S1BucketStore ready: %d %s buckets over ranks %s%s",
@@ -879,13 +878,14 @@ class S1BucketStore:
         return rc, None
 
     def _query_target(self, rank: int, tgt: int) -> Optional[float]:
+        """Blocking (no event) on the space thread. An event needs an engine and
+        a poller of its own, and a second poller cost 23 ms of hit TTFT
+        (0.158 -> 0.181 s, lane A A/B); a slow answer here only delays the next
+        reading, never a request. The query goes through the pool service, so
+        it says nothing about the target's rank either way."""
         from . import obj_binding as ob
         info = _TargetInfo()
-
-        def submit(slot):
-            return ob._daos.daos_pool_query_target(self._poh, tgt, rank,
-                                                   ctypes.byref(info), slot.addr)
-        if self._space_engine.run(rank, submit, info, 0, 5.0) != 0:
+        if ob._daos.daos_pool_query_target(self._poh, tgt, rank, ctypes.byref(info), None) != 0:
             return None
         return free_fraction(list(info.ta_space.s_total), list(info.ta_space.s_free))
 
@@ -906,22 +906,24 @@ class S1BucketStore:
         return self._closed_since is not None and \
             time.monotonic() - self._closed_since < grace
 
-    def _maint_loop(self) -> None:
-        next_poll = next_log = 0.0
+    def _space_loop(self) -> None:
+        next_log = 0.0
         while True:
+            try:
+                self.space.poll_once()
+            except Exception:
+                logger.exception("space poll failed")
             now = time.monotonic()
-            if self.space is not None and now >= next_poll:
-                try:
-                    self.space.poll_once()
-                except Exception:              # a query bug must not stop the flush
-                    logger.exception("space poll failed")
-                next_poll = now + self.space_poll
-                if now >= next_log:            # what the marks act on, once a minute
-                    snap = self.space.snapshot()
-                    logger.info("target free share: min %s over %d targets, %d writes refused, "
-                                "%d punches held", min(snap.values()) if snap else "unknown",
-                                len(snap), self.full_skips, len(self._held))
-                    next_log = now + 60.0
+            if now >= next_log:                # what the marks act on, once a minute
+                snap = self.space.snapshot()
+                logger.info("target free share: min %s over %d targets, %d writes refused, "
+                            "%d punches held", min(snap.values()) if snap else "unknown",
+                            len(snap), self.full_skips, len(self._held))
+                next_log = now + 60.0
+            time.sleep(self.space_poll)
+
+    def _maint_loop(self) -> None:
+        while True:
             self._flush_held()
             time.sleep(1.0)
 
