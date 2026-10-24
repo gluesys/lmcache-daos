@@ -56,6 +56,7 @@ try:
     from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
     from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend  # noqa: F401
     from lmcache.v1.memory_management import MemoryObj  # noqa: F401
+    from lmcache.v1.memory_management import BytesBufferMemoryObj, MemoryFormat
     from lmcache.v1.protocol import RemoteMetadata
 
     from lmcache.logging import init_logger
@@ -312,6 +313,18 @@ class DaosPoolWedged(DaosError):
             self, errno.EBUSY,
             "daos-io pool wedged: all %d workers are inside a DAOS call and "
             "none has completed in %.0fs" % (workers, stalled_s))
+
+def _dtypes_of(memory_obj) -> list:
+    """One dtype per shape, as RemoteMetadata zips them strictly. A serialised
+    object (CacheGen's BytesBufferMemoryObj) reports one shape and no dtype,
+    which made every CacheGen store fail ("zip() argument 2 is shorter than
+    argument 1", LMCache 0.5.5, lane A 2026-10-24): its bytes go as uint8."""
+    dtypes = memory_obj.get_dtypes()
+    if not dtypes and memory_obj.get_shapes():
+        import torch
+        dtypes = [torch.uint8] * len(memory_obj.get_shapes())
+    return dtypes
+
 
 class DaosConnector(RemoteConnector):
     def __init__(self, url=None, loop=None, local_cpu_backend=None, config=None):
@@ -904,7 +917,7 @@ class DaosConnector(RemoteConnector):
         meta_bytes = RemoteMetadata(
             n,
             memory_obj.get_shapes(),
-            memory_obj.get_dtypes(),
+            _dtypes_of(memory_obj),
             memory_obj.get_memory_format(),
         ).serialize()
         header = serde.prefix_pack(len(meta_bytes), n) + meta_bytes
@@ -1049,6 +1062,15 @@ class DaosConnector(RemoteConnector):
         except Exception:
             pass
 
+    def _allocate(self, metadata):
+        """The MemoryObj a stored value is read into. A serialised one (CacheGen,
+        BINARY_BUFFER: compressed bytes, not a KV tensor) is a plain byte buffer,
+        which the deserializer turns back into KV; the CPU allocator cannot make
+        one -- its shape is [n, 0, 0, 0]."""
+        if metadata.fmt == MemoryFormat.BINARY_BUFFER:
+            return BytesBufferMemoryObj(bytearray(metadata.length))
+        return self.local_cpu_backend.allocate(metadata.shapes, metadata.dtypes, metadata.fmt)
+
     # -- runs inside the thread pool ---------------------------------------
     @staticmethod
     def _release(memory_obj) -> None:
@@ -1124,8 +1146,7 @@ class DaosConnector(RemoteConnector):
         if hdr.payload_len < metadata.length:
             return None                          # header disagrees with itself
 
-        memory_obj = self.local_cpu_backend.allocate(
-            metadata.shapes, metadata.dtypes, metadata.fmt)
+        memory_obj = self._allocate(metadata)
         if memory_obj is None:
             return None
 
@@ -1324,8 +1345,7 @@ class DaosConnector(RemoteConnector):
                 continue                         # torn, uncommitted => miss
             if hdr.payload_len < metadata.length:
                 continue                         # header disagrees with itself
-            mo = self.local_cpu_backend.allocate(
-                metadata.shapes, metadata.dtypes, metadata.fmt)
+            mo = self._allocate(metadata)
             if mo is None:
                 continue
             view = mo.byte_array
@@ -1434,8 +1454,7 @@ class DaosConnector(RemoteConnector):
             if payload_len < metadata.length:
                 return None                      # header itself is inconsistent
 
-            memory_obj = self.local_cpu_backend.allocate(
-                metadata.shapes, metadata.dtypes, metadata.fmt)
+            memory_obj = self._allocate(metadata)
             if memory_obj is None:
                 return None
 
