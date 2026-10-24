@@ -65,6 +65,7 @@ DEADLINE = "DEADLINE"      # aborted at the caller's deadline, now a zombie
 SKIPPED = "SKIPPED"        # breaker open: not sent at all
 NOT_READY = "NOT_READY"    # store still connecting (outage at start-up)
 DER_NOSPACE = -1007        # daos_errno.h: no space on the target
+FULL = "FULL"              # the bucket's target is below an admission mark: not sent
 
 CLOSED, OPEN, HALF_OPEN = "closed", "open", "half-open"
 
@@ -568,7 +569,17 @@ def _first_rank(layout_p) -> int:
     sh = _ObjShard.from_address(shard0)
     if sh.os_replica_nr < 1:
         raise RuntimeError("object shard has no replicas")
-    return _ShardLoc.from_address(shard0 + ctypes.sizeof(_ObjShard)).sd_rank
+    return _first_loc(layout_p)[0]
+
+
+def _first_loc(layout_p) -> Tuple[int, int]:
+    """(rank, target index) of shard 0, replica 0; see :func:`_first_rank`."""
+    base = ctypes.cast(layout_p, ctypes.c_void_p).value
+    off = (ctypes.sizeof(_ObjLayout) + ctypes.alignment(ctypes.c_void_p) - 1) \
+        // ctypes.alignment(ctypes.c_void_p) * ctypes.alignment(ctypes.c_void_p)
+    loc = _ShardLoc.from_address(ctypes.c_void_p.from_address(base + off).value
+                                 + ctypes.sizeof(_ObjShard))
+    return loc.sd_rank, loc.sd_tgt_idx
 
 
 def op_deadline(base: float, nbytes: int, min_bw: float) -> float:
@@ -595,6 +606,81 @@ class _Anchor(ctypes.Structure):      # daos_types.h daos_anchor_t
 _ANCHOR_EOF = 3                       # DAOS_ANCHOR_TYPE_EOF
 
 
+class _Space(ctypes.Structure):       # daos_pool.h struct daos_space (SCM, NVMe)
+    _fields_ = [("s_total", ctypes.c_uint64 * 2), ("s_free", ctypes.c_uint64 * 2)]
+
+
+class _TargetInfo(ctypes.Structure):  # daos_pool.h daos_target_info_t
+    _fields_ = [("ta_padding", ctypes.c_uint32), ("ta_state", ctypes.c_int),
+                ("ta_perf", ctypes.c_int), ("ta_space", _Space)]
+
+
+def free_fraction(total, free) -> Optional[float]:
+    """The smaller free share over the media a target has (SCM/metadata and
+    NVMe/data with MD-on-SSD); None when it reports no space at all."""
+    fr = [f / t for t, f in zip(total, free) if t > 0]
+    return min(fr) if fr else None
+
+
+class SpaceMonitor:
+    """Free share of every target that holds a bucket (doc/EVICTION-DESIGN.md §4.1).
+
+    A whole-pool query does not answer while a rank of a self_heal:none pool is
+    down (lane A, 2026-10-22), and NOSPACE comes from one target filling, not
+    the pool. So each target is asked on its own, ``query(rank, tgt)`` -> free
+    share or None, every ``interval`` seconds, skipping ranks whose breaker is
+    not closed. A value older than three intervals counts as unknown, and an
+    unknown target is never refused a write.
+    """
+
+    def __init__(self, locs: Dict[int, Tuple[int, int]],
+                 query: Callable[[int, int], Optional[float]], breaker: Breaker,
+                 interval: float = 10.0, clock: Callable[[], float] = time.monotonic):
+        self.locs, self.query, self.breaker = locs, query, breaker
+        self.interval, self._clock = interval, clock
+        self._frac: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def poll_once(self) -> None:
+        for loc in sorted(set(self.locs.values())):
+            if self.breaker.state(loc[0]) != CLOSED:
+                continue
+            f = self.query(*loc)
+            if f is not None:
+                with self._lock:
+                    self._frac[loc] = (f, self._clock())
+
+    def _fresh(self, loc) -> Optional[float]:
+        v = self._frac.get(loc)
+        if v is None or self._clock() - v[1] > 3 * self.interval:
+            return None
+        return v[0]
+
+    def bucket_frac(self, b: int) -> Optional[float]:
+        with self._lock:
+            return self._fresh(self.locs[b])
+
+    def min_frac(self) -> Optional[float]:
+        with self._lock:
+            fr = [f for f in (self._fresh(loc) for loc in set(self.locs.values()))
+                  if f is not None]
+        return min(fr) if fr else None
+
+    def buckets_under(self, mark: float) -> set:
+        """Buckets whose target's free share is known and under ``mark``."""
+        with self._lock:
+            out = set()
+            for b, loc in self.locs.items():
+                f = self._fresh(loc)
+                if f is not None and f < mark:
+                    out.add(b)
+            return out
+
+    def snapshot(self) -> Dict[str, float]:
+        with self._lock:
+            return {"%d.%d" % loc: round(v[0], 3) for loc, v in sorted(self._frac.items())}
+
+
 class S1BucketStore:
     """Keys over ``nbuckets`` S1 objects, every op through a DeadlineEngine.
 
@@ -618,12 +704,27 @@ class S1BucketStore:
                  per_rank_eq: bool = True, slow_poll_secs: float = 0.05,
                  write_deadline: float = 10.0, min_bw: float = 50e6,
                  oclass: str = "S1", relocate: bool = False,
-                 relocate_budget: Optional[int] = None):
+                 relocate_budget: Optional[int] = None, space_poll: float = 0.0,
+                 admit_new_at: float = 0.15, admit_all_at: float = 0.05,
+                 punch_hold: bool = True):
         self.pool, self.cont, self.sys = pool, cont, sys
         # relocate: write keys whose home rank is down to another rank's
         # bucket and read them back from there (Relocator). S1 only.
         self.relocate = relocate
         self.relocate_budget = relocate_budget
+        # doc/EVICTION-DESIGN.md §4.2-4.4: refuse writes to a target whose free
+        # share is under a mark (relocated ones first), and while a rank of an
+        # S1 pool is down hold punches -- the live ranks reclaim nothing then
+        # (RANK-GUARD.md §4) -- and run them once every rank is back.
+        self.space_poll = space_poll
+        self.admit_new_at, self.admit_all_at = admit_new_at, admit_all_at
+        self.punch_hold = punch_hold
+        self.space: Optional[SpaceMonitor] = None
+        self._held: Dict[bytes, Optional[Sequence[bytes]]] = {}
+        self._held_lock = threading.Lock()
+        self._closed_since: Optional[float] = None
+        self._single = False
+        self.full_skips = 0
         self.relocator: Optional[Relocator] = None
         # S1: one shard per bucket, so a bucket lives on one rank and the
         # breaker is per rank. Any other class (e.g. EC_2P1G1 on an rd_fac 1
@@ -675,7 +776,7 @@ class S1BucketStore:
                                               ctypes.POINTER(ctypes.c_void_p)]
             d.daos_obj_layout_free.restype = ctypes.c_int
             d.daos_obj_layout_free.argtypes = [ctypes.c_void_p]
-            ranks = []
+            ranks, locs = [], {}
             for b in range(self.nbuckets):
                 oid = ob.DaosObjId(self.oid_base + b, 0)
                 ob._chk(d.daos_obj_generate_oid(coh, ctypes.byref(oid), 0, s1, 0, 0),
@@ -688,7 +789,8 @@ class S1BucketStore:
                     ob._chk(d.daos_obj_layout_get(coh, oid, ctypes.byref(lay)),
                             "daos_obj_layout_get")
                     try:
-                        ranks.append(_first_rank(lay))
+                        locs[b] = _first_loc(lay)
+                        ranks.append(locs[b][0])
                     finally:
                         d.daos_obj_layout_free(lay)
                 else:
@@ -703,6 +805,20 @@ class S1BucketStore:
             if self.relocate and single and len(set(ranks)) > 1:
                 self.relocator = Relocator(self.placement, self.breaker,
                                            budget=self.relocate_budget)
+            self._single, self._ranks = single, sorted(set(ranks))
+            if single and self.space_poll > 0:
+                d.daos_pool_query_target.restype = ctypes.c_int
+                d.daos_pool_query_target.argtypes = [ob.DaosHandle, ctypes.c_uint32,
+                                                     ctypes.c_uint32, ctypes.c_void_p,
+                                                     ctypes.c_void_p]
+                # its own engine and breaker: the query goes through the pool
+                # service, so a slow answer says nothing about the target's rank
+                self._space_engine = DeadlineEngine(EventQueue(), Breaker())
+                self.space = SpaceMonitor(locs, self._query_target, self.breaker,
+                                          interval=self.space_poll)
+            if single:
+                threading.Thread(target=self._maint_loop, name="daos-space",
+                                 daemon=True).start()
             self.ready.set()
             logger.info("S1BucketStore ready: %d %s buckets over ranks %s%s",
                         self.nbuckets, self.oclass,
@@ -715,6 +831,9 @@ class S1BucketStore:
     def _op(self, dkey: bytes, items, single: bool, fetch: bool, on_reap=None):
         if not self.ready.is_set():
             return NOT_READY, None
+        if not fetch and self._held:
+            with self._held_lock:             # written again: its held punch is stale
+                self._held.pop(dkey, None)
         rl = self.relocator
         if rl is None:
             return self._bucket_op(self.placement.bucket(dkey), dkey, items, single,
@@ -722,13 +841,20 @@ class S1BucketStore:
         if fetch:
             return rl.fetch(dkey, lambda b: self._bucket_op(b, dkey, items, single,
                                                              True, on_reap))
-        return rl.update(dkey, lambda b: self._bucket_op(b, dkey, items, single,
-                                                          False)[0],
+        home = self.placement.bucket(dkey)
+        return rl.update(dkey, lambda b: self._bucket_op(b, dkey, items, single, False,
+                                                          relocated=b != home)[0],
                          sum(int(x[2]) for x in items)), None
 
     def _bucket_op(self, b: int, dkey: bytes, items, single: bool, fetch: bool,
-                   on_reap=None):
+                   on_reap=None, relocated: bool = False):
         from . import obj_binding as ob
+        if not fetch and self.space is not None:
+            f = self.space.bucket_frac(b)
+            if f is not None and (f < self.admit_all_at or
+                                  (relocated and f < self.admit_new_at)):
+                self.full_skips += 1
+                return FULL, None
         rank = self.placement.rank(b)
         oh = self._ohs[b]
         dk_iov, dk_buf = ob.build_key(dkey)
@@ -752,6 +878,55 @@ class S1BucketStore:
                        for i in range(n)]
         return rc, None
 
+    def _query_target(self, rank: int, tgt: int) -> Optional[float]:
+        from . import obj_binding as ob
+        info = _TargetInfo()
+
+        def submit(slot):
+            return ob._daos.daos_pool_query_target(self._poh, tgt, rank,
+                                                   ctypes.byref(info), slot.addr)
+        if self._space_engine.run(rank, submit, info, 0, 5.0) != 0:
+            return None
+        return free_fraction(list(info.ta_space.s_total), list(info.ta_space.s_free))
+
+    def holding(self) -> bool:
+        """Punches are held: a rank of this S1 pool is down, and the live
+        ranks reclaim nothing until it is back (RANK-GUARD.md §4)."""
+        down = self.punch_hold and self._single and any(
+            self.breaker.state(r) != CLOSED for r in self._ranks)
+        if down:
+            self._closed_since = None
+        elif self._closed_since is None:
+            self._closed_since = time.monotonic()
+        return down
+
+    def recovering(self, grace: float = 30.0) -> bool:
+        """Within ``grace`` seconds of every rank closing again: aggregation is
+        still catching up, so free space reads low (lane A, 2026-10-21)."""
+        return self._closed_since is not None and \
+            time.monotonic() - self._closed_since < grace
+
+    def _maint_loop(self) -> None:
+        next_poll = 0.0
+        while True:
+            now = time.monotonic()
+            if self.space is not None and now >= next_poll:
+                try:
+                    self.space.poll_once()
+                except Exception:              # a query bug must not stop the flush
+                    logger.exception("space poll failed")
+                next_poll = now + self.space_poll
+            self._flush_held()
+            time.sleep(1.0)
+
+    def _flush_held(self) -> None:
+        if not self._held or self.holding():
+            return
+        with self._held_lock:
+            held, self._held = self._held, {}
+        done = sum(1 for dk, ak in held.items() if self._punch_now(dk, ak) == 0)
+        logger.info("every rank is back: ran %d of %d held punches", done, len(held))
+
     def fetch(self, dkey: bytes, items: Sequence[Tuple[bytes, object, int]],
               single: bool = False, on_reap=None):
         """Returns ``(rc, got)``. Anything but rc 0 is a miss to the caller;
@@ -771,6 +946,16 @@ class S1BucketStore:
         a late eviction."""
         if not self.ready.is_set():
             return NOT_READY
+        if self.holding():
+            with self._held_lock:             # a whole-dkey punch covers any akey punch
+                if not akeys or (dkey in self._held and self._held[dkey] is None):
+                    self._held[dkey] = None
+                else:
+                    self._held[dkey] = list(self._held.get(dkey) or []) + list(akeys)
+            return 0
+        return self._punch_now(dkey, akeys)
+
+    def _punch_now(self, dkey: bytes, akeys: Optional[Sequence[bytes]]):
         if self.relocator is not None:
             return self.relocator.punch(dkey, lambda b: self._bucket_punch(b, dkey, akeys))
         return self._bucket_punch(self.placement.bucket(dkey), dkey, akeys)
@@ -860,6 +1045,8 @@ class S1BucketStore:
         rl = self.relocator
         return {"ready": self.ready.is_set(), "ranks": self.breaker.snapshot(),
                 "stats": dict(eng.stats) if eng else {},
+                "space": self.space.snapshot() if self.space else None,
+                "full_skips": self.full_skips, "held_punches": len(self._held),
                 "relocation": ({"writes": rl.relocated_writes, "alt_hits": rl.alt_hits,
                                 "dropped": rl.dropped_writes, "spent": rl.spent()}
                                if rl else None),
@@ -937,9 +1124,167 @@ class CapacityIndex:
                 need -= n
             return out
 
+    def oldest(self, nbytes: int, skip=(), only=None) -> List[bytes]:
+        """Oldest keys adding up to ``nbytes``, whatever the total: eviction
+        driven by a target's free share rather than by this bound. ``only``,
+        when given, limits it to the keys it accepts."""
+        with self._lock:
+            out = []
+            for k, n in self._lru.items():
+                if nbytes <= 0:
+                    break
+                if k in skip or (only is not None and not only(k)):
+                    continue
+                out.append(k)
+                nbytes -= n
+            return out
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._lru)
+
+
+class S3FifoIndex:
+    """CapacityIndex's interface with S3-FIFO order (doc/EVICTION-DESIGN.md §4.3).
+
+    A new key enters the small queue S. Leaving S, a key that was read meanwhile
+    moves to the main queue M; one that was not is evicted and remembered in
+    the ghost G, and if it is written again it goes straight to M. M is a FIFO
+    with a hit count (at most 3): at its tail a counted key loses one and goes
+    back to the head, an uncounted one is evicted. Keys written once and never
+    read -- most of a KV cache, e.g. a prompt never seen again -- leave from S
+    without pushing out the prefixes that keep being read. A hit only bumps a
+    count, so the hit path moves nothing.
+
+    Keys found at start-up may be another process's: they wait in their own
+    queue O and go first. ``victims`` and ``oldest`` pick keys (promoting as
+    S3-FIFO does along the way) but drop nothing; a key leaves on ``discard``,
+    once its punch went through, so one that could not be punched stays.
+    """
+
+    def __init__(self, capacity: int, low_water: float = 0.9, small: float = 0.1):
+        from collections import OrderedDict
+        self.capacity = int(capacity)
+        self.low = int(capacity * low_water)
+        self.small = small
+        self._o: "OrderedDict[bytes, int]" = OrderedDict()
+        self._s: "OrderedDict[bytes, list]" = OrderedDict()   # key -> [bytes, hits]
+        self._m: "OrderedDict[bytes, list]" = OrderedDict()
+        self._g: "OrderedDict[bytes, None]" = OrderedDict()
+        self._sbytes = 0
+        self._lock = threading.Lock()
+        self.total = 0
+
+    def _drop(self, key: bytes) -> Optional[str]:
+        for name, q in (("o", self._o), ("s", self._s), ("m", self._m)):
+            if key in q:
+                v = q.pop(key)
+                n = v if name == "o" else v[0]
+                self.total -= n
+                if name == "s":
+                    self._sbytes -= n
+                return name
+        return None
+
+    def add(self, key: bytes, nbytes: int) -> None:
+        with self._lock:
+            hits = 0
+            for q in (self._s, self._m):
+                if key in q:
+                    hits = q[key][1]
+            was = self._drop(key)
+            if was in ("s", "m"):
+                q = self._s if was == "s" else self._m
+                q[key] = [nbytes, hits]
+                if was == "s":
+                    self._sbytes += nbytes
+            elif key in self._g:
+                del self._g[key]
+                self._m[key] = [nbytes, 0]
+            else:
+                self._s[key] = [nbytes, 0]
+                self._sbytes += nbytes
+            self.total += nbytes
+
+    def add_old(self, key: bytes, nbytes: int) -> None:
+        with self._lock:
+            if key in self._o or key in self._s or key in self._m:
+                return
+            self._o[key] = nbytes
+            self.total += nbytes
+
+    def touch(self, key: bytes) -> None:
+        with self._lock:
+            for q in (self._s, self._m):
+                if key in q:
+                    q[key][1] = min(q[key][1] + 1, 3)
+                    return
+            if key in self._o:                # read by this process: it is ours now
+                n = self._o.pop(key)
+                self._m[key] = [n, 1]
+
+    def discard(self, key: bytes) -> None:
+        with self._lock:
+            if self._drop(key) == "s":
+                self._g[key] = None
+                while len(self._g) > max(1024, len(self._m) + len(self._s)):
+                    self._g.popitem(last=False)
+
+    def _pick(self, need: int, skip, only) -> List[bytes]:
+        ok = (lambda k: k not in skip and (only is None or only(k)))
+        out = []
+        for k, n in list(self._o.items()):
+            if need <= 0:
+                return out
+            if ok(k):
+                out.append(k)
+                need -= n
+
+        def from_s():
+            nonlocal need
+            for k, v in list(self._s.items()):
+                if need <= 0:
+                    return
+                if v[1] > 0:                   # read while in S: promote
+                    del self._s[k]
+                    self._sbytes -= v[0]
+                    self._m[k] = [v[0], 0]
+                elif ok(k):
+                    out.append(k)
+                    need -= v[0]
+
+        def from_m():
+            nonlocal need
+            for k, v in list(self._m.items()):
+                if need <= 0:
+                    return
+                if v[1] > 0:                   # counted: one less, back to the head
+                    v[1] -= 1
+                    self._m.move_to_end(k)
+                elif ok(k):
+                    out.append(k)
+                    need -= v[0]
+        order = (from_s, from_m) if self._sbytes > self.small * self.total else (from_m, from_s)
+        for _ in range(4):                     # each M pass takes one hit off
+            for f in order:
+                f()
+            if need <= 0:
+                break
+        return out
+
+    def victims(self, skip=(), only=None) -> List[bytes]:
+        with self._lock:
+            if self.total <= self.capacity:
+                return []
+            return self._pick(self.total - self.low, skip, only)
+
+    def oldest(self, nbytes: int, skip=(), only=None) -> List[bytes]:
+        with self._lock:
+            return self._pick(nbytes, skip, only)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._o) + len(self._s) + len(self._m)
 
 
 # ---- connector adapter ------------------------------------------------------

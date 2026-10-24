@@ -763,6 +763,137 @@ def relocation_stops_on_nospace():
        "(%r %r %d)" % (rc, rc2, len(w.calls) - n0))
 
 
+def space_fraction_and_monitor():
+    ck("space: the smaller media share counts", G.free_fraction([100, 1000], [50, 100]) == 0.1)
+    ck("space: a target with no space reported is unknown", G.free_fraction([0, 0], [0, 0]) is None)
+    clock = [0.0]
+    br = G.Breaker(threshold=1, open_secs=5.0, clock=lambda: clock[0])
+    asked = []
+
+    def query(r, t):
+        asked.append((r, t))
+        return {(0, 0): 0.5, (1, 3): 0.1}[(r, t)]
+    m = G.SpaceMonitor({0: (0, 0), 1: (1, 3), 2: (0, 0)}, query, br, interval=10.0,
+                       clock=lambda: clock[0])
+    m.poll_once()
+    ck("space: each target asked once per poll", sorted(asked) == [(0, 0), (1, 3)])
+    ck("space: bucket and minimum shares", m.bucket_frac(1) == 0.1 and m.min_frac() == 0.1)
+    br.miss(1)                                   # rank 1 opens
+    asked.clear()
+    m.poll_once()
+    ck("space: a rank whose breaker is not closed is not asked", asked == [(0, 0)])
+    clock[0] += 31
+    ck("space: a share older than three intervals is unknown", m.bucket_frac(1) is None)
+
+
+def capacity_index_oldest():
+    c = G.CapacityIndex(1000)
+    for k in (b"a", b"b", b"c"):
+        c.add(k, 100)
+    ck("cap: oldest by bytes, under the bound too", c.oldest(150) == [b"a", b"b"])
+    ck("cap: oldest skips", c.oldest(150, skip={b"a"}) == [b"b", b"c"])
+
+
+class _HoldStore(G.S1BucketStore):
+    """An S1BucketStore without DAOS: two ranks, buckets b % 2, ops recorded."""
+
+    def __init__(self, space=None):
+        import threading as th
+        self.clock = [0.0]
+        self.breaker = G.Breaker(threshold=1, open_secs=5.0, clock=lambda: self.clock[0])
+        self.placement = G.BucketPlacement(4, lambda b: b % 2)
+        self.ready = th.Event()
+        self.ready.set()
+        self.relocator, self.space = None, space
+        self.punch_hold, self._single, self._ranks = True, True, [0, 1]
+        self._held, self._held_lock, self._closed_since = {}, th.Lock(), None
+        self.admit_new_at, self.admit_all_at, self.full_skips = 0.15, 0.05, 0
+        self.punched, self.written = [], []
+
+    def _bucket_punch(self, b, dkey, akeys):
+        self.punched.append((dkey, akeys))
+        return 0
+
+
+def punch_hold_while_a_rank_is_down():
+    st = _HoldStore()
+    st.punch(b"x")
+    ck("hold: with every rank closed a punch runs", st.punched == [(b"x", None)])
+    st.punched.clear()
+    st.breaker.miss(1)                           # rank 1 opens
+    ck("hold: a rank down holds punches", st.holding() and st.punch(b"k1") == 0 and
+       st.punch(b"k2", [b"a"]) == 0 and st.punch(b"k2", [b"b"]) == 0 and st.punched == [])
+    st._flush_held()
+    ck("hold: nothing runs while still down", st.punched == [] and len(st._held) == 2)
+    st.clock[0] += 10
+    st.breaker.success(1)
+    st._flush_held()
+    ck("hold: once every rank is back the held punches run, akeys merged",
+       sorted(st.punched) == [(b"k1", None), (b"k2", [b"a", b"b"])], "(%r)" % (st.punched,))
+
+
+def punch_hold_drops_a_rewritten_key():
+    st = _HoldStore()
+    st.breaker.miss(1)
+    st.punch(b"k")
+    st._bucket_op = lambda *a, **k: (0, None)    # the write itself, no DAOS
+    st.update(b"k", [(b"a", None, 8)])
+    ck("hold: a key written again loses its held punch", b"k" not in st._held)
+
+
+def admission_by_free_share():
+    class Space:
+        def __init__(self, f):
+            self.f = f
+
+        def bucket_frac(self, b):
+            return self.f
+    st = _HoldStore(Space(0.10))
+    rc, _ = st._bucket_op(0, b"k", [(b"a", None, 8)], False, False, relocated=True)
+    ck("admit: a relocated write to a target under admit_new_at is refused", rc == G.FULL)
+    st.space.f = 0.03
+    rc, _ = st._bucket_op(0, b"k", [(b"a", None, 8)], False, False)
+    ck("admit: any write to a target under admit_all_at is refused",
+       rc == G.FULL and st.full_skips == 2)
+
+
+def s3fifo_one_time_keys_leave_first():
+    c = G.S3FifoIndex(1000)
+    c.add(b"hot", 100)
+    c.touch(b"hot")                              # read once while in S
+    for i in range(9):
+        c.add(b"once%d" % i, 100)                # written, never read
+    c.add(b"more", 100)                          # 1100 > 1000
+    v = c.victims()
+    ck("s3fifo: keys never read leave before a read one", b"hot" not in v and v[0] == b"once0",
+       "(%r)" % (v,))
+    for k in v:
+        c.discard(k)
+    c.add(b"once0", 100)                         # evicted from S, written again: ghost hit
+    ck("s3fifo: a ghost written again goes to the main queue", b"once0" in c._m)
+
+
+def s3fifo_startup_keys_first_and_only():
+    c = G.S3FifoIndex(300)
+    c.add(b"mine", 100)
+    c.add_old(b"found1", 100)
+    c.add_old(b"found2", 100)
+    c.add(b"mine2", 100)
+    ck("s3fifo: keys found at start-up go first", c.victims()[:1] == [b"found1"])
+    ck("s3fifo: only limits the pick", c.oldest(100, only=lambda k: k.startswith(b"mine")) == [b"mine"])
+    c.touch(b"found2")
+    ck("s3fifo: a start-up key read by this process becomes ours", b"found2" in c._m)
+    ck("s3fifo: a pick drops nothing until discard", len(c) == 4 and c.total == 400)
+
+
+def space_buckets_under():
+    br = G.Breaker()
+    m = G.SpaceMonitor({0: (0, 0), 1: (1, 0), 2: (0, 0)},
+                       lambda r, t: {0: 0.5, 1: 0.2}[r], br, interval=10.0)
+    m.poll_once()
+    ck("space: buckets on targets under the mark", m.buckets_under(0.3) == {1})
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -780,7 +911,11 @@ def main():
               capacity_index_lru, capacity_index_startup_and_skip,
               relocation_alt_bucket, relocation_outage_and_return,
               relocation_two_ranks_down, relocation_miss_costs_one_more_fetch,
-              relocation_budget_and_return, relocation_stops_on_nospace):
+              relocation_budget_and_return, relocation_stops_on_nospace,
+              space_fraction_and_monitor, capacity_index_oldest,
+              punch_hold_while_a_rank_is_down, punch_hold_drops_a_rewritten_key,
+              admission_by_free_share, s3fifo_one_time_keys_leave_first,
+              s3fifo_startup_keys_first_and_only, space_buckets_under):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)

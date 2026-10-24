@@ -46,7 +46,7 @@ from . import serde
 from . import serde_v3
 from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
-from .rank_guard import (CLOSED, Breaker, CapacityIndex, Dropped, GuardedObj,
+from .rank_guard import (CLOSED, Breaker, CapacityIndex, Dropped, GuardedObj, S3FifoIndex,
                          Parked, S1BucketStore)
 from .streaming import stream_completions
 
@@ -386,6 +386,13 @@ class DaosConnector(RemoteConnector):
                 # (doc/RANK-GUARD-RELOCATION.md); S1 buckets only
                 relocate=os.environ.get("DAOS_RANK_GUARD_RELOCATE") == "1",
                 relocate_budget=int(budget_gb * (1 << 30)) if budget_gb > 0 else None,
+                # doc/EVICTION-DESIGN.md §4.1-4.4: per-target free share every
+                # SPACE_POLL s (0 = off), writes refused under the ADMIT marks,
+                # punches held while a rank is down
+                space_poll=float(os.environ.get("DAOS_RANK_GUARD_SPACE_POLL", "10")),
+                admit_new_at=float(os.environ.get("DAOS_RANK_GUARD_ADMIT_NEW_AT", "0.15")),
+                admit_all_at=float(os.environ.get("DAOS_RANK_GUARD_ADMIT_ALL_AT", "0.05")),
+                punch_hold=os.environ.get("DAOS_RANK_GUARD_PUNCH_HOLD", "1") == "1",
                 # the longest a rank (or, with EC buckets, the pool) stays open
                 # between probes; probe failures double the period up to it
                 breaker=Breaker(max_open_secs=float(
@@ -406,7 +413,11 @@ class DaosConnector(RemoteConnector):
             # DAOS_RANK_GUARD_CAPACITY_GB bounds what this process keeps in the
             # container: an approximate LRU, evicted by punching the oldest
             # dkeys (rank_guard.CapacityIndex). 0 or unset = unbounded.
-            self._cap = CapacityIndex(int(cap_gb * (1 << 30))) if cap_gb > 0 else None
+            # S3-FIFO by default (doc/EVICTION-DESIGN.md §4.3); lru = the old index
+            idx = CapacityIndex if os.environ.get("DAOS_RANK_GUARD_EVICTION") == "lru" \
+                else S3FifoIndex
+            self._cap = idx(int(cap_gb * (1 << 30))) if cap_gb > 0 else None
+            self._evict_at = float(os.environ.get("DAOS_RANK_GUARD_EVICT_AT", "0.30"))
             if self._cap is not None:
                 threading.Thread(target=self._evict_loop, name="daos-evict",
                                  daemon=True).start()
@@ -1234,7 +1245,17 @@ class DaosConnector(RemoteConnector):
                     self._cap.total / 2**30, time.monotonic() - t0)
         while True:
             time.sleep(1.0)
+            if st.holding():                  # a punch frees nothing now (RANK-GUARD.md §4)
+                continue
             victims = self._cap.victims()
+            if not victims and st.space is not None and not st.recovering():
+                hot = st.space.buckets_under(self._evict_at)
+                if hot:
+                    # a target is filling though this process is under its bound
+                    # (other writers, reclaim lag): a twentieth of the bound a
+                    # round, from the keys on the filling targets only
+                    victims = self._cap.oldest(self._cap.capacity // 20,
+                                               only=lambda k: st.placement.bucket(k) in hot)
             if not victims:
                 continue
             freed = 0
