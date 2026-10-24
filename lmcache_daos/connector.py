@@ -1243,14 +1243,20 @@ class DaosConnector(RemoteConnector):
         logger.info("DAOS rank guard: capacity %.1f GiB, %d stored keys found "
                     "(%.1f GiB) in %.1f s", self._cap.capacity / 2**30, found,
                     self._cap.total / 2**30, time.monotonic() - t0)
+        last_space_evict = 0.0
         while True:
             time.sleep(1.0)
             if st.holding():                  # a punch frees nothing now (RANK-GUARD.md §4)
                 continue
             victims = self._cap.victims()
-            if not victims and st.space is not None and not st.recovering():
+            # once per space poll: a punch shows in the free share only after
+            # aggregation and the next poll, and evicting on every second's stale
+            # reading took 2.5 GiB down to 0.6 GiB after an outage (lane A, lo3)
+            if not victims and st.space is not None and not st.recovering() \
+                    and time.monotonic() - last_space_evict >= st.space_poll:
                 hot = st.space.buckets_under(self._evict_at)
                 if hot:
+                    last_space_evict = time.monotonic()
                     # a target is filling though this process is under its bound
                     # (other writers, reclaim lag): a twentieth of the bound a
                     # round, from the keys on the filling targets only
