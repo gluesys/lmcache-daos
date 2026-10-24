@@ -18,6 +18,11 @@ is doing real work.
   written to a relocation bucket on another rank, chosen by hash so every
   process agrees, and read back from there during and after the outage.
   `doc/RANK-GUARD-RELOCATION.md`.
+- Relocation budget (`DAOS_RANK_GUARD_RELOCATE_BUDGET_GB`, MP
+  `"guard_relocate_budget_gb"`, default a quarter of the capacity bound): bytes
+  relocated for one down rank before its keys' writes are dropped again, and an
+  immediate stop on DER_NOSPACE from a relocation bucket. In a 20-minute outage
+  it kept the outage hits and cut DER_NOSPACE from 889 to 374 (lane A).
 - `bench/reboot/`: the storage-node reboot test behind `doc/RANK-GUARD.md` §5 --
   vLLM TTFT while a node is powered off (`reboot.sh`), VOS aggregation on the
   live ranks during the outage (`agg.sh`), reintegration under load

@@ -42,6 +42,7 @@ DAOS_RANK_GUARD_WRITE_DEADLINE=10  # 쓰기·punch base(s)
 DAOS_RANK_GUARD_MIN_BW=50e6        # 기한에 더할 크기/대역폭(B/s)
 DAOS_RANK_GUARD_MAX_OPEN=60        # breaker 열림 상한(s)
 DAOS_RANK_GUARD_RELOCATE=0         # 1: 기본 rank 가 열린 키를 다른 rank 버킷에(S1 만, RANK-GUARD-RELOCATION.md)
+DAOS_RANK_GUARD_RELOCATE_BUDGET_GB= # 꺼진 rank 하나 몫으로 재배치할 상한, 기본 CAPACITY_GB 의 1/4(§6.1)
 ```
 
 LMCache 설정은 **플러그인 경로만** 쓴다. `remote_url` 과 `remote_storage_plugins`

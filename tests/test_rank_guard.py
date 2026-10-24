@@ -609,11 +609,12 @@ class RelocWorld:
     """Buckets as dicts over 3 ranks (bucket % 3), for Relocator. A bucket on
     a down rank answers SKIPPED once its breaker is open, DEADLINE before."""
 
-    def __init__(self, nbuckets=12):
+    def __init__(self, nbuckets=12, budget=None):
         self.clock = [0.0]
         self.br = G.Breaker(threshold=1, open_secs=5.0, clock=lambda: self.clock[0])
         self.pl = G.BucketPlacement(nbuckets, lambda b: b % 3)
-        self.rl = G.Relocator(self.pl, self.br)
+        self.rl = G.Relocator(self.pl, self.br, budget=budget)
+        self.full = set()                        # ranks answering DER_NOSPACE to writes
         self.data = {b: {} for b in range(nbuckets)}
         self.down = set()
         self.calls = []
@@ -640,10 +641,12 @@ class RelocWorld:
     def update(self, k, v):
         def do(b):
             rc = self._gate(b)
+            if rc == 0 and self.pl.rank(b) in self.full:
+                return G.DER_NOSPACE
             if rc == 0:
                 self.data[b][k] = v
             return rc
-        return self.rl.update(k, do)
+        return self.rl.update(k, do, len(v))
 
     def punch(self, k):
         def do(b):
@@ -721,6 +724,45 @@ def relocation_miss_costs_one_more_fetch():
     ck("reloc: a healthy hit asks home only", len(w.calls) - n0 == 1)
 
 
+def relocation_budget_and_return():
+    w = RelocWorld(budget=20)
+    keys = [b"b%d" % i for i in range(300) if w.pl.rank(w.pl.bucket(b"b%d" % i)) == 1]
+    w.down.add(1)
+    w.fetch(keys[0])                             # opens rank 1
+    rcs = [w.update(k, b"v" * 8) for k in keys[:4]]
+    ck("reloc budget: writes relocate until 20 bytes are spent, then are dropped",
+       rcs == [0, 0, 0, G.SKIPPED] and w.rl.dropped_writes == 1 and w.rl.spent() == {1: 24},
+       "(%r %r)" % (rcs, w.rl.spent()))
+    rc, got = w.fetch(keys[1])
+    ck("reloc budget: what was relocated still hits", rc == 0 and got == [8])
+    k0 = next(b"z%d" % i for i in range(300) if w.pl.rank(w.pl.bucket(b"z%d" % i)) == 0)
+    ck("reloc budget: a live rank's own keys still go home",
+       w.update(k0, b"v") == 0 and w.where(k0) == [w.pl.bucket(k0)])
+    w.down.discard(1)
+    w.clock[0] += 10
+    w.fetch(keys[0])                             # probe closes rank 1
+    w.update(keys[4], b"v" * 8)                  # home write: resets the budget
+    w.down.add(1)
+    w.clock[0] += 1
+    w.fetch(keys[0])
+    ck("reloc budget: the next outage starts with the whole budget",
+       w.update(keys[5], b"v" * 8) == 0 and w.rl.spent() == {1: 8}, "(%r)" % (w.rl.spent(),))
+
+
+def relocation_stops_on_nospace():
+    w = RelocWorld()                             # no budget
+    keys = [b"n%d" % i for i in range(300) if w.pl.rank(w.pl.bucket(b"n%d" % i)) == 1]
+    w.down.add(1)
+    w.fetch(keys[0])
+    w.full.update({0, 2})                        # the live ranks are out of space
+    rc = w.update(keys[0], b"v")
+    n0 = len(w.calls)
+    rc2 = w.update(keys[1], b"v")
+    ck("reloc: DER_NOSPACE from a relocation bucket stops relocation for that rank",
+       rc == G.DER_NOSPACE and rc2 == G.SKIPPED and len(w.calls) == n0,
+       "(%r %r %d)" % (rc, rc2, len(w.calls) - n0))
+
+
 def main():
     for t in (live_rank_completes, dead_rank_parks_a_zombie,
               breaker_opens_and_short_circuits, half_open_probe_and_backoff,
@@ -737,7 +779,8 @@ def main():
               answered_zombie_closes_breaker, unreachable_zombie_keeps_breaker_open,
               capacity_index_lru, capacity_index_startup_and_skip,
               relocation_alt_bucket, relocation_outage_and_return,
-              relocation_two_ranks_down, relocation_miss_costs_one_more_fetch):
+              relocation_two_ranks_down, relocation_miss_costs_one_more_fetch,
+              relocation_budget_and_return, relocation_stops_on_nospace):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)

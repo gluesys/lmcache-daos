@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 DEADLINE = "DEADLINE"      # aborted at the caller's deadline, now a zombie
 SKIPPED = "SKIPPED"        # breaker open: not sent at all
 NOT_READY = "NOT_READY"    # store still connecting (outage at start-up)
+DER_NOSPACE = -1007        # daos_errno.h: no space on the target
 
 CLOSED, OPEN, HALF_OPEN = "closed", "open", "half-open"
 
@@ -450,12 +451,26 @@ class Relocator:
     ``do(bucket)`` runs the op on one bucket: for fetch it returns ``(rc,
     got)``, for update and punch an rc. Only for S1 buckets on a
     ``self_heal:none`` pool, where a bucket never moves.
+
+    ``budget`` bounds the bytes relocated for one down rank until it is back
+    (None: no bound). While a rank of a ``self_heal:none`` pool is down, the
+    live ranks reclaim nothing, and relocated writes ran them out of space
+    four minutes into a 20-minute outage -- after which their own keys' writes
+    failed too (lane A, 2026-10-24). Past the budget, or after the first
+    DER_NOSPACE from a relocation bucket, writes of that rank's keys are
+    dropped as they are without relocation; reads still look in both places.
     """
 
-    def __init__(self, placement: BucketPlacement, breaker: Breaker):
+    def __init__(self, placement: BucketPlacement, breaker: Breaker,
+                 budget: Optional[int] = None):
         self.placement, self.breaker = placement, breaker
+        self.budget = budget
         self.relocated_writes = 0
+        self.dropped_writes = 0
         self.alt_hits = 0
+        self._spent: Dict[int, int] = {}     # down rank -> bytes relocated for it
+        self._stopped: Dict[int, str] = {}   # down rank -> why relocation stopped
+        self._lock = threading.Lock()
 
     def fetch(self, dkey: bytes, do: Callable[[int], tuple]):
         rc, got = do(self.placement.bucket(dkey))
@@ -474,14 +489,43 @@ class Relocator:
             return rc1, got1
         return rc, got
 
-    def update(self, dkey: bytes, do: Callable[[int], int]):
+    def update(self, dkey: bytes, do: Callable[[int], int], nbytes: int = 0):
         b0 = self.placement.bucket(dkey)
-        if self.breaker.state(self.placement.rank(b0)) != CLOSED:
-            b1 = self.placement.alt(dkey)
-            if b1 is not None:
-                self.relocated_writes += 1
-                return do(b1)
-        return do(b0)
+        r0 = self.placement.rank(b0)
+        if self.breaker.state(r0) == CLOSED:
+            if r0 in self._spent or r0 in self._stopped:
+                with self._lock:              # back: the next outage starts afresh
+                    self._spent.pop(r0, None)
+                    self._stopped.pop(r0, None)
+            return do(b0)
+        b1 = self.placement.alt(dkey)
+        if b1 is None:
+            return do(b0)
+        with self._lock:
+            if r0 in self._stopped:
+                self.dropped_writes += 1
+                return SKIPPED
+            self.relocated_writes += 1
+        rc = do(b1)
+        with self._lock:
+            if rc == 0:
+                spent = self._spent.get(r0, 0) + nbytes
+                self._spent[r0] = spent
+                if self.budget is not None and spent >= self.budget:
+                    self._stop(r0, "budget %.2f GiB used" % (self.budget / 2**30))
+            elif rc == DER_NOSPACE:
+                self._stop(r0, "DER_NOSPACE from rank %d" % self.placement.rank(b1))
+        return rc
+
+    def _stop(self, rank: int, why: str) -> None:
+        if rank not in self._stopped:
+            self._stopped[rank] = why
+            logger.warning("rank %d: relocation stopped (%s); its keys' writes are dropped "
+                           "until it is back, reads still try both places", rank, why)
+
+    def spent(self) -> Dict[int, int]:
+        with self._lock:
+            return dict(self._spent)
 
     def punch(self, dkey: bytes, do: Callable[[int], int]):
         """Both copies: where a key lives is not recorded. Success if either
@@ -573,11 +617,13 @@ class S1BucketStore:
                  breaker: Optional[Breaker] = None, sys: Optional[str] = None,
                  per_rank_eq: bool = True, slow_poll_secs: float = 0.05,
                  write_deadline: float = 10.0, min_bw: float = 50e6,
-                 oclass: str = "S1", relocate: bool = False):
+                 oclass: str = "S1", relocate: bool = False,
+                 relocate_budget: Optional[int] = None):
         self.pool, self.cont, self.sys = pool, cont, sys
         # relocate: write keys whose home rank is down to another rank's
         # bucket and read them back from there (Relocator). S1 only.
         self.relocate = relocate
+        self.relocate_budget = relocate_budget
         self.relocator: Optional[Relocator] = None
         # S1: one shard per bucket, so a bucket lives on one rank and the
         # breaker is per rank. Any other class (e.g. EC_2P1G1 on an rd_fac 1
@@ -655,7 +701,8 @@ class S1BucketStore:
             self.engine = DeadlineEngine(EventQueue(), self.breaker, rank_eqs=rank_eqs,
                                          slow_poll_secs=self.slow_poll_secs)
             if self.relocate and single and len(set(ranks)) > 1:
-                self.relocator = Relocator(self.placement, self.breaker)
+                self.relocator = Relocator(self.placement, self.breaker,
+                                           budget=self.relocate_budget)
             self.ready.set()
             logger.info("S1BucketStore ready: %d %s buckets over ranks %s%s",
                         self.nbuckets, self.oclass,
@@ -676,7 +723,8 @@ class S1BucketStore:
             return rl.fetch(dkey, lambda b: self._bucket_op(b, dkey, items, single,
                                                              True, on_reap))
         return rl.update(dkey, lambda b: self._bucket_op(b, dkey, items, single,
-                                                          False)[0]), None
+                                                          False)[0],
+                         sum(int(x[2]) for x in items)), None
 
     def _bucket_op(self, b: int, dkey: bytes, items, single: bool, fetch: bool,
                    on_reap=None):
@@ -812,7 +860,8 @@ class S1BucketStore:
         rl = self.relocator
         return {"ready": self.ready.is_set(), "ranks": self.breaker.snapshot(),
                 "stats": dict(eng.stats) if eng else {},
-                "relocation": ({"writes": rl.relocated_writes, "alt_hits": rl.alt_hits}
+                "relocation": ({"writes": rl.relocated_writes, "alt_hits": rl.alt_hits,
+                                "dropped": rl.dropped_writes, "spent": rl.spent()}
                                if rl else None),
                 "zombies": eng.zombies() if eng else 0,
                 "poll_max": eng.poll_max() if eng else {}}

@@ -370,6 +370,11 @@ class DaosConnector(RemoteConnector):
         self._cap = None
         self._raw = self._guard or _choose_backend(pool, cont, sysname)
         if self._guard:
+            cap_gb = float(os.environ.get("DAOS_RANK_GUARD_CAPACITY_GB", "0") or 0)
+            # bytes relocated for one down rank before its keys' writes are
+            # dropped (Relocator); default a quarter of the capacity bound
+            budget_gb = float(os.environ.get("DAOS_RANK_GUARD_RELOCATE_BUDGET_GB", "0") or 0) \
+                or cap_gb / 4
             self._obj = GuardedObj(S1BucketStore(
                 pool, cont, sys=sysname,
                 nbuckets=int(os.environ.get("DAOS_RANK_GUARD_BUCKETS", "64")),
@@ -380,6 +385,7 @@ class DaosConnector(RemoteConnector):
                 # keys whose home rank is down go to another rank's bucket
                 # (doc/RANK-GUARD-RELOCATION.md); S1 buckets only
                 relocate=os.environ.get("DAOS_RANK_GUARD_RELOCATE") == "1",
+                relocate_budget=int(budget_gb * (1 << 30)) if budget_gb > 0 else None,
                 # the longest a rank (or, with EC buckets, the pool) stays open
                 # between probes; probe failures double the period up to it
                 breaker=Breaker(max_open_secs=float(
@@ -400,7 +406,6 @@ class DaosConnector(RemoteConnector):
             # DAOS_RANK_GUARD_CAPACITY_GB bounds what this process keeps in the
             # container: an approximate LRU, evicted by punching the oldest
             # dkeys (rank_guard.CapacityIndex). 0 or unset = unbounded.
-            cap_gb = float(os.environ.get("DAOS_RANK_GUARD_CAPACITY_GB", "0") or 0)
             self._cap = CapacityIndex(int(cap_gb * (1 << 30))) if cap_gb > 0 else None
             if self._cap is not None:
                 threading.Thread(target=self._evict_loop, name="daos-evict",
