@@ -42,6 +42,13 @@ DAOS_RANK_GUARD_WRITE_DEADLINE=10  # 쓰기·punch base(s)
 DAOS_RANK_GUARD_MIN_BW=50e6        # 기한에 더할 크기/대역폭(B/s)
 DAOS_RANK_GUARD_MAX_OPEN=60        # breaker 열림 상한(s)
 DAOS_RANK_GUARD_RELOCATE=0         # 1: 기본 rank 가 열린 키를 다른 rank 버킷에(S1 만, RANK-GUARD-RELOCATION.md)
+DAOS_RANK_GUARD_RELOCATE_BUDGET_GB= # 꺼진 rank 하나 몫으로 재배치할 상한, 기본 CAPACITY_GB 의 1/4(§6.1)
+DAOS_RANK_GUARD_EVICTION=s3fifo    # 축출 순서: s3fifo(기본) | lru (EVICTION-DESIGN.md §4.3)
+DAOS_RANK_GUARD_SPACE_POLL=10      # 버킷 target 남은 공간 조회 주기(s), 0 이면 끔(§4.1)
+DAOS_RANK_GUARD_EVICT_AT=0.30      # target 남은 비율이 이 아래면 그 target 키부터 축출(§4.2)
+DAOS_RANK_GUARD_ADMIT_NEW_AT=0.15  # 이 아래 target 으로 가는 재배치 쓰기를 거름
+DAOS_RANK_GUARD_ADMIT_ALL_AT=0.05  # 이 아래 target 으로 가는 쓰기를 모두 거름
+DAOS_RANK_GUARD_PUNCH_HOLD=1       # S1 풀에서 rank 가 꺼져 있는 동안 punch 보류, 복귀 뒤 실행(§4.4)
 ```
 
 LMCache 설정은 **플러그인 경로만** 쓴다. `remote_url` 과 `remote_storage_plugins`

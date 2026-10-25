@@ -18,6 +18,21 @@ is doing real work.
   written to a relocation bucket on another rank, chosen by hash so every
   process agrees, and read back from there during and after the outage.
   `doc/RANK-GUARD-RELOCATION.md`.
+- Relocation budget (`DAOS_RANK_GUARD_RELOCATE_BUDGET_GB`, MP
+  `"guard_relocate_budget_gb"`, default a quarter of the capacity bound): bytes
+  relocated for one down rank before its keys' writes are dropped again, and an
+  immediate stop on DER_NOSPACE from a relocation bucket. In a 20-minute outage
+  it kept the outage hits and cut DER_NOSPACE from 889 to 374 (lane A).
+- Space-aware eviction, stages 1-3 of `doc/EVICTION-DESIGN.md`: each bucket
+  target's free share is read with `daos_pool_query_target` every
+  `DAOS_RANK_GUARD_SPACE_POLL` s (own deadline engine); writes to a target
+  under `ADMIT_NEW_AT` (relocated) / `ADMIT_ALL_AT` (all) are refused before
+  they hit DER_NOSPACE; eviction starts on the keys of a target under
+  `EVICT_AT`; while a rank of an S1 pool is down punches are held (they free
+  nothing then) and run once every rank is back; the index is S3-FIFO by
+  default (`DAOS_RANK_GUARD_EVICTION=lru` for the old one). MP mode gets the
+  admission and the punch hold (`guard_space_poll`, `guard_admit_new_at`,
+  `guard_admit_all_at`, `guard_punch_hold`).
 - `bench/reboot/`: the storage-node reboot test behind `doc/RANK-GUARD.md` §5 --
   vLLM TTFT while a node is powered off (`reboot.sh`), VOS aggregation on the
   live ranks during the outage (`agg.sh`), reintegration under load

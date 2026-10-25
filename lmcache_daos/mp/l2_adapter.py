@@ -270,12 +270,19 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
         guard = {}
         for k, typ in (("buckets", int), ("deadline", (int, float)),
                        ("write_deadline", (int, float)), ("min_bw", (int, float)),
-                       ("max_open", (int, float))):
+                       ("max_open", (int, float)), ("relocate_budget_gb", (int, float)),
+                       ("space_poll", (int, float)), ("admit_new_at", (int, float)),
+                       ("admit_all_at", (int, float))):
             if "guard_" + k in d:
                 v = d["guard_" + k]
                 if not isinstance(v, typ) or isinstance(v, bool) or v <= 0:
                     raise ValueError("daos: 'guard_%s' must be a positive number" % k)
                 guard[k] = v
+        if "guard_punch_hold" in d:
+            v = d["guard_punch_hold"]
+            if not isinstance(v, bool):
+                raise ValueError("daos: 'guard_punch_hold' must be a boolean")
+            guard["punch_hold"] = v
         if "guard_relocate" in d:
             v = d["guard_relocate"]
             if not isinstance(v, bool):
@@ -342,7 +349,13 @@ class DaosL2AdapterConfig(L2AdapterConfigBase):
             "(default 60 s) is the longest a breaker stays open between probes. "
             "guard_relocate (default false) writes keys whose home rank is down "
             "to another rank's bucket and reads them back from there "
-            "(S1 buckets only, doc/RANK-GUARD-RELOCATION.md)\n"
+            "(S1 buckets only, doc/RANK-GUARD-RELOCATION.md). "
+            "guard_relocate_budget_gb (default a quarter of max_capacity_gb) bounds "
+            "what is relocated for one down rank before its keys' writes are dropped. "
+            "guard_space_poll (default 10 s) reads each bucket target's free share; "
+            "guard_admit_new_at / guard_admit_all_at (0.15 / 0.05) refuse relocated / all "
+            "writes to a target under them; guard_punch_hold (default true) holds deletes "
+            "while a rank is down (doc/EVICTION-DESIGN.md)\n"
             "- eviction / persist_enabled / serde: common L2 options"
         )
 
@@ -379,6 +392,13 @@ class DaosL2Adapter(L2AdapterInterface):
                     min_bw=g.get("min_bw", 50e6),
                     oclass=g.get("oclass", "S1"),
                     relocate=g.get("relocate", False),
+                    # bytes relocated for one down rank; default a quarter of L2
+                    relocate_budget=int(g.get("relocate_budget_gb", config.max_capacity_gb / 4)
+                                        * (1 << 30)) or None,
+                    space_poll=g.get("space_poll", 10.0),
+                    admit_new_at=g.get("admit_new_at", 0.15),
+                    admit_all_at=g.get("admit_all_at", 0.05),
+                    punch_hold=g.get("punch_hold", True),
                     breaker=Breaker(max_open_secs=g.get("max_open", 60.0))))
         factory = dfs_factory or (
             lambda: DfsSys(pool=config.pool, cont=config.container, sys=config.sys)
