@@ -48,6 +48,7 @@ from .dfs_binding import DfsSys, DaosError, warm_up_all_targets
 from .obj_binding import (DAOS_PROP_CO_LAYOUT_POSIX, ObjSys, container_layout)
 from .rank_guard import (CLOSED, Breaker, CapacityIndex, Dropped, GuardedObj, S3FifoIndex,
                          Parked, S1BucketStore)
+from .reuse_stats import ReuseStats
 from .streaming import stream_completions
 
 # LMCache is only present on the serving host. Guard the import so this module
@@ -452,6 +453,11 @@ class DaosConnector(RemoteConnector):
         # where raising it to 128 made things 9-10% WORSE, showing the cost
         # is serialised rather than concurrency-bound.
         self._workers = int(os.environ.get("DAOS_WORKERS", "16"))
+        # DAOS_REUSE_STATS=<s>: how often evicted chunks are asked for again,
+        # logged that often -- the numbers a tiering decision needs (reuse_stats)
+        rs = float(os.environ.get("DAOS_REUSE_STATS", "0") or 0)
+        self._reuse = ReuseStats(rs, int(os.environ.get("DAOS_REUSE_STATS_GHOST", "100000"))) \
+            if rs > 0 else None
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._workers, thread_name_prefix="daos-io")
 
@@ -560,8 +566,26 @@ class DaosConnector(RemoteConnector):
             probe = ctypes.create_string_buffer(_META_CAP)
             (got,) = self._obj.fetch(dkey, [(mak, probe, _META_CAP)],
                                      single=True)
-            return got > 0
-        return self._dfs.exists(addr)
+            hit = got > 0
+        else:
+            hit = self._dfs.exists(addr)
+        if not hit:
+            self._stat("missed", addr)
+        return hit
+
+    def _stat(self, what, addr, nbytes=None) -> None:
+        """Feed ReuseStats one chunk event. ``addr`` is a DFS path, a raw
+        (dkey, layer) pair -- counted for layer 0 or a whole chunk only, so a
+        layerwise chunk counts once -- or a bare dkey."""
+        if self._reuse is None:
+            return
+        if isinstance(addr, tuple):
+            if addr[1] not in (None, 0):
+                return
+            addr = addr[0]
+        fn = getattr(self._reuse, what)
+        fn(addr) if nbytes is None else fn(addr, nbytes)
+        self._reuse.maybe_log(logger)
 
     def exists_sync(self, key) -> bool:
         return self._exists_sync(self._addr(key))
@@ -952,6 +976,7 @@ class DaosConnector(RemoteConnector):
             self._dfs.write_obj_from(obj, len(header), n, src)   # bulk, no copy
         finally:
             self._dfs.close_obj(obj)
+        self._stat("written", addr, n)
 
     # -- batched interface --------------------------------------------------
     # Only get/put are overridden, and only because measurement said so.
@@ -1130,6 +1155,7 @@ class DaosConnector(RemoteConnector):
             return              # rank guard: not stored, which a cache allows
         if self._cap is not None:
             self._cap.add(dkey, n + len(hdr))
+        self._stat("written", addr, n)
 
     def _get_raw(self, addr) -> Optional["MemoryObj"]:
         """The object-API read. Same contract as _get_sync: absent or
@@ -1188,6 +1214,7 @@ class DaosConnector(RemoteConnector):
             return None
         if self._cap is not None:
             self._cap.touch(dkey)
+        self._stat("read", addr, n)
         return self._dbg(memory_obj, "read")
 
     # -- layerwise folding ---------------------------------------------------
@@ -1295,6 +1322,7 @@ class DaosConnector(RemoteConnector):
                 except Dropped:
                     continue
                 self._cap.discard(dk)
+                self._stat("evicted", dk)
                 freed += 1
             if freed:
                 logger.info("DAOS rank guard: evicted %d keys, %.2f GiB stored",
@@ -1350,6 +1378,7 @@ class DaosConnector(RemoteConnector):
         if self._cap is not None:
             # layers of one chunk share the dkey and are evicted together
             self._cap.add(dkey, sum(n for _l, _h, _s, n in entries))
+        self._stat("written", dkey, sum(n for _l, _h, _s, n in entries))
 
     def _get_raw_folded(self, dkey, layers):
         """Read the named layers of one chunk. Returns a list positional to
@@ -1406,8 +1435,10 @@ class DaosConnector(RemoteConnector):
                 self._release(mo)
             else:
                 out[i] = self._dbg(mo, "read")
-        if self._cap is not None and any(o is not None for o in out):
-            self._cap.touch(dkey)
+        if any(o is not None for o in out):
+            if self._cap is not None:
+                self._cap.touch(dkey)
+            self._stat("read", dkey)
         return out
 
     def _remove_one(self, addr) -> bool:
@@ -1425,8 +1456,12 @@ class DaosConnector(RemoteConnector):
                 return False
             if self._cap is not None:
                 self._cap.discard(dkey)
+            self._stat("evicted", dkey)
             return True
-        return self._dfs.remove(addr)
+        ok = self._dfs.remove(addr)
+        if ok:
+            self._stat("evicted", addr)
+        return ok
 
     def _get_sync(self, path) -> Optional["MemoryObj"]:
         """Load one object, or return None if it is absent OR incomplete.
@@ -1516,6 +1551,7 @@ class DaosConnector(RemoteConnector):
                     self._release(memory_obj)
                     return None
                 view[:n] = memoryview(tmp)[:n]
+                self._stat("read", path, n)
                 return self._dbg(memory_obj, "read")
 
             dest = (ctypes.c_char * n).from_buffer(view[:n])
@@ -1524,6 +1560,7 @@ class DaosConnector(RemoteConnector):
                 # Truncated payload: give the buffer back and report a miss.
                 self._release(memory_obj)
                 return None
+            self._stat("read", path, n)
             return self._dbg(memory_obj, "read")
         finally:
             dfs.close_obj(obj)

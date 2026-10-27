@@ -11,7 +11,16 @@ is doing real work.
 
 ## [Unreleased]
 
-Nothing since 0.2.0.
+### Added
+
+- Reuse statistics for the tiering decision (`DAOS_REUSE_STATS=<seconds>`, off
+  by default; `lmcache_daos/reuse_stats.py`, `doc/REUSE-STATS.md`). The
+  in-process connector counts writes, hits and misses with bytes, the gap
+  before each hit, reads per chunk at eviction, and the misses that fall on
+  chunks this process evicted -- each a hit a lower tier would have served --
+  with the time since eviction, and logs them as one JSON line
+  (`DAOS reuse stats {...}`) that often. `DAOS_REUSE_STATS_GHOST` bounds the
+  evicted keys remembered (default 100000).
 
 ## [0.2.0] - 2026-10-27
 

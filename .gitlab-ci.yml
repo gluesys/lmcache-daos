@@ -64,6 +64,9 @@ unit:
     # store: in particular that L1's buffers never reach DAOS, which is what
     # keeps a request past its deadline from writing into another key's KV.
     - python3 tests/test_guarded_kv.py
+    # Reuse statistics (DAOS_REUSE_STATS) on a fake clock: which misses a lower
+    # tier would have served, and how long after eviction.
+    - python3 tests/test_reuse_stats.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
