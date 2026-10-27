@@ -17,4 +17,4 @@ This is the single source of the version: ``pyproject.toml`` reads
 from .serde import pack, unpack, prefix_size, parse_prefix
 
 __all__ = ["pack", "unpack", "prefix_size", "parse_prefix", "__version__"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
