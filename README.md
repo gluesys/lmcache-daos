@@ -71,7 +71,7 @@ vLLM ─ LMCache ─ RemoteBackend ─(plugin:// 스킴)─ DaosConnector (conne
 | 항목 | 버전 / 조건 |
 |---|---|
 | Python | 커넥터 자체는 ≥ 3.8. **실운영은 ≥ 3.10** — LMCache·vLLM 이 `requires_python >=3.10` 이고 LMCache 0.5.2 휠은 cp310–cp313 뿐이다 |
-| LMCache | **v0.5.2** |
+| LMCache | **v0.5.2, v0.5.5** 에서 실측. v0.5.4 는 쓰는 API 가 0.5.5 와 같다(코드 비교, 미실측). vLLM 0.30 GPU 에서는 fused KV 패치 필요 — [CHANGELOG 0.2.0](CHANGELOG.md) |
 | vLLM | **≥ 0.26.0** |
 | DAOS 클라이언트 | 2.8 / 2.9 (`libdaos`, `libdfs`), `daos_agent` 실행 중, **서버와 같은 버전** |
 | DAOS 컨테이너 | `--type POSIX` |

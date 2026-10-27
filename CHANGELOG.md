@@ -11,6 +11,23 @@ is doing real work.
 
 ## [Unreleased]
 
+Nothing since 0.2.0.
+
+## [0.2.0] - 2026-10-27
+
+The release that makes a storage-node outage cost misses instead of stalls.
+The rank guard (in-process and MP, S1 and EC buckets), its relocation and
+space-aware eviction were measured on a 3-node lane with vLLM 0.30.0 and
+LMCache 0.5.5; the NIXL backend moved to its own repository.
+
+Compatibility: tested with LMCache 0.5.2 and 0.5.5. LMCache 0.5.4 (what
+vllm-rbln 0.12 depends on) has the same `RemoteConnector`, `RemoteBackend`,
+plugin loading and serde code as 0.5.5, compared file by file, but has not
+been run. On vLLM 0.30 GPU builds LMCache 0.5.5's GPU connector copies half of
+each chunk's KV with the fused K/V layout, so hits answer wrongly whatever the
+storage backend; the daos-images `vllm-lmcache-daos` image carries the fix as
+`patches/lmcache-0.5.5-fused-kv.patch`.
+
 ### Added
 
 - Rank guard relocation (`DAOS_RANK_GUARD_RELOCATE=1`, MP `"guard_relocate": true`,
@@ -94,6 +111,13 @@ is doing real work.
 
 ### Fixed
 
+- Values serialized by CacheGen (`remote_serde: cachegen`) can be stored and
+  read. LMCache 0.5.5 hands them over as a `BytesBufferMemoryObj` with no
+  dtype, and `RemoteMetadata`'s strict zip failed every store ("zip()
+  argument 2 is shorter than argument 1"), so the hit rate was 0. Such objects
+  are now written with uint8 metadata, and a `BINARY_BUFFER` read goes into a
+  `BytesBufferMemoryObj` of its length instead of the CPU allocator. LMCache's
+  own redis connector has the same code.
 - MP mode could not use EC buckets: `DaosL2Adapter` passed the guard no
   object class or breaker cap, so it was always S1 with a 60 s cap. New
   `--l2-adapter` keys `guard_oclass` and `guard_max_open` match
