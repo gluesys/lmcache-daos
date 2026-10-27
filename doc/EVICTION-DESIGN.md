@@ -3,7 +3,9 @@
 
 # rank 가드 — 축출(용량 관리) 재설계
 
-상태: 1~3 단계 구현·레인 A 확인(2026-10-24, §10). 4 단계(MP 희생자 순서·차트 값) 남음. 현재 축출은 `rank_guard.CapacityIndex` + `connector._evict_loop`
+상태: 1~4 단계 끝(2026-10-26). 1~3 단계 구현·레인 A 확인(2026-10-24, §10), 4 단계는 MP 어댑터의 승인
+제어·punch 보류(1~3 단계에 같이 들어감)와 daos-operator 차트 값(`rankGuard.*`, 차트 0.1.9)이고 차트 경로로
+다시 쟀다(§10.1). MP 희생자 순서는 §4.6 대로 LMCache 정책을 따른다. 현재 축출은 `rank_guard.CapacityIndex` + `connector._evict_loop`
 (in-process)와 LMCache L2 축출(MP)이다.
 
 ## 1. 왜 다시 설계하나
@@ -212,3 +214,14 @@ LMCache L2 축출이 희생자를 고르고 delete 를 부른다. 바꿀 수 있
 - 공간 조회를 이벤트·별도 poller 로 하면 정상 hit TTFT 가 0.158 → 0.181 s 로 늘었다. 동기 조회(전용 스레드)로 해소.
 
 원자료: `daos-reboot-repro/2026-10-24-longout/`(`lo1`~`lo5`, `ab*`, `NOTES.md`).
+
+### 10.1 차트 경로 (레인 A, 2026-10-26)
+
+daos-operator 차트 `vllm.services` 로 띄운 vLLM(이미지 `vllm-lmcache-daos:0.30.0-0.5.5-20261025.2`, 기본값,
+`lmcacheCpuGB: 0.5`)과 같은 조건(14 GiB 풀, rank 1 1200 s 정지).
+
+| 요청 / 실패 | 반복 p50 정상 / 장애 중 / 복귀 뒤 | DER_NOSPACE | 승인 제어로 거른 쓰기 | 축출 뒤 크기 |
+|---|---|---|---|---|
+| 15,662 / 0 | 0.091 / 0.094 / 0.094 s | 5(복귀 1 분 뒤) | 933 | 2.69 GiB |
+
+라이브러리 기본값만으로 §10 의 결과가 재현된다. 원자료: `daos-reboot-repro/2026-10-26-chart/`.
