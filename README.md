@@ -71,7 +71,7 @@ vLLM ─ LMCache ─ RemoteBackend ─(plugin:// 스킴)─ DaosConnector (conne
 | 항목 | 버전 / 조건 |
 |---|---|
 | Python | 커넥터 자체는 ≥ 3.8. **실운영은 ≥ 3.10** — LMCache·vLLM 이 `requires_python >=3.10` 이고 LMCache 0.5.2 휠은 cp310–cp313 뿐이다 |
-| LMCache | **v0.5.2, v0.5.5** 에서 실측. v0.5.4 는 쓰는 API 가 0.5.5 와 같다(코드 비교, 미실측). vLLM 0.30 GPU 에서는 fused KV 패치 필요 — [CHANGELOG 0.2.0](CHANGELOG.md) |
+| LMCache | **v0.5.2, v0.5.5, v0.5.7.post1(MP 모드)** 에서 실측. v0.5.4 는 쓰는 API 가 0.5.5 와 같다(코드 비교, 미실측). vLLM 0.30 GPU 에서는 0.5.5 에 fused KV 패치 필요 — [CHANGELOG 0.2.0](CHANGELOG.md), 0.5.7.post1 은 소스 빌드 필요 — [하이브리드 어텐션 모델](#하이브리드-어텐션-모델-qwen38-등-mambalinear-attention-혼합) |
 | vLLM | **≥ 0.26.0** |
 | DAOS 클라이언트 | 2.8 / 2.9 (`libdaos`, `libdfs`), `daos_agent` 실행 중, **서버와 같은 버전** |
 | DAOS 컨테이너 | `--type POSIX` |
@@ -282,6 +282,78 @@ vllm serve <model> --kv-transfer-config '{"kv_connector":"DaosMPConnector",
   한다(`verify_size`). 쓰기는 tmp → `dfs_sys_rename`.
 - 기동 시 모든 타깃에 SX 프로브로 연결을 미리 맺는다(`probe_chunks`, 기본 64). 이것이
   없으면 store 직후 첫 대용량 load 가 ~15 s 멈추는 현상이 난다.
+
+#### 하이브리드 어텐션 모델 (Qwen3.8 등 Mamba/linear-attention 혼합)
+
+full attention 층과 Mamba(linear attention) 층이 섞인 모델은 **MP 모드로만** 동작한다
+(in-process `LMCacheConnectorV1` 경로는 A100 실측에서 동작하지 않았다). 다음 조건을 모두
+지켜야 한다(Qwen3.8-27B INT4, vLLM 0.30.0, A100 80GB·RTX A6000 실측):
+
+| 조건 | 값 / 이유 |
+|---|---|
+| 커넥터 | `LMCacheMPConnector`(vLLM 0.30 은 설치된 LMCache 의 커넥터로 위임) 또는 위 `DaosMPConnector` |
+| vLLM 인자 | `--enable-prefix-caching` 와 `--mamba-cache-mode=align` **둘 다 필수.** align 모드에서만 Mamba 상태가 블록 끝마다 남아 청크 단위로 저장·복원된다. LMCache 커넥터의 기동 검사(`validate_mamba_step_alignment`)는 align 일 때만 돌고 이 둘의 유무는 보지 않으므로 직접 확인할 것 |
+| `--max-num-batched-tokens` | 블록 크기 이상. align 모드에서 이보다 작으면 커넥터가 기동 시 `ValueError` 로 거부한다 |
+| `--chunk-size` | **vLLM 블록 크기의 배수.** 블록 크기는 KV dtype 과 MTP 에 따라 바뀐다: bf16 784, FP8 1568(MTP 를 켜면 800, 1600 — 단 위 MTP 주의). 엔진 로그의 block size 를 보고 정한다 |
+| `--l1-size-gb` | **요청 하나의 KV 전체보다 커야 한다.** L2 에서 읽은 청크는 L1 을 거쳐 GPU 로 가므로, 작으면 load 가 reserve 단계에서 실패해 재계산된다. Qwen3.8-27B 는 청크(800 토큰)당 203 MiB, 32K 요청이 7.9 GiB |
+| GPU 가 SM80(A100·A6000) | `--attention-backend=TRITON_ATTN --kv-cache-dtype=bfloat16`. SM80 은 FP8 KV 를 못 쓰고, FlashInfer 즉석 빌드 경로는 KV 복원 시 출력이 깨진다(A100 실측) |
+| MTP(추측 디코딩) | **LMCache 와 함께 쓰지 말 것** — 아래 참고 |
+| LMCache | **0.5.7 이상 권장** — 아래 참고 |
+
+**MTP 를 켜면 KV 복원 응답이 틀린다 (LMCache 0.5.5, 0.5.7.post1 모두).** chunk 800·MTP 3 에서
+4321/16321/32321 토큰 프롬프트를 L2 또는 GPU 적중으로 복원하면 콜드 계산과 응답이 매번 다르다
+(27/27). 0.5.7 의 4321 토큰은 `duct Register Register …` 같은 쓰레기 출력이다. 같은 0.5.7 에서
+**LMCache 를 빼고 MTP 만**(vLLM prefix cache) 쓰거나, **MTP 를 끄고 LMCache 만**(chunk 784) 쓰면
+모두 콜드와 글자까지 같다 — 조합에서만 깨진다. 상류에 열린 이슈
+[LMCache#5675](https://github.com/LMCache/LMCache/issues/5675)(Qwen3.8-27B + MTP, 같은 `Register`
+반복)와 같은 증상이다. MTP 는 마지막 전체 블록과 꼬리를 한 prefill step 으로 합쳐 그 블록 끝의
+recurrent state 를 쓰지 않는데, 그 청크가 저장되고 다시 읽힌다(서버 로그상 관찰, 근본 원인은 상류
+미해결). 상류 수정 [#5004](https://github.com/LMCache/LMCache/pull/5004)(0.5.7 포함)는 vLLM 0.30
+에서 이 경우를 막지 못한다. **하이브리드 모델에 LMCache 를 붙일 때는 MTP 를 끈다.**
+
+0.5.5 는 여기에 더해 길이가 청크의 배수인 프롬프트가 전부 적중하면 마지막 토큰을 Mamba 상태에
+두 번 적용한다([#5249](https://github.com/LMCache/LMCache/pull/5249), 0.5.7 에서 수정). 0.5.7 은 그
+대가로 그 경우 마지막 청크를 재계산한다(4K +0.4 s, 32K +0.8 s, 길이가 배수일 때만).
+
+**LMCache 0.5.5/0.5.6 은 vLLM prefix cache 적중에도 L2 를 통째로 읽는다.** 스케줄러가
+lookup 을 항상 토큰 0 부터 내고 서버는 vLLM 이 GPU 에 가진 범위를 모르기 때문이다.
+`--l2-store-policy skip_l1` 이면 L1 에도 남지 않아 같은 요청을 다시 보내도 매번 L2 읽기를
+기다린다. 상류 [LMCache#5383](https://github.com/LMCache/LMCache/pull/5383)(0.5.7 부터)이
+vLLM 적중 구간을 lookup 에서 빼 이를 고쳤다. RTX A6000, DAOS 4 rank, chunk 800, 청크 배수가 아닌
+길이에서 GPU 적중 TTFT(저장소 적중은 두 버전이 같다):
+
+| 프롬프트 | 0.5.5 | 0.5.7.post1(소스 빌드) |
+|---|---|---|
+| 4321 | 0.33 s | 0.26 s |
+| 16321 | 0.64 s | 0.34 s |
+| 32321 | 1.05 s(그중 L2 0.61 s) | 0.46 s(L2 0.02 s) |
+ 0.5.7 은 L2 어댑터에 `get_memory_tags()` 를 추상 메서드로
+추가했고 이 저장소의 어댑터는 그것을 구현한다.
+
+**0.5.7.post1 PyPI 휠의 `cuda_ops` 는 torch 2.13(vLLM 0.30 의 torch)과 링크되지 않는다**
+(`undefined symbol: _ZN3c104cuda19CUDAErrorLogCaptureC1Ev`). 서버는 기동하지만
+`lmcache.cuda_ops compiled extension not found; CudaDeviceOps stays on the torch baseline`
+경고와 함께 L1↔GPU 전송이 torch 기본 경로로 떨어져 32K 회수가 0.003 s → 0.41 s 가 된다.
+vLLM 0.30 과 쓸 때는 소스 빌드한다:
+
+```bash
+pip install "vllm==0.30.0" "lmcache==0.5.7.post1"            # 의존성(이 휠의 cuda_ops 는 덮어쓴다)
+pip install ninja setuptools_scm wheel grpcio-tools            # grpc_tools 가 없으면 빌드 실패
+# venv 의 pip CUDA 는 판이 섞여 있다(nvcc 13.5, 런타임 헤더 13.0 → CCCL 이 "incompatible" 로 거부).
+# torch cu130 과 같은 13.0 툴체인을 따로 받고, torch 헤더가 찾는 라이브러리 헤더는 venv 와 같은 판으로.
+T=/opt/cu130; H=/opt/cu130hdr                                   # pip --target 은 기존 nvidia/ 에 합치지 않아 둘로 나눈다
+pip install --target $T "nvidia-cuda-nvcc==13.0.*" "nvidia-cuda-crt==13.0.*" "nvidia-nvvm==13.0.*" \
+    "nvidia-cuda-runtime==13.0.*" "nvidia-cuda-cccl==13.0.*"
+pip install --target $H --no-deps nvidia-cublas==<venv 판> nvidia-cusparse==<venv 판> \
+    nvidia-cusolver==<venv 판> nvidia-curand==<venv 판> nvidia-cufft==<venv 판> nvidia-cudss-cu13
+ln -s libcudart.so.13 $T/nvidia/cu13/lib/libcudart.so          # -lcudart 용 이름
+export CUDA_HOME=$T/nvidia/cu13 PATH=$T/nvidia/cu13/bin:$PATH CPATH=$H/nvidia/cu13/include \
+       MAX_JOBS=8 TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0"
+pip install --no-build-isolation --no-deps --force-reinstall --no-binary lmcache "lmcache==0.5.7.post1"
+python -c "import lmcache.cuda_ops"                            # ImportError 가 없어야 한다
+```
+
+`<venv 판>` 은 `pip list | grep nvidia-` 로 확인한다.
 
 컨테이너 하나에서 두 프로세스를 관리하는 예시는
 [`deploy/launchers/run_vllm_mp_c5.sh`](deploy/launchers/run_vllm_mp_c5.sh),

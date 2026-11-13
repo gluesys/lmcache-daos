@@ -400,6 +400,31 @@ def test_guard_oclass_and_max_open_reach_the_store():
         raise AssertionError("accepted %r" % bad)
 
 
+def test_memory_tags_say_remote_storage():
+    """LMCache 0.5.7 made get_memory_tags abstract: without it make() itself
+    raises TypeError there. Older releases have no tags and never ask."""
+    ad, _dfs = make()
+    try:
+        from lmcache.v1.distributed.api import (
+            MemoryResidency,
+            MemorySegment,
+            MemoryTags,
+        )
+    except ImportError:
+        try:
+            ad.get_memory_tags()
+        except NotImplementedError:
+            return
+        finally:
+            ad.close()
+        raise AssertionError("tags returned without LMCache support")
+    try:
+        assert ad.get_memory_tags() == MemoryTags(
+            MemorySegment.STORAGE, MemoryResidency.REMOTE)
+    finally:
+        ad.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

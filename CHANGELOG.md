@@ -13,6 +13,23 @@ is doing real work.
 
 ### Added
 
+- MP L2 adapter: `get_memory_tags()` (STORAGE, REMOTE). LMCache 0.5.7 made it
+  abstract on `L2AdapterInterface`, so without it the adapter could not be
+  instantiated there; on older LMCache it raises `NotImplementedError` and is
+  never called. 0.5.7 is the first release with LMCache#5383, which stops a
+  vLLM prefix-cache hit from re-reading the whole prompt from L2: on 0.5.5 a
+  32K GPU hit waited 0.60 s for an L2 prefetch it did not use (RTX A6000, Qwen3.8
+  27B INT4, DAOS 4 ranks). The 0.5.7.post1 PyPI wheel's `cuda_ops` does not
+  link against vLLM 0.30's torch 2.13 and silently falls back to a ~100x
+  slower L1->GPU copy; build it from source (README, hybrid attention models).
+- README: the conditions for hybrid attention (Mamba + full attention) models
+  in MP mode -- prefix caching with `--mamba-cache-mode=align`, chunk size a
+  multiple of the vLLM block, L1 larger than one request's KV, TRITON_ATTN +
+  bf16 KV on SM80, and no MTP. With MTP on, restored responses differ from a
+  cold computation on both LMCache 0.5.5 and 0.5.7.post1 (27 of 27; at 4321
+  tokens 0.5.7 answers `duct Register Register ...`, the signature of open
+  LMCache#5675); MTP without LMCache, or LMCache without MTP, restores
+  byte-identically.
 - Reuse statistics for the tiering decision (`DAOS_REUSE_STATS=<seconds>`, off
   by default; `lmcache_daos/reuse_stats.py`, `doc/REUSE-STATS.md`). The
   in-process connector counts writes, hits and misses with bytes, the gap
