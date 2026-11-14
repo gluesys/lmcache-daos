@@ -140,8 +140,43 @@ def dead_rank():
     ck("up again: the earlier key still reads", kv.stat_size("/d") == 32)
 
 
+def bounce_reuse():
+    """Completed ops recycle their private buffer; a zombie's is never reused."""
+    st = DictStore()
+    kv = GuardedKV(st)
+    src = ctypes.create_string_buffer(b"r" * 128, 128)
+    kv.write_obj_from("/f", 0, 128, src)
+    w = st.seen[0]                       # the write's payload buffer
+    dst = ctypes.create_string_buffer(128)
+    st.seen = []
+    kv.read_obj_into("/f", 0, 128, dst)
+    kv.read_obj_into("/f", 0, 128, dst)
+    ck("reuse: the write and both reads used one pooled buffer",
+       st.seen[1] == w and st.seen[3] == w and kv._bounce.idle_bytes() == 128,
+       "idle=%d" % kv._bounce.idle_bytes())
+    have = kv.stat_size("/f")
+    kv.stat_size = lambda p: have
+    st.down = True
+    seen0 = len(st.seen)
+    kv.read_obj_into("/f", 0, 128, dst)
+    zombie = st.seen[seen0]
+    ck("reuse: a timed-out read keeps its buffer out of the pool",
+       kv._bounce.idle_bytes() == 0)
+    st.down = False
+    st.seen = []
+    kv.read_obj_into("/f", 0, 128, dst)
+    ck("reuse: the next read does not get the zombie's buffer",
+       zombie not in st.seen and dst.raw == b"r" * 128)
+    kv.write_obj_from("/g", 0, 128, src)
+    st.down = True
+    n = kv.write_obj_from("/h", 0, 128, src)
+    ck("reuse: a dropped write keeps its buffer out of the pool",
+       n == 0 and kv._bounce.idle_bytes() == 0)
+
+
 def main():
-    for t in (roundtrip, uncommitted_is_absent, l1_buffers_never_reach_daos, dead_rank):
+    for t in (roundtrip, uncommitted_is_absent, l1_buffers_never_reach_daos, dead_rank,
+              bounce_reuse):
         print(t.__name__)
         t()
     print("FAIL" if fails else "OK", "(%d failed)" % fails)
