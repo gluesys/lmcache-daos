@@ -66,6 +66,11 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_factory
 from lmcache.v1.platform import create_event_notifier
 
+try:  # LMCache >= 0.5.7: every L2 adapter reports where its bytes live
+    from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
+except ImportError:  # 0.5.2 .. 0.5.6 have no memory tags
+    MemoryTags = None
+
 from ..dfs_binding import DaosError, DfsSys, warm_up_all_targets
 from ..rank_guard import Breaker, S1BucketStore
 from .guarded_kv import GuardedKV
@@ -788,6 +793,15 @@ class DaosL2Adapter(L2AdapterInterface):
     def query_load_result(self, task_id: L2TaskId) -> Optional[Bitmap]:
         with self._lock:
             return self._completed_load.pop(task_id, None)
+
+    # -- memory tags (LMCache >= 0.5.7) --------------------------------------
+    def get_memory_tags(self):
+        """Storage, off this host: a DAOS container is shared by every server
+        that opens it. Abstract in LMCache 0.5.7, so without it the adapter
+        cannot be instantiated there; older releases never call it."""
+        if MemoryTags is None:
+            raise NotImplementedError("memory tags need LMCache >= 0.5.7")
+        return MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
 
     # -- optional interface -------------------------------------------------
     def delete(self, keys: List[ObjectKey]) -> None:
