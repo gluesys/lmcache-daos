@@ -38,6 +38,22 @@ is doing real work.
   with the time since eviction, and logs them as one JSON line
   (`DAOS reuse stats {...}`) that often. `DAOS_REUSE_STATS_GHOST` bounds the
   evicted keys remembered (default 100000).
+- `tests/bench_guard_bw.py`: read and write bandwidth of the MP adapter's
+  rank-guard path against DFS, with the guarded read split into its length
+  fetch, bounce buffer and data fetch.
+
+### Fixed
+
+- MP adapter with `"rank_guard": true`: loads ran at a fraction of DFS
+  bandwidth and missed under load. `GuardedKV` allocated its private bounce
+  buffer per key with `(c_char * n)()`, which zero-fills under the GIL (95 ms
+  for a 203 MiB chunk), so a 40-key load allocated serially whatever the
+  worker count and the event poller, starved of the GIL, let reads pass their
+  deadline. Buffers now come from a pool of anonymous mmaps, returned only
+  after their op completed (a timed-out op's stays with its zombie). On a
+  4-rank cxl2 pool, 40 x 203 MiB at 16 workers: read 2.56 -> 7.05 GB/s with
+  37/40 -> 40/40 hits, write 2.36 -> 5.33 GB/s (DFS: 13.6 / 13.1 GB/s). The
+  remaining gap is placement: a key is one value on one target.
 
 ## [0.2.0] - 2026-10-27
 
